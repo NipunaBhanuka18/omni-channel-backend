@@ -1,5 +1,8 @@
 # ==============================================================================
-# Cognito Identity Module (Phase 1 Scaffold - Internal Pilot)
+# DEPRECATED MODULE: Cognito Identity Module
+# ==============================================================================
+# Deprecated as of 2026-08-07 — replaced by Azure AD per supervisor + BRD confirmation.
+# Retained for reference only, not included in root module wiring.
 # ==============================================================================
 # ARCHITECTURAL NOTE ON TENANT ISOLATION IN AUTHENTICATION:
 # In Phase 1 (internal pilot), user groups ('staff', 'admin') are global/generic.

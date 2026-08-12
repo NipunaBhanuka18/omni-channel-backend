@@ -8,23 +8,26 @@ output "api_gateway_health_invoke_url" {
   value       = module.api_gateway.invoke_url
 }
 
-output "cognito_user_pool_id" {
-  description = "Cognito User Pool ID"
-  value       = module.cognito.user_pool_id
-}
-
-output "cognito_app_client_id" {
-  description = "Cognito App Client ID"
-  value       = module.cognito.client_id
-}
-
-output "cognito_groups" {
-  description = "Cognito internal pilot groups"
-  value = {
-    staff = module.cognito.staff_group_name
-    admin = module.cognito.admin_group_name
-  }
-}
+# ------------------------------------------------------------------------------
+# DEPRECATED: Cognito Identity Outputs (Commented out per Azure AD transition)
+# ------------------------------------------------------------------------------
+# output "cognito_user_pool_id" {
+#   description = "Cognito User Pool ID"
+#   value       = module.cognito.user_pool_id
+# }
+# 
+# output "cognito_app_client_id" {
+#   description = "Cognito App Client ID"
+#   value       = module.cognito.client_id
+# }
+# 
+# output "cognito_groups" {
+#   description = "Cognito internal pilot groups"
+#   value = {
+#     staff = module.cognito.staff_group_name
+#     admin = module.cognito.admin_group_name
+#   }
+# }
 
 output "secrets_tenant_template_arn" {
   description = "Secrets Manager template secret ARN"

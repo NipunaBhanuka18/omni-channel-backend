@@ -40,9 +40,10 @@ resource "aws_api_gateway_method" "health_get" {
   http_method   = "GET"
   authorization = "NONE"
 
-  # Generic header extraction placeholder for x-tenant-id
+  # Header extraction placeholder for Azure AD Bearer JWT and x-tenant-id
   request_parameters = {
-    "method.request.header.x-tenant-id" = false # Optional in Phase 1 scaffold
+    "method.request.header.x-tenant-id"   = false # Optional tenant header
+    "method.request.header.Authorization" = false # Optional Azure AD Bearer JWT token header
   }
 }
 
@@ -76,11 +77,13 @@ resource "aws_api_gateway_integration_response" "health_mock_200" {
 
   response_templates = {
     "application/json" = jsonencode({
-      status      = "healthy"
-      environment = var.environment
-      phase       = "phase-1-scaffold"
-      timestamp   = "$context.requestTime"
-      tenant_id   = "$input.params('x-tenant-id')" # Passthrough logging placeholder
+      status               = "healthy"
+      environment          = var.environment
+      phase                = "phase-1-scaffold"
+      auth_provider        = "azure-ad"
+      timestamp            = "$context.requestTime"
+      tenant_id            = "$input.params('x-tenant-id')"
+      authorization_header = "$input.params('Authorization')"
     })
   }
 

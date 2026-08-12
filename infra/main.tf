@@ -17,10 +17,15 @@ module "waf" {
   api_gateway_stage_arn = module.api_gateway.stage_arn
 }
 
-module "cognito" {
-  source      = "./cognito"
-  environment = var.environment
-}
+# ------------------------------------------------------------------------------
+# DEPRECATED: Cognito Identity Module
+# Deprecated as of 2026-08-07 — replaced by Azure AD per supervisor + BRD confirmation.
+# Retained for reference only in ./cognito/, not included in active root module.
+# ------------------------------------------------------------------------------
+# module "cognito" {
+#   source      = "./cognito"
+#   environment = var.environment
+# }
 
 module "secrets" {
   source      = "./secrets"
