@@ -87,7 +87,166 @@ resource "aws_api_gateway_integration_response" "health_mock_200" {
     })
   }
 
-  depends_on = [aws_api_gateway_integration.health_mock]
+  depends_on = [aws_api_gateway_integration_response.health_mock_200]
+}
+
+# ------------------------------------------------------------------------------
+# Phase 3 Endpoint: Tenant Resolver & Runtime Router (/route)
+# ------------------------------------------------------------------------------
+
+resource "aws_api_gateway_resource" "route" {
+  rest_api_id = aws_api_gateway_rest_api.omni_channel.id
+  parent_id   = aws_api_gateway_rest_api.omni_channel.root_resource_id
+  path_part   = "route"
+}
+
+resource "aws_api_gateway_method" "route_get" {
+  rest_api_id   = aws_api_gateway_rest_api.omni_channel.id
+  resource_id   = aws_api_gateway_resource.route.id
+  http_method   = "GET"
+  authorization = "NONE"
+
+  request_parameters = {
+    "method.request.header.Authorization"     = false
+    "method.request.header.x-tenant-id"       = false
+    "method.request.header.x-channel"         = false
+    "method.request.header.x-session-id"     = false
+    "method.request.header.x-conversation-id" = false
+  }
+}
+
+resource "aws_api_gateway_integration" "route_mock" {
+  rest_api_id = aws_api_gateway_rest_api.omni_channel.id
+  resource_id = aws_api_gateway_resource.route.id
+  http_method = aws_api_gateway_method.route_get.http_method
+  type        = "MOCK"
+
+  request_templates = {
+    "application/json" = <<EOF
+#set($auth = $input.params('Authorization'))
+#set($tenant = $input.params('x-tenant-id'))
+#if($auth == "")
+  {"statusCode": 401}
+#elseif($tenant == "")
+  {"statusCode": 400}
+#else
+  {"statusCode": 200}
+#end
+EOF
+  }
+}
+
+resource "aws_api_gateway_method_response" "route_200" {
+  rest_api_id = aws_api_gateway_rest_api.omni_channel.id
+  resource_id = aws_api_gateway_resource.route.id
+  http_method = aws_api_gateway_method.route_get.http_method
+  status_code = "200"
+
+  response_models = {
+    "application/json" = "Empty"
+  }
+}
+
+resource "aws_api_gateway_method_response" "route_400" {
+  rest_api_id = aws_api_gateway_rest_api.omni_channel.id
+  resource_id = aws_api_gateway_resource.route.id
+  http_method = aws_api_gateway_method.route_get.http_method
+  status_code = "400"
+
+  response_models = {
+    "application/json" = "Empty"
+  }
+}
+
+resource "aws_api_gateway_method_response" "route_401" {
+  rest_api_id = aws_api_gateway_rest_api.omni_channel.id
+  resource_id = aws_api_gateway_resource.route.id
+  http_method = aws_api_gateway_method.route_get.http_method
+  status_code = "401"
+
+  response_models = {
+    "application/json" = "Empty"
+  }
+}
+
+resource "aws_api_gateway_integration_response" "route_mock_200" {
+  rest_api_id = aws_api_gateway_rest_api.omni_channel.id
+  resource_id = aws_api_gateway_resource.route.id
+  http_method = aws_api_gateway_method.route_get.http_method
+  status_code = aws_api_gateway_method_response.route_200.status_code
+
+  response_templates = {
+    "application/json" = <<EOF
+#set($channel = $input.params('x-channel'))
+#if($channel == "")#set($channel = "web")#end
+#set($session = $input.params('x-session-id'))
+#if($session == "")#set($session = "sess-default-8832-47a1")#end
+#set($conv = $input.params('x-conversation-id'))
+#if($conv == "")#set($conv = "conv-default-9412-23b9")#end
+{
+  "success": true,
+  "data": {
+    "targetAgent": "main-agent",
+    "tenantContext": {
+      "tenantId": "$input.params('x-tenant-id')",
+      "userId": "dev-user-001",
+      "role": "staff",
+      "permissions": ["billing:read", "usage:read", "faults:read"],
+      "channel": "$channel",
+      "sessionId": "$session",
+      "conversationId": "$conv"
+    },
+    "routedAt": "$context.requestTime"
+  }
+}
+EOF
+  }
+
+  depends_on = [aws_api_gateway_integration.route_mock]
+}
+
+resource "aws_api_gateway_integration_response" "route_mock_400" {
+  rest_api_id = aws_api_gateway_rest_api.omni_channel.id
+  resource_id = aws_api_gateway_resource.route.id
+  http_method = aws_api_gateway_method.route_get.http_method
+  status_code = aws_api_gateway_method_response.route_400.status_code
+  selection_pattern = "400"
+
+  response_templates = {
+    "application/json" = jsonencode({
+      success = false
+      error = {
+        code      = "BAD_REQUEST"
+        message   = "Missing or empty x-tenant-id header"
+        retryable = false
+        details   = { requiredHeader = "x-tenant-id" }
+      }
+    })
+  }
+
+  depends_on = [aws_api_gateway_integration.route_mock]
+}
+
+resource "aws_api_gateway_integration_response" "route_mock_401" {
+  rest_api_id = aws_api_gateway_rest_api.omni_channel.id
+  resource_id = aws_api_gateway_resource.route.id
+  http_method = aws_api_gateway_method.route_get.http_method
+  status_code = aws_api_gateway_method_response.route_401.status_code
+  selection_pattern = "401"
+
+  response_templates = {
+    "application/json" = jsonencode({
+      success = false
+      error = {
+        code      = "UNAUTHORIZED"
+        message   = "Missing or empty Authorization header. Expected format: 'Bearer <token>'"
+        retryable = false
+        details   = { requiredHeader = "Authorization" }
+      }
+    })
+  }
+
+  depends_on = [aws_api_gateway_integration.route_mock]
 }
 
 # ------------------------------------------------------------------------------
@@ -102,6 +261,9 @@ resource "aws_api_gateway_deployment" "deployment" {
       aws_api_gateway_resource.health.id,
       aws_api_gateway_method.health_get.id,
       aws_api_gateway_integration.health_mock.id,
+      aws_api_gateway_resource.route.id,
+      aws_api_gateway_method.route_get.id,
+      aws_api_gateway_integration.route_mock.id,
     ]))
   }
 
@@ -109,7 +271,12 @@ resource "aws_api_gateway_deployment" "deployment" {
     create_before_destroy = true
   }
 
-  depends_on = [aws_api_gateway_integration_response.health_mock_200]
+  depends_on = [
+    aws_api_gateway_integration_response.health_mock_200,
+    aws_api_gateway_integration_response.route_mock_200,
+    aws_api_gateway_integration_response.route_mock_400,
+    aws_api_gateway_integration_response.route_mock_401,
+  ]
 }
 
 resource "aws_api_gateway_stage" "stage" {

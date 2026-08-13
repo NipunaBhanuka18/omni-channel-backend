@@ -126,5 +126,36 @@ Phase 1 foundational infrastructure scaffolding—encompassing API Gateway REST 
   - Parse and validate incoming Azure AD Bearer JWTs into typed `TenantContext` instances.
   - Enforce tenant isolation and route action requests to specialized agent microservices using the shared contracts.
 
+---
+
+## ADR-005: Phase 3 Tenant Resolver & Tenant Runtime Router Scaffolding
+
+- **Status**: Accepted
+- **Date**: 2026-08-13
+- **Scope**: Tenant Context Resolution, Multi-Tenant Runtime Routing, Hand-Off Boundary to Main Agent
+
+### Context
+Phase 3 establishes the Tenant Resolver and Tenant Runtime Router services directly downstream of API Gateway ingress. These components transform incoming request headers into a strictly-typed `TenantContext` and emit a routing decision for downstream agent microservices.
+
+---
+
+### Decisions & Rationale
+
+#### 1. Dev-Only Mock JWT Validator Scope & Guard Enforcement
+- **Decision**: `resolveTenantContext` utilizes the development-only mock validator (`services/tenant-resolver/mock-jwt-validator.ts`) to extract user claims without requiring remote Azure AD JWKS key fetching during LocalStack testing.
+- **Security Constraint**: Structural safety checks (`assertMockAuthPermitted`) throw a fatal runtime error if executed under `NODE_ENV === "production"`.
+
+#### 2. Separation of `sessionId` vs `conversationId`
+- **Decision**: `TenantContext` explicitly resolves both `sessionId` and `conversationId`:
+  - `sessionId`: Broad authenticated user session (persists across multiple actions and user interactions).
+  - `conversationId`: Granular interactive thread. Generated as `conv-<uuid>` if omitted, or reused when explicitly passed in headers (`x-conversation-id`).
+
+#### 3. Structured Error Response Alignment
+- **Decision**: All header resolution, token parsing, and tenant routing failures return errors matching the system-wide `AgentActionResponse["error"]` contract (`code`, `message`, `retryable`, `details`).
+
+#### 4. Defined Handoff Boundary to Main Agent (Phase 4)
+- **Decision**: The Tenant Runtime Router outputs a structured `RoutingDecisionResult` (`{ targetAgent: "main-agent", tenantContext: ... }`) without calling or executing agent logic, preserving a clear handoff boundary for Phase 4 Main Agent development.
+
+
 
 
