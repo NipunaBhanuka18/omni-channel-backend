@@ -8,6 +8,11 @@ output "api_gateway_health_invoke_url" {
   value       = module.api_gateway.invoke_url
 }
 
+output "api_gateway_route_invoke_url" {
+  description = "Invoke URL for Tenant Router endpoint"
+  value       = module.api_gateway.route_invoke_url
+}
+
 # ------------------------------------------------------------------------------
 # DEPRECATED: Cognito Identity Outputs (Commented out per Azure AD transition)
 # ------------------------------------------------------------------------------
