@@ -156,6 +156,33 @@ Phase 3 establishes the Tenant Resolver and Tenant Runtime Router services direc
 #### 4. Defined Handoff Boundary to Main Agent (Phase 4)
 - **Decision**: The Tenant Runtime Router outputs a structured `RoutingDecisionResult` (`{ targetAgent: "main-agent", tenantContext: ... }`) without calling or executing agent logic, preserving a clear handoff boundary for Phase 4 Main Agent development.
 
+---
+
+## ADR-006: Ingress Correction — API Gateway Transition from MOCK to Live Lambda Proxy Integration
+
+- **Status**: Accepted
+- **Date**: 2026-08-15
+- **Scope**: Ingress (`infra/api-gateway/`), Lambda Module (`infra/lambda/`), Runtime Adapter (`services/tenant-router/lambda-adapter.ts`)
+
+### Context
+During initial Phase 1 and Phase 3 infrastructure scaffolding, API Gateway endpoints (`/health` and `/route`) were deployed using static `MOCK` integrations evaluated via Velocity Template Language (VTL) templates. While this allowed early verification of API Gateway parameter validation, static `MOCK` integrations do not invoke application code in LocalStack or AWS.
+
+---
+
+### Decisions & Rationale
+
+#### 1. Transition of `/route` Endpoint to `AWS_PROXY` Integration
+- **Decision**: Replaced static `MOCK` integrations on the `/route` resource with `AWS_PROXY` Lambda Proxy integrations.
+- **Rationale**: Forwards raw HTTP request events (`APIGatewayProxyEvent`) directly to a live Node.js Lambda function execution on LocalStack/AWS, enabling true end-to-end runtime execution of `services/tenant-router/handler.ts`, `agents/main-agent/handler.ts`, and specialist microservices.
+
+#### 2. Provisioning of Tenant Router Lambda Function (`infra/lambda/`)
+- **Decision**: Provisioned `aws_lambda_function.tenant_router` (`omni-channel-tenant-router-${env}`) running Node.js runtime targeting `./dist`.
+- **Lambda Adapter**: Implemented `services/tenant-router/lambda-adapter.ts` to translate `APIGatewayProxyEvent` into `handleTenantRequest` input and map structured responses into `APIGatewayProxyResult`.
+
+#### 3. LocalStack Service Configuration Update
+- **Decision**: Added `lambda` to the `SERVICES` environment variable in `docker-compose.yml` and configured `lambda = var.localstack_url` under Terraform's LocalStack provider endpoints block.
+
+
 
 
 

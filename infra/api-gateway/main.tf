@@ -269,12 +269,14 @@ resource "aws_api_gateway_method" "route_post" {
 }
 
 resource "aws_api_gateway_integration" "route_post_mock" {
-  rest_api_id = aws_api_gateway_rest_api.omni_channel.id
-  resource_id = aws_api_gateway_resource.route.id
-  http_method = aws_api_gateway_method.route_post.http_method
-  type        = "MOCK"
+  rest_api_id             = aws_api_gateway_rest_api.omni_channel.id
+  resource_id             = aws_api_gateway_resource.route.id
+  http_method             = aws_api_gateway_method.route_post.http_method
+  integration_http_method = var.tenant_router_lambda_invoke_arn != "" ? "POST" : null
+  type                    = var.tenant_router_lambda_invoke_arn != "" ? "AWS_PROXY" : "MOCK"
+  uri                     = var.tenant_router_lambda_invoke_arn != "" ? var.tenant_router_lambda_invoke_arn : null
 
-  request_templates = {
+  request_templates = var.tenant_router_lambda_invoke_arn == "" ? {
     "application/json" = <<EOF
 #set($auth = $input.params('Authorization'))
 #set($tenant = $input.params('x-tenant-id'))
@@ -289,7 +291,7 @@ resource "aws_api_gateway_integration" "route_post_mock" {
   {"statusCode": 200}
 #end
 EOF
-  }
+  } : null
 }
 
 resource "aws_api_gateway_method_response" "route_post_200" {
