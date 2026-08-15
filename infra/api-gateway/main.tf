@@ -87,7 +87,7 @@ resource "aws_api_gateway_integration_response" "health_mock_200" {
     })
   }
 
-  depends_on = [aws_api_gateway_integration_response.health_mock_200]
+  depends_on = [aws_api_gateway_integration.health_mock]
 }
 
 # ------------------------------------------------------------------------------
