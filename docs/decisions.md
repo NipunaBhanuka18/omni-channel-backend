@@ -182,6 +182,30 @@ During initial Phase 1 and Phase 3 infrastructure scaffolding, API Gateway endpo
 #### 3. LocalStack Service Configuration Update
 - **Decision**: Added `lambda` to the `SERVICES` environment variable in `docker-compose.yml` and configured `lambda = var.localstack_url` under Terraform's LocalStack provider endpoints block.
 
+---
+
+## ADR-007: Multi-Developer Environment Alignment & `docker-compose.yml` Service Specification
+
+- **Status**: Accepted
+- **Date**: 2026-08-17
+- **Scope**: Local Environment (`docker-compose.yml`), Infrastructure Composition
+
+### Context
+During parallel infrastructure development, parallel commits modified `docker-compose.yml` independently to satisfy individual feature requirements (e.g. adding `lambda` for API Gateway Ingress vs. focusing on `dynamodb` for Main Agent state persistence). This resulted in service reduction conflicts where necessary LocalStack services (`apigateway`, `lambda`, `secretsmanager`, `iam`, `wafv2`, etc.) and mandatory environment variables (`LOCALSTACK_AUTH_TOKEN`) were omitted.
+
+---
+
+### Decisions & Rationale
+
+#### 1. Unified Service Manifest in `docker-compose.yml`
+- **Decision**: `SERVICES` in `docker-compose.yml` must explicitly declare the complete superset of all platform services required across all active modules:
+  `SERVICES=apigateway,wafv2,secretsmanager,cognito,iam,s3,sqs,dynamodb,events,sts,kms,lambda`
+- **Mandatory Environment Variables**: Preserved `LOCALSTACK_AUTH_TOKEN=${LOCALSTACK_AUTH_TOKEN}` to prevent license activation failures when operating with LocalStack Pro image tags (`localstack/localstack:3.0`).
+
+#### 2. Cross-Team Coordination Protocol for Environment Manifests
+- **Decision**: `docker-compose.yml` is classified as a shared infrastructure asset. Developers adding or modifying service dependencies must merge additions additively into the unified `SERVICES` list rather than replacing the variable wholesale.
+
+
 
 
 
