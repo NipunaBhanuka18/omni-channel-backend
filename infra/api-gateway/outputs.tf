@@ -27,3 +27,8 @@ output "invoke_url" {
   description = "Invoke URL for the health check endpoint"
   value       = "${aws_api_gateway_stage.stage.invoke_url}/health"
 }
+
+output "route_invoke_url" {
+  description = "Invoke URL for the Tenant Router endpoint"
+  value       = "${aws_api_gateway_stage.stage.invoke_url}/route"
+}

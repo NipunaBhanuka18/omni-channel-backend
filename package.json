@@ -6,6 +6,7 @@
     "doc": "docs"
   },
   "scripts": {
+    "build": "tsc",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "repository": {
@@ -27,6 +28,8 @@
   "devDependencies": {
     "@types/aws-lambda": "^8.10.162",
     "@types/node": "^26.2.0",
+    "ts-node": "^10.9.2",
+    "tsx": "^4.23.12",
     "typescript": "^7.0.2"
   }
 }

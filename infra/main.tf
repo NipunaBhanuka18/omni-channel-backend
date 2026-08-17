@@ -1,13 +1,20 @@
 # ==============================================================================
-# Omni Channel Backend Infrastructure Root Module (Phase 1)
+# Omni Channel Backend Infrastructure Root Module
 # ==============================================================================
-# Modular composition for API Gateway, WAF, Cognito, and Secrets Manager.
+# Modular composition for API Gateway, Lambda, WAF, Cognito, and Secrets Manager.
 # Designed for LocalStack local development with effortless migration to real AWS.
 # ==============================================================================
 
+module "lambda" {
+  source                    = "./lambda"
+  environment               = var.environment
+  api_gateway_execution_arn = module.api_gateway.execution_arn
+}
+
 module "api_gateway" {
-  source      = "./api-gateway"
-  environment = var.environment
+  source                           = "./api-gateway"
+  environment                      = var.environment
+  tenant_router_lambda_invoke_arn  = module.lambda.invoke_arn
 }
 
 module "waf" {
