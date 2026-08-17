@@ -1,15 +1,11 @@
 services:
   localstack:
     container_name: omni_channel_localstack
-    image: localstack/localstack:latest
+    image: localstack/localstack:3.0   
     ports:
-      - "127.0.0.1:4566:4566" # LocalStack Gateway
-      - "127.0.0.1:4510-4559:4510-4559" # External service port range
+      - "127.0.0.1:4566:4566"
     environment:
-      - SERVICES=apigateway,wafv2,secretsmanager,cognito,iam,s3,sqs,dynamodb,events,sts,kms
+      - SERVICES=dynamodb
       - DEBUG=1
-      - DOCKER_HOST=unix:///var/run/docker.sock
-      - LOCALSTACK_AUTH_TOKEN=${LOCALSTACK_AUTH_TOKEN}
     volumes:
-      - "${LOCALSTACK_VOLUME_DIR:-./.localstack}:/var/lib/localstack"
       - "/var/run/docker.sock:/var/run/docker.sock"
