@@ -156,6 +156,85 @@ Phase 3 establishes the Tenant Resolver and Tenant Runtime Router services direc
 #### 4. Defined Handoff Boundary to Main Agent (Phase 4)
 - **Decision**: The Tenant Runtime Router outputs a structured `RoutingDecisionResult` (`{ targetAgent: "main-agent", tenantContext: ... }`) without calling or executing agent logic, preserving a clear handoff boundary for Phase 4 Main Agent development.
 
+---
+
+## ADR-006: Ingress Correction — API Gateway Transition from MOCK to Live Lambda Proxy Integration
+
+- **Status**: Accepted
+- **Date**: 2026-08-15
+- **Scope**: Ingress (`infra/api-gateway/`), Lambda Module (`infra/lambda/`), Runtime Adapter (`services/tenant-router/lambda-adapter.ts`)
+
+### Context
+During initial Phase 1 and Phase 3 infrastructure scaffolding, API Gateway endpoints (`/health` and `/route`) were deployed using static `MOCK` integrations evaluated via Velocity Template Language (VTL) templates. While this allowed early verification of API Gateway parameter validation, static `MOCK` integrations do not invoke application code in LocalStack or AWS.
+
+---
+
+### Decisions & Rationale
+
+#### 1. Transition of `/route` Endpoint to `AWS_PROXY` Integration
+- **Decision**: Replaced static `MOCK` integrations on the `/route` resource with `AWS_PROXY` Lambda Proxy integrations.
+- **Rationale**: Forwards raw HTTP request events (`APIGatewayProxyEvent`) directly to a live Node.js Lambda function execution on LocalStack/AWS, enabling true end-to-end runtime execution of `services/tenant-router/handler.ts`, `agents/main-agent/handler.ts`, and specialist microservices.
+
+#### 2. Provisioning of Tenant Router Lambda Function (`infra/lambda/`)
+- **Decision**: Provisioned `aws_lambda_function.tenant_router` (`omni-channel-tenant-router-${env}`) running Node.js runtime targeting `./dist`.
+- **Lambda Adapter**: Implemented `services/tenant-router/lambda-adapter.ts` to translate `APIGatewayProxyEvent` into `handleTenantRequest` input and map structured responses into `APIGatewayProxyResult`.
+
+#### 3. LocalStack Service Configuration Update
+- **Decision**: Added `lambda` to the `SERVICES` environment variable in `docker-compose.yml` and configured `lambda = var.localstack_url` under Terraform's LocalStack provider endpoints block.
+
+---
+
+## ADR-007: Multi-Developer Environment Alignment & `docker-compose.yml` Service Specification
+
+- **Status**: Accepted
+- **Date**: 2026-08-17
+- **Scope**: Local Environment (`docker-compose.yml`), Infrastructure Composition
+
+### Context
+During parallel infrastructure development, parallel commits modified `docker-compose.yml` independently to satisfy individual feature requirements (e.g. adding `lambda` for API Gateway Ingress vs. focusing on `dynamodb` for Main Agent state persistence). This resulted in service reduction conflicts where necessary LocalStack services (`apigateway`, `lambda`, `secretsmanager`, `iam`, `wafv2`, etc.) and mandatory environment variables (`LOCALSTACK_AUTH_TOKEN`) were omitted.
+
+---
+
+### Decisions & Rationale
+
+#### 1. Unified Service Manifest in `docker-compose.yml`
+- **Decision**: `SERVICES` in `docker-compose.yml` must explicitly declare the complete superset of all platform services required across all active modules:
+  `SERVICES=apigateway,wafv2,secretsmanager,cognito,iam,s3,sqs,dynamodb,events,sts,kms,lambda`
+- **Mandatory Environment Variables**: Preserved `LOCALSTACK_AUTH_TOKEN=${LOCALSTACK_AUTH_TOKEN}` to prevent license activation failures when operating with LocalStack Pro image tags (`localstack/localstack:3.0`).
+
+#### 2. Cross-Team Coordination Protocol for Environment Manifests
+- **Decision**: `docker-compose.yml` is classified as a shared infrastructure asset. Developers adding or modifying service dependencies must merge additions additively into the unified `SERVICES` list rather than replacing the variable wholesale.
+
+---
+
+## ADR-008: Role-Based Access Control (RBAC) Permission Enforcement at Ingress Router Layer
+
+- **Status**: Accepted
+- **Date**: 2026-08-17
+- **Scope**: Ingress Router (`services/tenant-router/handler.ts`), Permission Matrix (`services/tenant-router/permission-map.ts`), Security Hardening (Phase 6)
+
+### Context
+Prior to Phase 6 security hardening, the `TenantContext` carried fine-grained permissions (e.g., `billing:read`, `usage:read`, `faults:create`), but access enforcement was not applied before dispatching requests to the Main Agent. Any authenticated request could trigger any intent, posing a privilege escalation risk.
+
+---
+
+### Decisions & Rationale
+
+#### 1. Ingress Router Layer Enforcement (Pre-Main Agent Handoff)
+- **Decision**: RBAC permission checks are enforced directly in `services/tenant-router/handler.ts` after tenant routing resolution but prior to invoking `mainAgentHandler`.
+- **Rationale**: Prevents unauthorized requests from reaching downstream agent logic or triggering state logging (e.g. DynamoDB conversation writes) when access is denied.
+
+#### 2. Intent-to-Permission Mapping Matrix (`permission-map.ts`)
+- **Decision**: Implemented a central lookup mapping business intents to required fine-grained permissions (e.g., `check_balance` -> `PERMISSIONS.BILLING_READ`).
+- **Single-Line Extensibility**: Adding new intent mappings requires a single line addition to `INTENT_PERMISSION_MAP`.
+
+#### 3. Fail-Closed Security Policy for Unmapped Intents
+- **Decision**: Any intent not explicitly registered in `INTENT_PERMISSION_MAP` is denied by default (`getRequiredPermissionForIntent` returns `undefined`), returning a structured `403 FORBIDDEN` response.
+- **Rationale**: Enforces strict security defaults to guarantee that future or unmapped intents cannot be silently executed without explicit authorization rules.
+
+
+
+
 
 
 
