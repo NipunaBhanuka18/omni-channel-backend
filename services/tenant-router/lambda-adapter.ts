@@ -8,9 +8,19 @@ export const handler = async (event: any): Promise<any> => {
   try {
     let rawBodyStr = event.body;
 
+    // Detailed character-level & byte-level logging for diagnosis
+    if (typeof rawBodyStr === "string") {
+      const charCodes = Array.from(rawBodyStr.slice(0, 30)).map((c) => `${c}: ${c.charCodeAt(0)}`);
+      console.log(`[LambdaAdapter] RAW event.body (len=${rawBodyStr.length}):`, JSON.stringify(rawBodyStr));
+      console.log(`[LambdaAdapter] RAW event.body char codes (first 30):`, charCodes.join(", "));
+    } else {
+      console.log("[LambdaAdapter] RAW event.body (type):", typeof rawBodyStr);
+    }
+
     // Handle standard API Gateway base64-encoded request bodies
     if (event.isBase64Encoded && typeof rawBodyStr === "string") {
       rawBodyStr = Buffer.from(rawBodyStr, "base64").toString("utf-8");
+      console.log("[LambdaAdapter] Base64 decoded body:", rawBodyStr);
     }
 
     let body: any = {};
@@ -19,6 +29,7 @@ export const handler = async (event: any): Promise<any> => {
         try {
           body = JSON.parse(rawBodyStr);
         } catch (parseError: any) {
+          console.error("[LambdaAdapter] Strict JSON.parse failed. Raw payload string was:", JSON.stringify(rawBodyStr));
           // Strict Input Validation: Return structured 400 Bad Request error for malformed JSON payloads
           return {
             statusCode: 400,
@@ -32,7 +43,7 @@ export const handler = async (event: any): Promise<any> => {
                 code: "BAD_REQUEST",
                 message: `Invalid or malformed JSON payload in request body: ${parseError.message}`,
                 retryable: false,
-                details: { parseError: parseError.message },
+                details: { parseError: parseError.message, rawBody: rawBodyStr },
               },
             }),
           };
