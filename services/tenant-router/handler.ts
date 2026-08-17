@@ -1,6 +1,7 @@
 import { resolveTenantContext } from "../tenant-resolver/resolver";
 import { routeRequest, RoutingDecisionResult } from "./router";
 import { AgentActionResponse } from "../../shared/types/agent-action";
+import { getRequiredPermissionForIntent } from "./permission-map";
 import { handler as mainAgentHandler } from "../../agents/main-agent/handler";
 
 export interface HttpRequestPayload {
@@ -58,12 +59,42 @@ export async function handleTenantRequest(request: HttpRequestPayload): Promise<
   }
 
   const params = request.body?.params || {};
+  const cleanIntent = intent.trim();
 
-  // Step 4: Invoke Main Agent handler (if targetAgent is main-agent)
+  // Step 4: RBAC Permission Enforcement
+  const requiredPermission = getRequiredPermissionForIntent(cleanIntent);
+
+  // Fail closed if intent is not mapped in permission matrix
+  if (!requiredPermission) {
+    return {
+      success: false,
+      error: {
+        code: "FORBIDDEN",
+        message: `Access denied: Intent '${cleanIntent}' is unmapped and denied by security policy.`,
+        retryable: false,
+        details: { requiredPermission: "none (unmapped_intent)" },
+      },
+    };
+  }
+
+  const userPermissions = routerResult.data.tenantContext.permissions || [];
+  if (!userPermissions.includes(requiredPermission)) {
+    return {
+      success: false,
+      error: {
+        code: "FORBIDDEN",
+        message: "Access denied: Missing required permission for requested intent",
+        retryable: false,
+        details: { requiredPermission },
+      },
+    };
+  }
+
+  // Step 5: Invoke Main Agent handler (if targetAgent is main-agent)
   if (routerResult.data.targetAgent === "main-agent") {
     return await mainAgentHandler({
       context: routerResult.data.tenantContext,
-      intent: intent.trim(),
+      intent: cleanIntent,
       params: params,
     });
   }

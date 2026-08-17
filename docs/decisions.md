@@ -205,6 +205,34 @@ During parallel infrastructure development, parallel commits modified `docker-co
 #### 2. Cross-Team Coordination Protocol for Environment Manifests
 - **Decision**: `docker-compose.yml` is classified as a shared infrastructure asset. Developers adding or modifying service dependencies must merge additions additively into the unified `SERVICES` list rather than replacing the variable wholesale.
 
+---
+
+## ADR-008: Role-Based Access Control (RBAC) Permission Enforcement at Ingress Router Layer
+
+- **Status**: Accepted
+- **Date**: 2026-08-17
+- **Scope**: Ingress Router (`services/tenant-router/handler.ts`), Permission Matrix (`services/tenant-router/permission-map.ts`), Security Hardening (Phase 6)
+
+### Context
+Prior to Phase 6 security hardening, the `TenantContext` carried fine-grained permissions (e.g., `billing:read`, `usage:read`, `faults:create`), but access enforcement was not applied before dispatching requests to the Main Agent. Any authenticated request could trigger any intent, posing a privilege escalation risk.
+
+---
+
+### Decisions & Rationale
+
+#### 1. Ingress Router Layer Enforcement (Pre-Main Agent Handoff)
+- **Decision**: RBAC permission checks are enforced directly in `services/tenant-router/handler.ts` after tenant routing resolution but prior to invoking `mainAgentHandler`.
+- **Rationale**: Prevents unauthorized requests from reaching downstream agent logic or triggering state logging (e.g. DynamoDB conversation writes) when access is denied.
+
+#### 2. Intent-to-Permission Mapping Matrix (`permission-map.ts`)
+- **Decision**: Implemented a central lookup mapping business intents to required fine-grained permissions (e.g., `check_balance` -> `PERMISSIONS.BILLING_READ`).
+- **Single-Line Extensibility**: Adding new intent mappings requires a single line addition to `INTENT_PERMISSION_MAP`.
+
+#### 3. Fail-Closed Security Policy for Unmapped Intents
+- **Decision**: Any intent not explicitly registered in `INTENT_PERMISSION_MAP` is denied by default (`getRequiredPermissionForIntent` returns `undefined`), returning a structured `403 FORBIDDEN` response.
+- **Rationale**: Enforces strict security defaults to guarantee that future or unmapped intents cannot be silently executed without explicit authorization rules.
+
+
 
 
 
