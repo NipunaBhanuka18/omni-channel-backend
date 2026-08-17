@@ -60,7 +60,14 @@ export function decodeMockAzureJwt(authorizationHeader?: string): Partial<Tenant
   const parts = token.split(".");
 
   if (parts.length !== 3) {
-    // If a simple mock string token is passed in local dev (e.g., "dev-token-staff")
+    if (token === "dev-token-guest" || token === "dev-token-restricted") {
+      return {
+        userId: "dev-user-guest",
+        role: "staff",
+        permissions: ["usage:read"], // Restricted permissions (lacks billing:read)
+      };
+    }
+    // Default mock token for staff in local development (e.g., "dev-token-staff")
     return {
       userId: "dev-user-001",
       role: "staff",

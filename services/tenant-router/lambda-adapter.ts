@@ -6,9 +6,51 @@ import { handleTenantRequest } from "./handler";
  */
 export const handler = async (event: any): Promise<any> => {
   try {
+    let rawBodyStr = event.body;
+
+    // Detailed character-level & byte-level logging for diagnosis
+    if (typeof rawBodyStr === "string") {
+      const charCodes = Array.from(rawBodyStr.slice(0, 30)).map((c) => `${c}: ${c.charCodeAt(0)}`);
+      console.log(`[LambdaAdapter] RAW event.body (len=${rawBodyStr.length}):`, JSON.stringify(rawBodyStr));
+      console.log(`[LambdaAdapter] RAW event.body char codes (first 30):`, charCodes.join(", "));
+    } else {
+      console.log("[LambdaAdapter] RAW event.body (type):", typeof rawBodyStr);
+    }
+
+    // Handle standard API Gateway base64-encoded request bodies
+    if (event.isBase64Encoded && typeof rawBodyStr === "string") {
+      rawBodyStr = Buffer.from(rawBodyStr, "base64").toString("utf-8");
+      console.log("[LambdaAdapter] Base64 decoded body:", rawBodyStr);
+    }
+
     let body: any = {};
-    if (event.body) {
-      body = typeof event.body === "string" ? JSON.parse(event.body) : event.body;
+    if (rawBodyStr) {
+      if (typeof rawBodyStr === "string") {
+        try {
+          body = JSON.parse(rawBodyStr);
+        } catch (parseError: any) {
+          console.error("[LambdaAdapter] Strict JSON.parse failed. Raw payload string was:", JSON.stringify(rawBodyStr));
+          // Strict Input Validation: Return structured 400 Bad Request error for malformed JSON payloads
+          return {
+            statusCode: 400,
+            headers: {
+              "Content-Type": "application/json",
+              "Access-Control-Allow-Origin": "*",
+            },
+            body: JSON.stringify({
+              success: false,
+              error: {
+                code: "BAD_REQUEST",
+                message: `Invalid or malformed JSON payload in request body: ${parseError.message}`,
+                retryable: false,
+                details: { parseError: parseError.message, rawBody: rawBodyStr },
+              },
+            }),
+          };
+        }
+      } else {
+        body = rawBodyStr;
+      }
     }
 
     // Normalize incoming headers to lowercase keys for consistent lookup
