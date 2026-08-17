@@ -250,6 +250,183 @@ resource "aws_api_gateway_integration_response" "route_mock_401" {
 }
 
 # ------------------------------------------------------------------------------
+# POST Method for /route Resource
+# ------------------------------------------------------------------------------
+
+resource "aws_api_gateway_method" "route_post" {
+  rest_api_id   = aws_api_gateway_rest_api.omni_channel.id
+  resource_id   = aws_api_gateway_resource.route.id
+  http_method   = "POST"
+  authorization = "NONE"
+
+  request_parameters = {
+    "method.request.header.Authorization"     = false
+    "method.request.header.x-tenant-id"       = false
+    "method.request.header.x-channel"         = false
+    "method.request.header.x-session-id"     = false
+    "method.request.header.x-conversation-id" = false
+  }
+}
+
+resource "aws_api_gateway_integration" "route_post_mock" {
+  rest_api_id             = aws_api_gateway_rest_api.omni_channel.id
+  resource_id             = aws_api_gateway_resource.route.id
+  http_method             = aws_api_gateway_method.route_post.http_method
+  integration_http_method = var.tenant_router_lambda_invoke_arn != "" ? "POST" : null
+  type                    = var.tenant_router_lambda_invoke_arn != "" ? "AWS_PROXY" : "MOCK"
+  uri                     = var.tenant_router_lambda_invoke_arn != "" ? var.tenant_router_lambda_invoke_arn : null
+
+  request_templates = var.tenant_router_lambda_invoke_arn == "" ? {
+    "application/json" = <<EOF
+#set($auth = $input.params('Authorization'))
+#set($tenant = $input.params('x-tenant-id'))
+#set($rawBody = $input.body)
+#if($auth == "")
+  {"statusCode": 401}
+#elseif($tenant == "")
+  {"statusCode": 400}
+#elseif(!$rawBody.contains('"intent"'))
+  {"statusCode": 422}
+#else
+  {"statusCode": 200}
+#end
+EOF
+  } : null
+}
+
+resource "aws_api_gateway_method_response" "route_post_200" {
+  rest_api_id = aws_api_gateway_rest_api.omni_channel.id
+  resource_id = aws_api_gateway_resource.route.id
+  http_method = aws_api_gateway_method.route_post.http_method
+  status_code = "200"
+
+  response_models = {
+    "application/json" = "Empty"
+  }
+}
+
+resource "aws_api_gateway_method_response" "route_post_400" {
+  rest_api_id = aws_api_gateway_rest_api.omni_channel.id
+  resource_id = aws_api_gateway_resource.route.id
+  http_method = aws_api_gateway_method.route_post.http_method
+  status_code = "400"
+
+  response_models = {
+    "application/json" = "Empty"
+  }
+}
+
+resource "aws_api_gateway_method_response" "route_post_401" {
+  rest_api_id = aws_api_gateway_rest_api.omni_channel.id
+  resource_id = aws_api_gateway_resource.route.id
+  http_method = aws_api_gateway_method.route_post.http_method
+  status_code = "401"
+
+  response_models = {
+    "application/json" = "Empty"
+  }
+}
+
+resource "aws_api_gateway_method_response" "route_post_422" {
+  rest_api_id = aws_api_gateway_rest_api.omni_channel.id
+  resource_id = aws_api_gateway_resource.route.id
+  http_method = aws_api_gateway_method.route_post.http_method
+  status_code = "422"
+
+  response_models = {
+    "application/json" = "Empty"
+  }
+}
+
+resource "aws_api_gateway_integration_response" "route_post_mock_200" {
+  rest_api_id = aws_api_gateway_rest_api.omni_channel.id
+  resource_id = aws_api_gateway_resource.route.id
+  http_method = aws_api_gateway_method.route_post.http_method
+  status_code = aws_api_gateway_method_response.route_post_200.status_code
+
+  response_templates = {
+    "application/json" = jsonencode({
+      success = true
+      data = {
+        accountNumber      = "SLT-9982-555"
+        outstandingBalance = 1500.5
+        currency           = "LKR"
+        dueDate            = "2026-09-15"
+        status             = "active"
+      }
+    })
+  }
+
+  depends_on = [aws_api_gateway_integration.route_post_mock]
+}
+
+resource "aws_api_gateway_integration_response" "route_post_mock_400" {
+  rest_api_id = aws_api_gateway_rest_api.omni_channel.id
+  resource_id = aws_api_gateway_resource.route.id
+  http_method = aws_api_gateway_method.route_post.http_method
+  status_code = aws_api_gateway_method_response.route_post_400.status_code
+  selection_pattern = "400"
+
+  response_templates = {
+    "application/json" = jsonencode({
+      success = false
+      error = {
+        code      = "BAD_REQUEST"
+        message   = "Missing or empty x-tenant-id header"
+        retryable = false
+        details   = { requiredHeader = "x-tenant-id" }
+      }
+    })
+  }
+
+  depends_on = [aws_api_gateway_integration.route_post_mock]
+}
+
+resource "aws_api_gateway_integration_response" "route_post_mock_401" {
+  rest_api_id = aws_api_gateway_rest_api.omni_channel.id
+  resource_id = aws_api_gateway_resource.route.id
+  http_method = aws_api_gateway_method.route_post.http_method
+  status_code = aws_api_gateway_method_response.route_post_401.status_code
+  selection_pattern = "401"
+
+  response_templates = {
+    "application/json" = jsonencode({
+      success = false
+      error = {
+        code      = "UNAUTHORIZED"
+        message   = "Missing or empty Authorization header. Expected format: 'Bearer <token>'"
+        retryable = false
+        details   = { requiredHeader = "Authorization" }
+      }
+    })
+  }
+
+  depends_on = [aws_api_gateway_integration.route_post_mock]
+}
+
+resource "aws_api_gateway_integration_response" "route_post_mock_422" {
+  rest_api_id = aws_api_gateway_rest_api.omni_channel.id
+  resource_id = aws_api_gateway_resource.route.id
+  http_method = aws_api_gateway_method.route_post.http_method
+  status_code = aws_api_gateway_method_response.route_post_422.status_code
+  selection_pattern = "422"
+
+  response_templates = {
+    "application/json" = jsonencode({
+      success = false
+      error = {
+        code      = "BAD_REQUEST"
+        message   = "Missing required request body field: 'intent'"
+        retryable = false
+        details   = { requiredField = "intent" }
+      }
+    })
+  }
+
+  depends_on = [aws_api_gateway_integration.route_post_mock]
+}
+
+# ------------------------------------------------------------------------------
 # Deployment & Stage Settings (Throttling & Rate Limiting Baseline)
 # ------------------------------------------------------------------------------
 
@@ -264,6 +441,8 @@ resource "aws_api_gateway_deployment" "deployment" {
       aws_api_gateway_resource.route.id,
       aws_api_gateway_method.route_get.id,
       aws_api_gateway_integration.route_mock.id,
+      aws_api_gateway_method.route_post.id,
+      aws_api_gateway_integration.route_post_mock.id,
     ]))
   }
 
@@ -276,6 +455,10 @@ resource "aws_api_gateway_deployment" "deployment" {
     aws_api_gateway_integration_response.route_mock_200,
     aws_api_gateway_integration_response.route_mock_400,
     aws_api_gateway_integration_response.route_mock_401,
+    aws_api_gateway_integration_response.route_post_mock_200,
+    aws_api_gateway_integration_response.route_post_mock_400,
+    aws_api_gateway_integration_response.route_post_mock_401,
+    aws_api_gateway_integration_response.route_post_mock_422,
   ]
 }
 

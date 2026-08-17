@@ -1,6 +1,7 @@
 import { resolveTenantContext } from "../tenant-resolver/resolver";
 import { routeRequest, RoutingDecisionResult } from "./router";
 import { AgentActionResponse } from "../../shared/types/agent-action";
+import { handler as mainAgentHandler } from "../../agents/main-agent/handler";
 
 export interface HttpRequestPayload {
   headers: Record<string, string | undefined>;
@@ -8,12 +9,12 @@ export interface HttpRequestPayload {
 }
 
 /**
- * Handles incoming API request payload through the Tenant Resolver and Tenant Runtime Router pipeline.
+ * Handles incoming API request payload through the Tenant Resolver, Tenant Runtime Router, and Main Agent pipeline.
  *
  * @param request Incoming HTTP request containing headers and optional body
- * @returns AgentActionResponse shape (success: boolean, data?: RoutingDecisionData, error?: structuredError)
+ * @returns AgentActionResponse shape
  */
-export function handleTenantRequest(request: HttpRequestPayload): AgentActionResponse {
+export async function handleTenantRequest(request: HttpRequestPayload): Promise<AgentActionResponse> {
   // Step 1: Resolve Tenant Context from headers
   const resolverResult = resolveTenantContext(request.headers);
 
@@ -42,9 +43,35 @@ export function handleTenantRequest(request: HttpRequestPayload): AgentActionRes
     };
   }
 
-  // Step 3: Return successful routing decision as AgentActionResponse
+  // Step 3: Validate required intent field from body (no fallback default)
+  const intent = request.body?.intent;
+  if (!intent || typeof intent !== "string" || intent.trim() === "") {
+    return {
+      success: false,
+      error: {
+        code: "BAD_REQUEST",
+        message: "Missing required request body field: 'intent'",
+        retryable: false,
+        details: { requiredField: "intent" },
+      },
+    };
+  }
+
+  const params = request.body?.params || {};
+
+  // Step 4: Invoke Main Agent handler (if targetAgent is main-agent)
+  if (routerResult.data.targetAgent === "main-agent") {
+    return await mainAgentHandler({
+      context: routerResult.data.tenantContext,
+      intent: intent.trim(),
+      params: params,
+    });
+  }
+
+  // Fallback for other target agents if added in future
   return {
     success: true,
     data: routerResult.data,
   };
 }
+
