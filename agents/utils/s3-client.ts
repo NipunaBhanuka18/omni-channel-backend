@@ -1,10 +1,10 @@
 import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
 
 // Configure the S3 client to point to LocalStack
-const s3Client = new S3Client({
+export const s3Client = new S3Client({
   region: "us-east-1",
   endpoint: "http://127.0.0.1:4566",
-  forcePathStyle: true, // Required for LocalStack S3
+  forcePathStyle: true,
   credentials: {
     accessKeyId: "mock_access_key",
     secretAccessKey: "mock_secret_key",
