@@ -1,7 +1,7 @@
 import { TenantContext } from "../../../shared/types/tenant-context";
 import { AgentActionResponse } from "../../../shared/types/agent-action";
 import { PERMISSIONS } from "../../../shared/constants/permissions";
-import { fetchKbDocument } from "../../utils/s3-client";
+import { searchKnowledgeBase } from "../../utils/kb-retriever";
 
 export const handler = async (
   context: TenantContext,
@@ -23,24 +23,26 @@ export const handler = async (
     };
   }
 
-  // 2. Fetch the troubleshooting guide from S3
+  // 2. Search the knowledge base based on the user's params
   try {
-    const docText = await fetchKbDocument("router-troubleshooting-guide.txt");
+    // We'll pass a mock query from the params, or default to "slow internet"
+    const userQuery = params.query || "slow internet";
+    const searchResult = await searchKnowledgeBase(userQuery);
 
-    // 3. Return the document text to the user
     return {
       success: true,
       data: {
-        source: "S3 Knowledge Base",
-        guide: docText,
+        source: "Vector Index (Mocked)",
+        query: userQuery,
+        result: searchResult,
       },
     };
   } catch (error) {
     return {
       success: false,
       error: {
-        code: "KB_FETCH_FAILED",
-        message: "Failed to retrieve troubleshooting guide.",
+        code: "KB_SEARCH_FAILED",
+        message: "Failed to search knowledge base.",
         retryable: true,
       },
     };

@@ -22,15 +22,14 @@ async function runTest() {
   const result = await handler({
     context: mockContext,
     intent: "troubleshoot_router", // Testing the NEW intent
-    params: {},
+    params: { query: "slow internet" },
   });
 
   console.log("\n--- Result ---");
-  if (result.success && result.data?.source === "S3 Knowledge Base") {
+  if (result.success && result.data?.source === "Vector Index (Mocked)") {
     console.log(
-      "✅ SUCCESS: Dynamic routing to Support Agent worked! It fetched the S3 doc.",
+      "✅ SUCCESS: Dynamic routing to Support Agent worked! It queried the mock Vector Index.",
     );
-    // console.log(result.data.guide); // Uncomment to see the guide text again
   } else {
     console.log("❌ ERROR: Did not route to support agent correctly.");
     console.log(JSON.stringify(result, null, 2));
