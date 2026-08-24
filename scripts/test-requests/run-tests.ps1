@@ -31,7 +31,7 @@ Write-Host ""
 
 $scriptDir = $PSScriptRoot
 $passCount = 0
-$totalTests = 4
+$totalTests = 8
 
 # Helper to run curl using file payload @filename.json to avoid shell quoting issues
 function Test-Endpoint {
@@ -77,7 +77,7 @@ function Test-Endpoint {
 # Test Case 1: Valid check_balance request (dev-token-staff has billing:read)
 # ------------------------------------------------------------------------------
 if (Test-Endpoint `
-    -TestName "1. Valid Case (Authorized Staff)" `
+    -TestName "1. Valid Case: Billing check_balance (Authorized Staff)" `
     -JsonFile "valid-check-balance.json" `
     -AuthToken "dev-token-staff" `
     -ExpectedPattern '"success"\s*:\s*true' `
@@ -89,7 +89,7 @@ if (Test-Endpoint `
 # Test Case 2: Denied check_balance request (dev-token-guest lacks billing:read)
 # ------------------------------------------------------------------------------
 if (Test-Endpoint `
-    -TestName "2. Denied Case (Unauthorized Guest)" `
+    -TestName "2. Denied Case: Billing check_balance (Unauthorized Guest)" `
     -JsonFile "denied-check-balance.json" `
     -AuthToken "dev-token-guest" `
     -ExpectedPattern '"code"\s*:\s*"FORBIDDEN"' `
@@ -118,6 +118,54 @@ if (Test-Endpoint `
     -AuthToken "dev-token-staff" `
     -ExpectedPattern '"code"\s*:\s*"BAD_REQUEST"' `
     -Description "Request containing invalid JSON syntax should be strictly rejected with BAD_REQUEST (HTTP 400)") {
+    $passCount++
+}
+
+# ------------------------------------------------------------------------------
+# Test Case 5: Valid check_usage request (dev-token-staff has usage:read)
+# ------------------------------------------------------------------------------
+if (Test-Endpoint `
+    -TestName "5. Valid Case: Usage check_usage (Authorized Staff)" `
+    -JsonFile "valid-check-usage.json" `
+    -AuthToken "dev-token-staff" `
+    -ExpectedPattern '"success"\s*:\s*true' `
+    -Description "Request with usage:read permission calling check_usage intent should succeed (HTTP 200)") {
+    $passCount++
+}
+
+# ------------------------------------------------------------------------------
+# Test Case 6: Denied check_usage request (dev-token-billing-only lacks usage:read)
+# ------------------------------------------------------------------------------
+if (Test-Endpoint `
+    -TestName "6. Denied Case: Usage check_usage (Unauthorized Billing-Only User)" `
+    -JsonFile "denied-check-usage.json" `
+    -AuthToken "dev-token-billing-only" `
+    -ExpectedPattern '"code"\s*:\s*"FORBIDDEN"' `
+    -Description "Request lacking usage:read permission calling check_usage intent should fail with FORBIDDEN (HTTP 403)") {
+    $passCount++
+}
+
+# ------------------------------------------------------------------------------
+# Test Case 7: Valid troubleshoot_router request (dev-token-staff has faults:read)
+# ------------------------------------------------------------------------------
+if (Test-Endpoint `
+    -TestName "7. Valid Case: Support troubleshoot_router (Authorized Staff)" `
+    -JsonFile "valid-troubleshoot.json" `
+    -AuthToken "dev-token-staff" `
+    -ExpectedPattern '"success"\s*:\s*true' `
+    -Description "Request with faults:read permission calling troubleshoot_router intent should succeed (HTTP 200)") {
+    $passCount++
+}
+
+# ------------------------------------------------------------------------------
+# Test Case 8: Denied troubleshoot_router request (dev-token-billing-only lacks faults:read)
+# ------------------------------------------------------------------------------
+if (Test-Endpoint `
+    -TestName "8. Denied Case: Support troubleshoot_router (Unauthorized Billing-Only User)" `
+    -JsonFile "denied-troubleshoot.json" `
+    -AuthToken "dev-token-billing-only" `
+    -ExpectedPattern '"code"\s*:\s*"FORBIDDEN"' `
+    -Description "Request lacking faults:read permission calling troubleshoot_router intent should fail with FORBIDDEN (HTTP 403)") {
     $passCount++
 }
 
