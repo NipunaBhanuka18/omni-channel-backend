@@ -26,6 +26,7 @@ provider "aws" {
       events                  = var.localstack_url
       iam                     = var.localstack_url
       kms                     = var.localstack_url
+      lambda                  = var.localstack_url
       s3                      = var.localstack_url
       secretsmanager          = var.localstack_url
       sqs                     = var.localstack_url
