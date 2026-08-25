@@ -232,6 +232,38 @@ Prior to Phase 6 security hardening, the `TenantContext` carried fine-grained pe
 - **Decision**: Any intent not explicitly registered in `INTENT_PERMISSION_MAP` is denied by default (`getRequiredPermissionForIntent` returns `undefined`), returning a structured `403 FORBIDDEN` response.
 - **Rationale**: Enforces strict security defaults to guarantee that future or unmapped intents cannot be silently executed without explicit authorization rules.
 
+---
+
+## ADR-009: RBAC Permission Map Extension for Usage and Support Specialists
+
+- **Status**: Accepted
+- **Date**: 2026-08-21
+- **Scope**: Ingress Router (`services/tenant-router/permission-map.ts`), Mock Token Validator (`services/tenant-resolver/mock-jwt-validator.ts`), Integration Test Suite (`scripts/test-requests/`)
+
+### Context
+Following the integration of teammate Pubudini's newly added Usage Specialist (`agents/specialists/usage/handler.ts`) and Support Specialist (`agents/specialists/support/handler.ts`), the RBAC enforcement layer at the Tenant Router needed to be extended to cover the new business intents (`check_usage` and `troubleshoot_router`).
+
+---
+
+### Decisions & Rationale
+
+#### 1. Extension of `INTENT_PERMISSION_MAP` Using Existing Shared Contract Constants
+- **Decision**: Mapped newly integrated intents to pre-existing permission constants in `shared/constants/permissions.ts`:
+  - `check_usage` -> `PERMISSIONS.USAGE_READ` (`"usage:read"`)
+  - `troubleshoot_router` -> `PERMISSIONS.FAULTS_READ` (`"faults:read"`)
+  - `pay_bill` -> `PERMISSIONS.BILLING_PURCHASE` (`"billing:purchase"`)
+  - `create_fault` -> `PERMISSIONS.FAULTS_CREATE` (`"faults:create"`)
+- **Rationale**: All new intents were fully covered by existing contract permissions defined in `PERMISSIONS`. No new contract constants needed to be added to `shared/constants/permissions.ts`.
+
+#### 2. Mock Token Expansion for Granular Permission Testing
+- **Decision**: Added `dev-token-billing-only` to `services/tenant-resolver/mock-jwt-validator.ts` containing `["billing:read"]` permission.
+- **Rationale**: Enables explicit denial test cases for usage and support requests (`check_usage` and `troubleshoot_router`) without modifying existing staff/guest token permissions.
+
+#### 3. Fail-Closed Default Verification & Test Suite Expansion
+- **Decision**: Expanded the automated test suite in `scripts/test-requests/run-tests.ps1` from 4 to 8 test cases, validating HTTP 200 (allow) and HTTP 403 (deny) responses for all billing, usage, and support intents.
+- **Verification**: Verified 8/8 automated test cases passing against live LocalStack API Gateway proxy integration.
+
+
 
 
 

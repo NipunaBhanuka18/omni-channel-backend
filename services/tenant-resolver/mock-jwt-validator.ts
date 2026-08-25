@@ -64,7 +64,14 @@ export function decodeMockAzureJwt(authorizationHeader?: string): Partial<Tenant
       return {
         userId: "dev-user-guest",
         role: "staff",
-        permissions: ["usage:read"], // Restricted permissions (lacks billing:read)
+        permissions: ["usage:read"], // Restricted permissions (has usage:read; lacks billing:read & faults:read)
+      };
+    }
+    if (token === "dev-token-billing-only") {
+      return {
+        userId: "dev-user-billing",
+        role: "staff",
+        permissions: ["billing:read"], // Billing-only permissions (has billing:read; lacks usage:read & faults:read)
       };
     }
     // Default mock token for staff in local development (e.g., "dev-token-staff")

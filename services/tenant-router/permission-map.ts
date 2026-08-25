@@ -9,8 +9,9 @@ import { PERMISSIONS } from "../../shared/constants/permissions";
  */
 export const INTENT_PERMISSION_MAP: Record<string, string> = {
   check_balance: PERMISSIONS.BILLING_READ,
-  create_fault: PERMISSIONS.FAULTS_CREATE,
-  get_usage: PERMISSIONS.USAGE_READ,
+  pay_bill: PERMISSIONS.BILLING_PURCHASE,
+  check_usage: PERMISSIONS.USAGE_READ,
+  troubleshoot_router: PERMISSIONS.FAULTS_READ,
 };
 
 /**
