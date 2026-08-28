@@ -1,9 +1,13 @@
 import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
 
-// Configure the S3 client to point to LocalStack
+// Use LOCALSTACK_HOSTNAME if running inside a Lambda container, else fallback to 127.0.0.1
+const localstackEndpoint = process.env.LOCALSTACK_HOSTNAME
+  ? `http://${process.env.LOCALSTACK_HOSTNAME}:4566`
+  : "http://127.0.0.1:4566";
+
 export const s3Client = new S3Client({
   region: "us-east-1",
-  endpoint: "http://127.0.0.1:4566",
+  endpoint: localstackEndpoint,
   forcePathStyle: true,
   credentials: {
     accessKeyId: "mock_access_key",
