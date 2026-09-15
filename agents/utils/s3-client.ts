@@ -1,30 +1,36 @@
 import { S3Client, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
 import { TenantContext } from "../../shared/types/tenant-context";
 
-// Configure the S3 client to point to LocalStack
+// Dynamic LocalStack vs AWS Cloud S3 configuration
+const isLocal = process.env.IS_LOCAL !== "false";
+const localstackEndpoint = process.env.LOCALSTACK_HOSTNAME
+  ? `http://${process.env.LOCALSTACK_HOSTNAME}:4566`
+  : "http://127.0.0.1:4566";
+
 export const s3Client = new S3Client({
-  region: "us-east-1",
-  endpoint: "http://127.0.0.1:4566",
-  forcePathStyle: true,
-  credentials: {
-    accessKeyId: "mock_access_key",
-    secretAccessKey: "mock_secret_key",
-  },
+  region: process.env.AWS_REGION || "us-east-1",
+  ...(isLocal && {
+    endpoint: localstackEndpoint,
+    forcePathStyle: true,
+    credentials: {
+      accessKeyId: "mock_access_key",
+      secretAccessKey: "mock_secret_key",
+    },
+  }),
 });
 
-const KB_BUCKET_NAME = "omni-channel-kb-docs";
+const KB_BUCKET_NAME = process.env.KB_BUCKET_NAME || "omni-channel-kb-docs";
 
 /**
- * Helper: Builds an isolated S3 Object Key for a specific tenant
- * Format: tenants/<tenantId>/<docName>
- * Protects against Path Traversal attacks (e.g., ../)
+ * Helper: Builds an isolated S3 Object Key strictly partitioned by Tenant ID
+ * Format: tenants/<tenantId>/<docName> or platform-kb/<tenantId>/<docName>
  */
 export function buildTenantS3Key(tenantId: string, docName: string): string {
   if (!tenantId || !tenantId.trim()) {
     throw new Error("[S3 Isolation Error] tenantId is required to construct S3 Key.");
   }
 
-  // Sanitize docName to prevent path traversal vulnerability
+  // Sanitize docName to prevent path traversal vulnerability (e.g., ../ or /)
   const sanitizedDocName = docName.replace(/^(\.\.[\/\\])+/, "").replace(/^\/+/, "");
   const cleanDocName = sanitizedDocName.startsWith(`tenants/${tenantId}/`)
     ? sanitizedDocName.replace(`tenants/${tenantId}/`, "")
@@ -41,7 +47,7 @@ export const fetchKbDocument = async (
   docName: string
 ): Promise<string> => {
   if (!context || !context.tenantId) {
-    throw new Error("[S3 Isolation Guardrail] Missing authenticated TenantContext.");
+    throw new Error("[S3 Isolation Guardrail] Missing authenticated TenantContext for RAG query.");
   }
 
   const isolatedKey = buildTenantS3Key(context.tenantId, docName);
@@ -62,7 +68,7 @@ export const fetchKbDocument = async (
     }
     return Buffer.concat(chunks).toString("utf-8");
   } catch (error) {
-    // Local testing fallback if LocalStack is offline
+    // Local testing fallback if LocalStack S3 bucket object is not seeded
     console.warn(`[S3 Client Warning] S3 fetch skipped/offline for '${isolatedKey}'. Using mock KB document.`);
     
     return `
@@ -83,7 +89,7 @@ export const uploadKbDocument = async (
   content: string | Buffer
 ): Promise<string> => {
   if (!context || !context.tenantId) {
-    throw new Error("[S3 Isolation Guardrail] Missing authenticated TenantContext.");
+    throw new Error("[S3 Isolation Guardrail] Missing authenticated TenantContext for RAG upload.");
   }
 
   const isolatedKey = buildTenantS3Key(context.tenantId, docName);

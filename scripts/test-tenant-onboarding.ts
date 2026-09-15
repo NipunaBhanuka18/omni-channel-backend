@@ -40,29 +40,30 @@ async function runTenantOnboardingTests() {
 
   // TEST 1: Register New Company (Dialog Axiata)
   console.log("\n--- Test 1: Successful Company Registration ---");
+  const testSlug = `dialog-test-${Date.now().toString().slice(-4)}`;
   const onboardResult = await registerTenant({
     companyName: "Dialog Axiata PLC",
-    companySlug: "dialog",
-    adminEmail: "cloud-admin@dialog.lk",
+    companySlug: testSlug,
+    adminEmail: `cloud-admin-${testSlug}@dialog.lk`,
     planTier: "enterprise",
     themeColor: "#ED1C24",
   });
 
   assert(
-    "Onboarding generates clean tenantId 'tenant-dialog'",
-    onboardResult.success === true && onboardResult.tenantId === "tenant-dialog",
+    `Onboarding generates clean tenantId 'tenant-${testSlug}'`,
+    onboardResult.success === true && onboardResult.tenantId === `tenant-${testSlug}`,
     JSON.stringify(onboardResult)
   );
 
   assert(
     "Default Support Agent initialized with tenant prefix",
-    onboardResult.defaultAgent.agentId === "agent-dialog-support-01",
+    onboardResult.defaultAgent.agentId === `agent-${testSlug}-support-01`,
     onboardResult.defaultAgent.agentName
   );
 
   assert(
     "Tenant S3 folder prefix properly generated",
-    onboardResult.storage.s3Prefix === "tenants/tenant-dialog/",
+    onboardResult.storage.s3Prefix === `tenants/tenant-${testSlug}/`,
     onboardResult.storage.s3Prefix
   );
 
@@ -72,7 +73,7 @@ async function runTenantOnboardingTests() {
   try {
     await registerTenant({
       companyName: "Dialog Axiata Clone",
-      companySlug: "dialog",
+      companySlug: testSlug,
       adminEmail: "different-admin@dialog.lk",
     });
   } catch (err: any) {
@@ -86,12 +87,13 @@ async function runTenantOnboardingTests() {
 
   // TEST 3: HTTP API Gateway Handler (POST /tenants/register)
   console.log("\n--- Test 3: HTTP API Gateway Request Handler ---");
+  const fintechSlug = `fintech-${Date.now().toString().slice(-4)}`;
   const httpResponse = await handleRegisterTenantRequest({
     httpMethod: "POST",
     body: JSON.stringify({
       companyName: "Fintech Lanka",
-      companySlug: "fintech-lk",
-      adminEmail: "dev@fintech.lk",
+      companySlug: fintechSlug,
+      adminEmail: `dev@${fintechSlug}.lk`,
       planTier: "pro",
     }),
   });
@@ -99,7 +101,7 @@ async function runTenantOnboardingTests() {
   const parsedHttpBody = JSON.parse(httpResponse.body);
   assert(
     "POST /tenants/register returns HTTP 201 Created with tenant details",
-    httpResponse.statusCode === 201 && parsedHttpBody.tenantId === "tenant-fintech-lk",
+    httpResponse.statusCode === 201 && parsedHttpBody.tenantId === `tenant-${fintechSlug}`,
     httpResponse.body
   );
 

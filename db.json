@@ -46,6 +46,24 @@
         "WhatsApp"
       ],
       "tenantId": "tenant-reg-1789511736167"
+    },
+    {
+      "id": "reg-1789512029661",
+      "companyName": "Hemas Holdings",
+      "companySlug": "hemas",
+      "businessRegNumber": "BR-PENDING",
+      "companyEmail": "admin@hemas.com",
+      "adminName": "",
+      "password": "company123",
+      "status": "Approved",
+      "submissionDate": "2026-09-15",
+      "tier": "Enterprise",
+      "allocatedAgents": 5,
+      "channels": [
+        "Web",
+        "WhatsApp"
+      ],
+      "tenantId": "tenant-reg-1789512029661"
     }
   ]
 }

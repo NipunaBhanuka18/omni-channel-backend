@@ -394,7 +394,7 @@ app.get("/api/workspace/conversations", (req, res) => {
 // ==========================================
 
 // GET /api/resolve-chat-url?company={slug}&agent={agent}
-app.get("/api/resolve-chat-url", (req, res) => {
+app.get(["/api/resolve-chat-url", "/resolve-chat-url"], (req, res) => {
   const companySlug = (req.query.company as string) || "slt";
   const agentSlug = (req.query.agent as string) || "support";
 
@@ -440,7 +440,7 @@ app.post(["/api/tenant/route", "/api/agent"], async (req, res) => {
 });
 
 let server: any = null;
-if (process.env.NODE_ENV !== "test") {
+if (require.main === module) {
   server = app.listen(PORT, () => {
     console.log(`🚀 omni-channel-backend API Server running at http://localhost:${PORT}`);
   });

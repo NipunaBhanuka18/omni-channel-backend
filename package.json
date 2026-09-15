@@ -7,11 +7,12 @@
   },
   "scripts": {
     "start": "npx tsx server.ts",
-    "test": "tsx ./scripts/test-all.ts && tsx ./scripts/test-tenant-resolver.ts && tsx ./scripts/test-tenant-onboarding.ts && tsx ./scripts/test-ui-api-server.ts",
+    "test": "tsx ./scripts/test-all.ts && tsx ./scripts/test-tenant-resolver.ts && tsx ./scripts/test-tenant-onboarding.ts && tsx ./scripts/test-ui-api-server.ts && tsx ./scripts/test-member4-ai-engine.ts",
     "test:agents": "tsx ./scripts/test-all.ts",
     "test:tenant-resolver": "tsx ./scripts/test-tenant-resolver.ts",
     "test:tenant-onboarding": "tsx ./scripts/test-tenant-onboarding.ts",
-    "test:ui-server": "tsx ./scripts/test-ui-api-server.ts"
+    "test:ui-server": "tsx ./scripts/test-ui-api-server.ts",
+    "test:member4": "tsx ./scripts/test-member4-ai-engine.ts"
   },
   "repository": {
     "type": "git",
