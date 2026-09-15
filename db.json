@@ -9,5 +9,43 @@
       "createdAt": "2026-09-12T03:53:36.306Z"
     }
   ],
-  "registrations": []
+  "registrations": [
+    {
+      "id": "reg-1789511693016",
+      "companyName": "Hemas Holdings",
+      "companySlug": "hemas",
+      "businessRegNumber": "BR-PENDING",
+      "companyEmail": "admin@hemas.com",
+      "adminName": "",
+      "password": "company123",
+      "status": "Approved",
+      "submissionDate": "2026-09-15",
+      "tier": "Enterprise",
+      "allocatedAgents": 5,
+      "channels": [
+        "Web",
+        "WhatsApp"
+      ],
+      "tenantId": "tenant-hemas",
+      "onboardedAt": "2026-09-15T22:34:54.158Z"
+    },
+    {
+      "id": "reg-1789511736167",
+      "companyName": "Hemas Holdings",
+      "companySlug": "hemas",
+      "businessRegNumber": "BR-PENDING",
+      "companyEmail": "admin@hemas.com",
+      "adminName": "",
+      "password": "company123",
+      "status": "Approved",
+      "submissionDate": "2026-09-15",
+      "tier": "Enterprise",
+      "allocatedAgents": 5,
+      "channels": [
+        "Web",
+        "WhatsApp"
+      ],
+      "tenantId": "tenant-reg-1789511736167"
+    }
+  ]
 }

@@ -7,7 +7,7 @@
   },
   "scripts": {
     "start": "npx tsx server.ts",
-    "test": "tsx ./scripts/test-all.ts && tsx ./scripts/test-tenant-resolver.ts && tsx ./scripts/test-tenant-onboarding.ts",
+    "test": "tsx ./scripts/test-all.ts && tsx ./scripts/test-tenant-resolver.ts && tsx ./scripts/test-tenant-onboarding.ts && tsx ./scripts/test-ui-api-server.ts",
     "test:agents": "tsx ./scripts/test-all.ts",
     "test:tenant-resolver": "tsx ./scripts/test-tenant-resolver.ts",
     "test:tenant-onboarding": "tsx ./scripts/test-tenant-onboarding.ts",

@@ -90,7 +90,7 @@ export function resolveTenantContext(
       success: false,
       error: {
         code: "FORBIDDEN",
-        message: `Tenant ID spoofing detected. Token tenant '${tokenTenantId}' does not match requested header tenant '${requestedTenantId}'.`,
+        message: `Tenant ID spoofing detected. Tenant mismatch error: Token tenant '${tokenTenantId}' does not match requested header tenant '${requestedTenantId}'.`,
         retryable: false,
         details: { tokenTenantId, requestedTenantId },
       },

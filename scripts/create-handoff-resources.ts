@@ -1,5 +1,5 @@
 import { CreateTableCommand } from "@aws-sdk/client-dynamodb";
-import { dynamoClient } from "../agents/utils/dynamo-client";
+import { docClient } from "../agents/utils/dynamo-client";
 
 interface TableSpec {
   tableName: string;
@@ -41,7 +41,7 @@ async function createTableIfNotExists(spec: TableSpec) {
   });
 
   try {
-    const response = await dynamoClient.send(command);
+    const response = await docClient.send(command);
     console.log(`✅ Table created: ${response.TableDescription?.TableName}`);
   } catch (err: any) {
     if (err.name === "ResourceInUseException") {

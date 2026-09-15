@@ -83,7 +83,7 @@ export function decodeMockAzureJwt(authorizationHeader?: string): Partial<Tenant
     }
     // Default mock token for staff in local development (e.g., "dev-token-staff")
     return {
-      tenantId: resolvedTenantId || "dev-tenant-local",
+      tenantId: resolvedTenantId,
       userId: "dev-user-001",
       role: "staff",
       permissions: ["billing:read", "usage:read", "faults:read"],
