@@ -1,38 +1,47 @@
 import { fetchKbDocument } from "./s3-client";
+import { TenantContext } from "../../shared/types/tenant-context";
 
-/**
- * Mock Vector Index / RAG Retriever.
- * In production, this would convert the query into an embedding and query a Vector DB (like OpenSearch).
- * For local development, we fetch the doc and do a simple keyword match.
- */
-export const searchKnowledgeBase = async (query: string): Promise<string> => {
+export const searchKnowledgeBase = async (
+  query: string,
+  context: TenantContext,
+  documentName: string = "router-troubleshooting-guide.txt"
+): Promise<string> => {
   try {
-    const fullDocument = await fetchKbDocument(
-      "router-troubleshooting-guide.txt",
-    );
+    if (!context || !context.tenantId) {
+      throw new Error(
+        "[KB Isolation Violation] Attempted to query Knowledge Base without an authenticated TenantContext."
+      );
+    }
 
-    // Split the document into sections based on the "Issue:" keyword
+    // Pass 'context' first, then 'documentName' into fetchKbDocument
+    const fullDocument = await fetchKbDocument(context, documentName);
+
     const sections = fullDocument
       .split("Issue:")
       .filter((s) => s.trim().length > 0);
 
-    // Very basic keyword matcher (simulating vector similarity search)
     const queryLower = query.toLowerCase();
-    let bestMatch = sections[0]; // default to first section
+    let bestMatch: string | null = null;
 
     for (const section of sections) {
       if (section.toLowerCase().includes(queryLower)) {
         bestMatch = section;
-        break; // Found a match, stop looking
+        break;
       }
     }
 
-    // If no exact match, just return the whole doc (or in a real app, the top N chunks)
-    if (!bestMatch) bestMatch = fullDocument;
+    if (!bestMatch) {
+      bestMatch = sections[0] || fullDocument;
+    }
 
-    return `Issue: ${bestMatch.trim()}`;
+    return `[Tenant: ${context.tenantId}] Issue: ${bestMatch.trim()}`;
   } catch (error) {
-    console.error("[KB Retriever] Search failed:", error);
-    throw new Error("Failed to search knowledge base.");
+    console.error(
+      `[KB Retriever Error] Search failed for Tenant '${context?.tenantId}':`,
+      error
+    );
+    throw new Error(
+      `Failed to search knowledge base for tenant scope: ${(error as Error).message}`
+    );
   }
 };

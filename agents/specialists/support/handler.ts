@@ -11,7 +11,7 @@ export const handler = async (
     `[Support Specialist] Processing request for user ${context.userId}`,
   );
 
-  // 1. Authorization Check
+  // Authorization Check
   if (!context.permissions.includes(PERMISSIONS.FAULTS_READ)) {
     return {
       success: false,
@@ -23,11 +23,12 @@ export const handler = async (
     };
   }
 
-  // 2. Search the knowledge base based on the user's params
+  // Search the knowledge base based on the user's params with Tenant Context
   try {
-    // We'll pass a mock query from the params, or default to "slow internet"
     const userQuery = params.query || "slow internet";
-    const searchResult = await searchKnowledgeBase(userQuery);
+    
+    // Pass userQuery and authenticated context into isolated KB retriever
+    const searchResult = await searchKnowledgeBase(userQuery, context);
 
     return {
       success: true,
@@ -42,7 +43,7 @@ export const handler = async (
       success: false,
       error: {
         code: "KB_SEARCH_FAILED",
-        message: "Failed to search knowledge base.",
+        message: `Failed to search knowledge base: ${(error as Error).message}`,
         retryable: true,
       },
     };

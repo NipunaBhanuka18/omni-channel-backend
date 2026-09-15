@@ -4,7 +4,7 @@ async function runTest() {
   console.log("--- Starting S3 Fetch Test ---");
 
   try {
-    const content = await fetchKbDocument("router-troubleshooting-guide.txt");
+    const content = await fetchKbDocument("router-troubleshooting-guide.txt", "slt");
     console.log("\n✅ SUCCESS: Fetched document from S3!");
     console.log("\n--- Document Content ---");
     console.log(content);
