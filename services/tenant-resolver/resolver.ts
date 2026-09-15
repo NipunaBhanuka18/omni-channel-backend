@@ -16,16 +16,9 @@ const ALLOWED_CHANNELS: TenantContext["channel"][] = [
   "messenger",
 ];
 
-/**
- * Resolves incoming HTTP request headers into a strictly typed TenantContext object.
- *
- * @param headers Map of incoming HTTP headers (case-insensitive keys supported)
- * @returns TenantResolverResult containing either the resolved TenantContext or a structured AgentActionResponse error.
- */
 export function resolveTenantContext(
-  headers: Record<string, string | undefined>
+  headers: Record<string, string | undefined>,
 ): TenantResolverResult {
-  // Normalize header keys to lowercase for robust lookup
   const normalizedHeaders: Record<string, string | undefined> = {};
   for (const [key, value] of Object.entries(headers)) {
     if (value !== undefined) {
@@ -39,20 +32,21 @@ export function resolveTenantContext(
   const sessionIdHeader = normalizedHeaders["x-session-id"];
   const conversationIdHeader = normalizedHeaders["x-conversation-id"];
 
-  // 1. Validate missing Authorization header
+  // Validate missing Authorization header
   if (!authorizationHeader || !authorizationHeader.trim()) {
     return {
       success: false,
       error: {
         code: "UNAUTHORIZED",
-        message: "Missing or empty Authorization header. Expected format: 'Bearer <token>'",
+        message:
+          "Missing or empty Authorization header. Expected format: 'Bearer <token>'",
         retryable: false,
         details: { requiredHeader: "Authorization" },
       },
     };
   }
 
-  // 2. Validate missing x-tenant-id header
+  // Validate missing x-tenant-id header
   if (!tenantIdHeader || !tenantIdHeader.trim()) {
     return {
       success: false,
@@ -65,7 +59,7 @@ export function resolveTenantContext(
     };
   }
 
-  // 3. Decode token via dev-only mock validator
+  // Decode token via JWT validator
   let decodedClaims: Partial<TenantContext>;
   try {
     decodedClaims = decodeMockAzureJwt(authorizationHeader);
@@ -80,34 +74,58 @@ export function resolveTenantContext(
     };
   }
 
-  // 4. Resolve Channel with fallback default ("web")
+  // STRICT TENANT ISOLATION CHECK (NEW SECURITY GUARDRAIL)
+  // Check if tenantId inside JWT token matches the x-tenant-id header requested
+  const tokenTenantId = decodedClaims.tenantId;
+  const requestedTenantId = tenantIdHeader.trim();
+
+  if (tokenTenantId && tokenTenantId !== requestedTenantId) {
+    return {
+      success: false,
+      error: {
+        code: "FORBIDDEN",
+        message: `Tenant mismatch error: Token tenant '${tokenTenantId}' does not match requested header tenant '${requestedTenantId}'.`,
+        retryable: false,
+        details: { tokenTenantId, requestedTenantId },
+      },
+    };
+  }
+
+  // Use verified tenantId from token (fallback to validated header)
+  const tenantId = tokenTenantId || requestedTenantId;
+
+  // Resolve Channel
   let channel: TenantContext["channel"] = "web";
-  if (channelHeader && ALLOWED_CHANNELS.includes(channelHeader.toLowerCase() as TenantContext["channel"])) {
+  if (
+    channelHeader &&
+    ALLOWED_CHANNELS.includes(
+      channelHeader.toLowerCase() as TenantContext["channel"],
+    )
+  ) {
     channel = channelHeader.toLowerCase() as TenantContext["channel"];
   }
 
-  // 5. Resolve Session ID (reuse existing header if provided, otherwise generate new sess-<uuid>)
+  // Resolve Session ID
   const sessionId =
     sessionIdHeader && sessionIdHeader.trim()
       ? sessionIdHeader.trim()
       : `sess-${randomUUID()}`;
 
-  // 6. Resolve Conversation ID (reuse existing header if provided, otherwise generate new conv-<uuid>)
-  /**
-   * ARCHITECTURAL NOTE ON conversationId vs sessionId:
-   * - sessionId represents the broader authenticated user session, which persists across multiple actions and user interactions.
-   * - conversationId tracks a specific, individual conversation thread. Multiple conversationIds can exist sequentially or concurrently within a single user sessionId.
-   */
+  // Resolve Conversation ID
   const conversationId =
     conversationIdHeader && conversationIdHeader.trim()
       ? conversationIdHeader.trim()
       : `conv-${randomUUID()}`;
 
   const context: TenantContext = {
-    tenantId: tenantIdHeader.trim(),
+    tenantId,
     userId: decodedClaims.userId || "dev-user-001",
     role: decodedClaims.role || "staff",
-    permissions: decodedClaims.permissions || ["billing:read", "usage:read", "faults:read"],
+    permissions: decodedClaims.permissions || [
+      "billing:read",
+      "usage:read",
+      "faults:read",
+    ],
     channel,
     sessionId,
     conversationId,
