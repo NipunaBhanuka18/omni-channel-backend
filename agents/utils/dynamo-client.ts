@@ -1,12 +1,12 @@
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
-import { 
-  DynamoDBDocumentClient, 
-  GetCommand, 
-  PutCommand, 
-  QueryCommand,
+import {
+  DynamoDBDocumentClient,
+  GetCommand,
   GetCommandInput,
+  PutCommand,
   PutCommandInput,
-  QueryCommandInput
+  QueryCommand,
+  QueryCommandInput,
 } from "@aws-sdk/lib-dynamodb";
 import { TenantContext } from "../../shared/types/tenant-context";
 
@@ -27,32 +27,42 @@ const client = new DynamoDBClient({
   }),
 });
 
+// Base DocumentClient export for low-level access if strictly required
 export const docClient = DynamoDBDocumentClient.from(client);
 
 /**
- * Formats a raw tenant ID into a standardized DynamoDB Partition Key (PK).
+ * TENANT ISOLATED HELPER: Formats a standard Tenant Partition Key (PK)
+ * Format: TENANT#<tenantId>
  */
 export function formatTenantPK(tenantId: string): string {
-  if (!tenantId) {
-    throw new Error("INVALID_TENANT_ID: Tenant ID cannot be empty for database operations");
+  if (!tenantId || !tenantId.trim()) {
+    throw new Error("TenantIsolationError: tenantId cannot be empty or null.");
   }
-  return tenantId.startsWith("TENANT#") ? tenantId : `TENANT#${tenantId}`;
+  const cleanTenant = tenantId.trim();
+  return cleanTenant.startsWith("TENANT#") ? cleanTenant : `TENANT#${cleanTenant}`;
 }
 
 /**
- * Tenant-partitioned GetItem wrapper ensuring queries cannot breach tenant boundaries.
+ * TENANT ISOLATED GET ITEM
+ * Guarantees that the Partition Key (PK) is prefixed with the authenticated tenant's ID.
  */
 export async function getTenantItem<T = Record<string, any>>(
   tableName: string,
   context: TenantContext,
-  sortKey: { name: string; value: string }
+  sortKey: string | { name: string; value: string }
 ): Promise<T | null> {
+  const partitionKey = formatTenantPK(context.tenantId);
+  const keyObj: Record<string, any> = { PK: partitionKey };
+
+  if (typeof sortKey === "string") {
+    keyObj["SK"] = sortKey;
+  } else {
+    keyObj[sortKey.name] = sortKey.value;
+  }
+
   const params: GetCommandInput = {
     TableName: tableName,
-    Key: {
-      PK: formatTenantPK(context.tenantId),
-      [sortKey.name]: sortKey.value,
-    },
+    Key: keyObj,
   };
 
   const response = await docClient.send(new GetCommand(params));
@@ -60,46 +70,74 @@ export async function getTenantItem<T = Record<string, any>>(
 }
 
 /**
- * Tenant-partitioned PutItem wrapper enforcing tenant PK scoping on every write.
+ * TENANT ISOLATED PUT ITEM
+ * Enforces that every item stored in DynamoDB carries PK: TENANT#<tenantId> and explicit tenantId field.
  */
-export async function putTenantItem(
+export async function putTenantItem<T extends Record<string, any>>(
   tableName: string,
   context: TenantContext,
-  item: Record<string, any>
+  sortKeyOrItem: string | T,
+  itemData?: T
 ): Promise<void> {
-  const params: PutCommandInput = {
-    TableName: tableName,
-    Item: {
-      ...item,
-      PK: formatTenantPK(context.tenantId),
+  const partitionKey = formatTenantPK(context.tenantId);
+  let itemPayload: Record<string, any> = {};
+
+  if (typeof sortKeyOrItem === "string") {
+    itemPayload = {
+      PK: partitionKey,
+      SK: sortKeyOrItem,
       tenantId: context.tenantId,
       updatedAt: new Date().toISOString(),
-    },
+      ...(itemData || {}),
+    };
+  } else {
+    itemPayload = {
+      ...sortKeyOrItem,
+      PK: partitionKey,
+      tenantId: context.tenantId,
+      updatedAt: new Date().toISOString(),
+    };
+  }
+
+  const params: PutCommandInput = {
+    TableName: tableName,
+    Item: itemPayload,
   };
 
   await docClient.send(new PutCommand(params));
 }
 
 /**
- * Tenant-partitioned Query wrapper locked strictly to the authenticated tenant's partition.
+ * TENANT ISOLATED QUERY
+ * Restricts query scans strictly to items matching PK = TENANT#<tenantId>.
  */
 export async function queryTenantItems<T = Record<string, any>>(
   tableName: string,
   context: TenantContext,
-  keyConditionExpression?: string,
+  skPrefixOrCondition?: string,
   expressionAttributeValues?: Record<string, any>
 ): Promise<T[]> {
-  const tenantPK = formatTenantPK(context.tenantId);
+  const partitionKey = formatTenantPK(context.tenantId);
+
+  let keyConditionExpression = "PK = :pk";
+  const attrValues: Record<string, any> = {
+    ":pk": partitionKey,
+    ...expressionAttributeValues,
+  };
+
+  if (skPrefixOrCondition) {
+    if (skPrefixOrCondition.includes("=") || skPrefixOrCondition.includes("AND")) {
+      keyConditionExpression = `PK = :pk AND ${skPrefixOrCondition}`;
+    } else {
+      keyConditionExpression += " AND begins_with(SK, :skPrefix)";
+      attrValues[":skPrefix"] = skPrefixOrCondition;
+    }
+  }
 
   const params: QueryCommandInput = {
     TableName: tableName,
-    KeyConditionExpression: keyConditionExpression 
-      ? `PK = :pk AND ${keyConditionExpression}` 
-      : "PK = :pk",
-    ExpressionAttributeValues: {
-      ":pk": tenantPK,
-      ...expressionAttributeValues,
-    },
+    KeyConditionExpression: keyConditionExpression,
+    ExpressionAttributeValues: attrValues,
   };
 
   const response = await docClient.send(new QueryCommand(params));

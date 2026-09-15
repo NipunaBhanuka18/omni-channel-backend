@@ -6,8 +6,12 @@
     "doc": "docs"
   },
   "scripts": {
-    "build": "tsc",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "npx tsx server.ts",
+    "test": "tsx ./scripts/test-all.ts && tsx ./scripts/test-tenant-resolver.ts && tsx ./scripts/test-tenant-onboarding.ts",
+    "test:agents": "tsx ./scripts/test-all.ts",
+    "test:tenant-resolver": "tsx ./scripts/test-tenant-resolver.ts",
+    "test:tenant-onboarding": "tsx ./scripts/test-tenant-onboarding.ts",
+    "test:ui-server": "tsx ./scripts/test-ui-api-server.ts"
   },
   "repository": {
     "type": "git",
@@ -24,10 +28,14 @@
   "dependencies": {
     "@aws-sdk/client-dynamodb": "^3.1108.0",
     "@aws-sdk/client-s3": "^3.1113.0",
-    "@aws-sdk/lib-dynamodb": "^3.1108.0"
+    "@aws-sdk/lib-dynamodb": "^3.1108.0",
+    "cors": "^2.8.6",
+    "express": "^4.22.3"
   },
   "devDependencies": {
     "@types/aws-lambda": "^8.10.162",
+    "@types/cors": "^2.8.17",
+    "@types/express": "^4.17.21",
     "@types/node": "^26.2.0",
     "ts-node": "^10.9.2",
     "tsx": "^4.23.12",
