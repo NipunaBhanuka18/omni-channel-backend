@@ -1,4 +1,18 @@
 import { handleTenantRequest } from "./handler";
+import { s3Client } from "../../agents/utils/s3-client";
+
+// Ensure S3 client resolves to LocalStack container endpoint when running inside Lambda container
+const localstackHost = process.env.LOCALSTACK_HOSTNAME || process.env.AWS_ENDPOINT_URL;
+if (localstackHost) {
+  const host = localstackHost.replace(/^https?:\/\//, "").split(":")[0];
+  (s3Client.config as any).endpoint = () =>
+    Promise.resolve({
+      protocol: "http:",
+      hostname: host,
+      port: 4566,
+      path: "/",
+    });
+}
 
 /**
  * AWS Lambda Handler Adapter

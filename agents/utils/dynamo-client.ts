@@ -1,15 +1,18 @@
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient } from "@aws-sdk/lib-dynamodb";
 
-// Configure the client to point to LocalStack
+// Use LOCALSTACK_HOSTNAME if running inside a Lambda container, else fallback to 127.0.0.1
+const localstackEndpoint = process.env.LOCALSTACK_HOSTNAME
+  ? `http://${process.env.LOCALSTACK_HOSTNAME}:4566`
+  : "http://127.0.0.1:4566";
+
 const client = new DynamoDBClient({
   region: "us-east-1",
-  endpoint: "http://127.0.0.1:4566", // Force IPv4
+  endpoint: localstackEndpoint,
   credentials: {
-    accessKeyId: "mock_access_key", // LocalStack doesn't care what these are
+    accessKeyId: "mock_access_key",
     secretAccessKey: "mock_secret_key",
   },
 });
 
-// Create a DocumentClient for easier automatic marshalling of TypeScript objects
 export const docClient = DynamoDBDocumentClient.from(client);
