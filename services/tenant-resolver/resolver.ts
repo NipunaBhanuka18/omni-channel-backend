@@ -18,6 +18,7 @@ const ALLOWED_CHANNELS: TenantContext["channel"][] = [
 
 /**
  * Resolves incoming HTTP request headers into a strictly typed TenantContext object.
+ * Enforces Zero-Trust tenant validation and spoofing detection (Member 2 Scope).
  *
  * @param headers Map of incoming HTTP headers (case-insensitive keys supported)
  * @returns TenantResolverResult containing either the resolved TenantContext or a structured AgentActionResponse error.
@@ -80,6 +81,24 @@ export function resolveTenantContext(
     };
   }
 
+  // ==============================================================================
+  // Zero-Trust Tenant Spoofing Guard & Claim Validation
+  // ==============================================================================
+  const tokenTenantId = decodedClaims.tenantId;
+  const requestTenantId = tenantIdHeader.trim();
+
+  if (tokenTenantId && tokenTenantId !== requestTenantId) {
+    return {
+      success: false,
+      error: {
+        code: "FORBIDDEN",
+        message: `Tenant ID spoofing detected. Header tenant (${requestTenantId}) does not match authenticated token claim (${tokenTenantId})`,
+        retryable: false,
+        details: { headerTenantId: requestTenantId, tokenTenantId },
+      },
+    };
+  }
+
   // 4. Resolve Channel with fallback default ("web")
   let channel: TenantContext["channel"] = "web";
   if (channelHeader && ALLOWED_CHANNELS.includes(channelHeader.toLowerCase() as TenantContext["channel"])) {
@@ -104,7 +123,7 @@ export function resolveTenantContext(
       : `conv-${randomUUID()}`;
 
   const context: TenantContext = {
-    tenantId: tenantIdHeader.trim(),
+    tenantId: requestTenantId,
     userId: decodedClaims.userId || "dev-user-001",
     role: decodedClaims.role || "staff",
     permissions: decodedClaims.permissions || ["billing:read", "usage:read", "faults:read"],

@@ -2,12 +2,12 @@ import { TenantContext } from "../../shared/types/tenant-context";
 
 /**
  * ==============================================================================
- * [DEV-ONLY / INSECURE] Mock Azure AD JWT Token Validator
+ * [DEV-ONLY / INSECURE] Mock Azure AD / Cognito JWT Token Validator
  * ==============================================================================
  * WARNING: THIS MODULE IS FOR LOCALSTACK AND OFFLINE DEVELOPMENT ONLY.
- * IT DOES NOT PERFORM CRYPTOGRAPHIC JWKS SIGNATURE VERIFICATION AGAINST AZURE AD.
+ * IT DOES NOT PERFORM CRYPTOGRAPHIC JWKS SIGNATURE VERIFICATION.
  *
- * MUST BE REPLACED WITH REAL AZURE AD OIDC/JWKS VALIDATOR BEFORE ANY PRODUCTION DEPLOYMENT.
+ * MUST BE REPLACED WITH REAL AZURE AD / COGNITO OIDC/JWKS VALIDATOR BEFORE ANY PRODUCTION DEPLOYMENT.
  * ==============================================================================
  */
 
@@ -19,7 +19,7 @@ function assertMockAuthPermitted(): void {
   if (process.env.NODE_ENV === "production") {
     throw new Error(
       "[SECURITY FATAL] MockJWTValidator invoked while NODE_ENV=production! " +
-        "Mock token validation MUST NOT be used in production. Deploy real Azure AD JWKS verification."
+        "Mock token validation MUST NOT be used in production. Deploy real OIDC/JWKS verification."
     );
   }
 
@@ -37,13 +37,15 @@ export interface MockAzureJwtClaims {
   tid?: string;
   name?: string;
   preferred_username?: string;
+  "custom:tenant_id"?: string;
+  tenant_id?: string;
   roles?: string[];
   aud?: string;
   iss?: string;
 }
 
 /**
- * Parses and extracts tenant context claims from an unverified mock Azure AD JWT token.
+ * Parses and extracts tenant context claims from an unverified mock Azure AD / Cognito JWT token.
  * 
  * @param authorizationHeader The incoming Authorization HTTP header (e.g. "Bearer <token>")
  * @returns Parsed TenantContext
@@ -60,22 +62,28 @@ export function decodeMockAzureJwt(authorizationHeader?: string): Partial<Tenant
   const parts = token.split(".");
 
   if (parts.length !== 3) {
+    const tenantMatch = token.match(/TEN-\d+/i) || token.match(/tenant-[\w-]+/i);
+    const resolvedTenantId = tenantMatch ? tenantMatch[0] : undefined;
+
     if (token === "dev-token-guest" || token === "dev-token-restricted") {
       return {
+        tenantId: resolvedTenantId,
         userId: "dev-user-guest",
         role: "staff",
-        permissions: ["usage:read"], // Restricted permissions (has usage:read; lacks billing:read & faults:read)
+        permissions: ["usage:read"], // Restricted permissions
       };
     }
     if (token === "dev-token-billing-only") {
       return {
+        tenantId: resolvedTenantId,
         userId: "dev-user-billing",
         role: "staff",
-        permissions: ["billing:read"], // Billing-only permissions (has billing:read; lacks usage:read & faults:read)
+        permissions: ["billing:read"], // Billing-only permissions
       };
     }
     // Default mock token for staff in local development (e.g., "dev-token-staff")
     return {
+      tenantId: resolvedTenantId || "dev-tenant-local",
       userId: "dev-user-001",
       role: "staff",
       permissions: ["billing:read", "usage:read", "faults:read"],
@@ -87,9 +95,12 @@ export function decodeMockAzureJwt(authorizationHeader?: string): Partial<Tenant
     const claims = JSON.parse(payloadJson) as MockAzureJwtClaims;
 
     const role: "staff" | "admin" = claims.roles?.includes("OmniChannel.Admin") ? "admin" : "staff";
+    
+    // Resolve tenantId: Priority to custom:tenant_id (Cognito), tenant_id, tid (Azure AD), or default
+    const tenantId = claims["custom:tenant_id"] || claims.tenant_id || claims.tid || "dev-tenant-local";
 
     return {
-      tenantId: claims.tid || "dev-tenant-local",
+      tenantId,
       userId: claims.oid || claims.sub || "dev-user-001",
       role,
       permissions: role === "admin" 

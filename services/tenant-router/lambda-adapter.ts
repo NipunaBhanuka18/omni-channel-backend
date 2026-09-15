@@ -1,4 +1,5 @@
 import { handleTenantRequest } from "./handler";
+
 /**
  * AWS Lambda Handler Adapter
  * Translates APIGatewayProxyEvent to handleTenantRequest payload and formats response into APIGatewayProxyResult.
