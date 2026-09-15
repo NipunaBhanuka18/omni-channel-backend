@@ -1,0 +1,181 @@
+{
+  "Comment": "AWS Step Functions state machine for Multi-Tenant Company Onboarding",
+  "StartAt": "ValidateRegistrationPayload",
+  "States": {
+    "ValidateRegistrationPayload": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.companyName",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.companySlug",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.adminEmail",
+              "IsPresent": true
+            }
+          ],
+          "Next": "FormatTenantIdentifier"
+        }
+      ],
+      "Default": "FailInvalidInput"
+    },
+    "FailInvalidInput": {
+      "Type": "Fail",
+      "Error": "InvalidTenantPayloadError",
+      "Cause": "Missing required fields: companyName, companySlug, and adminEmail are mandatory."
+    },
+    "FormatTenantIdentifier": {
+      "Type": "Pass",
+      "Parameters": {
+        "tenantId.$": "States.Format('tenant-{}', $.companySlug)",
+        "companyName.$": "$.companyName",
+        "companySlug.$": "$.companySlug",
+        "adminEmail.$": "$.adminEmail",
+        "planTier.$": "$.planTier",
+        "registrationTimestamp.$": "$$.Execution.StartTime"
+      },
+      "Next": "CreateDynamoTenantRecord"
+    },
+    "CreateDynamoTenantRecord": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:putItem",
+      "Parameters": {
+        "TableName": "omni-channel-tenants",
+        "Item": {
+          "tenantId": {
+            "S.$": "$.tenantId"
+          },
+          "companyName": {
+            "S.$": "$.companyName"
+          },
+          "companySlug": {
+            "S.$": "$.companySlug"
+          },
+          "adminEmail": {
+            "S.$": "$.adminEmail"
+          },
+          "status": {
+            "S": "active"
+          },
+          "planTier": {
+            "S.$": "$.planTier"
+          },
+          "createdAt": {
+            "S.$": "$.registrationTimestamp"
+          }
+        }
+      },
+      "ResultPath": "$.dynamoTenantResult",
+      "Next": "ProvisionCognitoAdminUser"
+    },
+    "ProvisionCognitoAdminUser": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::cognito-idp:adminCreateUser",
+      "Parameters": {
+        "UserPoolId": "omni-channel-user-pool-dev",
+        "Username.$": "$.adminEmail",
+        "UserAttributes": [
+          {
+            "Name": "email",
+            "Value.$": "$.adminEmail"
+          },
+          {
+            "Name": "custom:tenant_id",
+            "Value.$": "$.tenantId"
+          },
+          {
+            "Name": "email_verified",
+            "Value": "true"
+          }
+        ],
+        "DesiredDeliveryMediums": ["EMAIL"]
+      },
+      "Catch": [
+        {
+          "ErrorEquals": ["UsernameExistsException"],
+          "Next": "ProvisionS3TenantFolder"
+        }
+      ],
+      "ResultPath": "$.cognitoAdminResult",
+      "Next": "AssignAdminToGroup"
+    },
+    "AssignAdminToGroup": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::cognito-idp:adminAddUserToGroup",
+      "Parameters": {
+        "UserPoolId": "omni-channel-user-pool-dev",
+        "Username.$": "$.adminEmail",
+        "GroupName": "admin"
+      },
+      "ResultPath": "$.cognitoGroupResult",
+      "Next": "ProvisionS3TenantFolder"
+    },
+    "ProvisionS3TenantFolder": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::s3:putObject",
+      "Parameters": {
+        "Bucket": "omni-channel-kb-docs",
+        "Key.$": "States.Format('tenants/{}/welcome.txt', $.tenantId)",
+        "Body": "Welcome to your dedicated Knowledge Base. Upload product docs or guides here.",
+        "Metadata": {
+          "tenant-id.$": "$.tenantId"
+        }
+      },
+      "ResultPath": "$.s3Result",
+      "Next": "InitializeDefaultAgent"
+    },
+    "InitializeDefaultAgent": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:putItem",
+      "Parameters": {
+        "TableName": "omni-channel-agents",
+        "Item": {
+          "tenantId": {
+            "S.$": "$.tenantId"
+          },
+          "agentId": {
+            "S.$": "States.Format('agent-{}-support-01', $.companySlug)"
+          },
+          "agentName": {
+            "S.$": "States.Format('{} Support Bot', $.companyName)"
+          },
+          "specialist": {
+            "S": "support"
+          },
+          "status": {
+            "S": "active"
+          },
+          "welcomeMessage": {
+            "S.$": "States.Format('Hello! Welcome to {} support. How can we help you today?', $.companyName)"
+          },
+          "createdAt": {
+            "S.$": "$.registrationTimestamp"
+          }
+        }
+      },
+      "ResultPath": "$.agentResult",
+      "Next": "OnboardingSucceeded"
+    },
+    "OnboardingSucceeded": {
+      "Type": "Pass",
+      "Parameters": {
+        "success": true,
+        "tenantId.$": "$.tenantId",
+        "companyName.$": "$.companyName",
+        "adminEmail.$": "$.adminEmail",
+        "defaultAgentId.$": "States.Format('agent-{}-support-01', $.companySlug)",
+        "s3BucketPath.$": "States.Format('s3://omni-channel-kb-docs/tenants/{}/', $.tenantId)",
+        "adminConsoleUrl.$": "States.Format('https://console.platform.com/login?tenant={}', $.tenantId)",
+        "temporaryPassword": "TempPass#2026!",
+        "status": "active"
+      },
+      "End": true
+    }
+  }
+}

@@ -90,3 +90,12 @@ resource "aws_cognito_user_group" "admin" {
   description  = "Internal pilot platform administrators"
   precedence   = 1
 }
+
+# Live Agent user group for real-time human customer support agents
+resource "aws_cognito_user_group" "live_agent" {
+  name         = "live_agent"
+  user_pool_id = aws_cognito_user_pool.pool.id
+  description  = "Live human support agents handling chat escalations"
+  precedence   = 5
+}
+

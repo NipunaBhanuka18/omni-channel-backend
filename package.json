@@ -6,7 +6,10 @@
     "doc": "docs"
   },
   "scripts": {
-    "test": "tsx ./scripts/test-all.ts"
+    "test": "tsx ./scripts/test-all.ts && tsx ./scripts/test-tenant-resolver.ts && tsx ./scripts/test-tenant-onboarding.ts",
+    "test:agents": "tsx ./scripts/test-all.ts",
+    "test:tenant-resolver": "tsx ./scripts/test-tenant-resolver.ts",
+    "test:tenant-onboarding": "tsx ./scripts/test-tenant-onboarding.ts"
   },
   "repository": {
     "type": "git",

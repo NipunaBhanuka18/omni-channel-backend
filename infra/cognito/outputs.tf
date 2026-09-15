@@ -22,3 +22,9 @@ output "admin_group_name" {
   description = "Name of the admin user group"
   value       = aws_cognito_user_group.admin.name
 }
+
+output "live_agent_group_name" {
+  description = "Name of the live agent user group"
+  value       = aws_cognito_user_group.live_agent.name
+}
+
