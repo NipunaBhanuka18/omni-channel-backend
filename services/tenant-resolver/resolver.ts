@@ -82,10 +82,7 @@ export function resolveTenantContext(
   }
 
   // ==============================================================================
-  // MEMBER 2 IMPLEMENTATION: Zero-Trust Tenant Spoofing Guard & Claim Validation
-  // ==============================================================================
-  // Validates that the tenantId specified in the incoming x-tenant-id header strictly
-  // matches the authenticated tenant_id claim resolved from the Bearer JWT token.
+  // Zero-Trust Tenant Spoofing Guard & Claim Validation
   // ==============================================================================
   const tokenTenantId = decodedClaims.tenantId;
   const requestTenantId = tenantIdHeader.trim();
@@ -108,18 +105,13 @@ export function resolveTenantContext(
     channel = channelHeader.toLowerCase() as TenantContext["channel"];
   }
 
-  // 5. Resolve Session ID (reuse existing header if provided, otherwise generate new sess-<uuid>)
+  // 5. Resolve Session ID
   const sessionId =
     sessionIdHeader && sessionIdHeader.trim()
       ? sessionIdHeader.trim()
       : `sess-${randomUUID()}`;
 
-  // 6. Resolve Conversation ID (reuse existing header if provided, otherwise generate new conv-<uuid>)
-  /**
-   * ARCHITECTURAL NOTE ON conversationId vs sessionId:
-   * - sessionId represents the broader authenticated user session, which persists across multiple actions and user interactions.
-   * - conversationId tracks a specific, individual conversation thread. Multiple conversationIds can exist sequentially or concurrently within a single user sessionId.
-   */
+  // 6. Resolve Conversation ID
   const conversationId =
     conversationIdHeader && conversationIdHeader.trim()
       ? conversationIdHeader.trim()
