@@ -43,3 +43,16 @@ output "waf_web_acl_arn" {
   description = "WAF Web ACL ARN (null if enable_waf = false)"
   value       = length(module.waf) > 0 ? module.waf[0].web_acl_arn : null
 }
+
+# ------------------------------------------------------------------------------
+# Company Onboarding Outputs
+# ------------------------------------------------------------------------------
+output "onboarding_state_machine_arn" {
+  description = "ARN of the company onboarding Step Functions state machine"
+  value       = module.step_functions.state_machine_arn
+}
+
+output "onboarding_endpoint_url" {
+  description = "Invoke URL for POST /tenants/register"
+  value       = module.api_gateway.onboarding_invoke_url
+}

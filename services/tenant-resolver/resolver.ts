@@ -1,6 +1,6 @@
 import { TenantContext } from "../../shared/types/tenant-context";
 import { AgentActionResponse } from "../../shared/types/agent-action";
-import { decodeMockAzureJwt } from "./mock-jwt-validator";
+import { decodeMockCognitoJwt } from "./mock-jwt-validator";
 import { randomUUID } from "crypto";
 
 export interface TenantResolverResult {
@@ -18,7 +18,15 @@ const ALLOWED_CHANNELS: TenantContext["channel"][] = [
 
 /**
  * Resolves incoming HTTP request headers into a strictly typed TenantContext object.
- * Enforces Zero-Trust tenant validation and spoofing detection (Member 2 Scope).
+ *
+ * ZERO-TRUST TENANT RESOLUTION (ADR-010 / KI: spoofing guard):
+ * Tenant identity comes exclusively from the verified token's `custom:tenant_id`
+ * claim (see mock-jwt-validator.ts). The client-supplied `x-tenant-id` header is
+ * NEVER used as a source of truth — it is accepted only as an optional consistency
+ * check. If present and it disagrees with the token's tenant, the request is
+ * rejected outright with 403 FORBIDDEN (TENANT_MISMATCH) rather than silently
+ * trusting either value. This closes the previous hole where `x-tenant-id` alone
+ * decided tenant context, letting any caller impersonate any tenant.
  *
  * @param headers Map of incoming HTTP headers (case-insensitive keys supported)
  * @returns TenantResolverResult containing either the resolved TenantContext or a structured AgentActionResponse error.
@@ -26,6 +34,7 @@ const ALLOWED_CHANNELS: TenantContext["channel"][] = [
 export function resolveTenantContext(
   headers: Record<string, string | undefined>
 ): TenantResolverResult {
+  // Normalize header keys to lowercase for robust lookup
   const normalizedHeaders: Record<string, string | undefined> = {};
   for (const [key, value] of Object.entries(headers)) {
     if (value !== undefined) {
@@ -39,37 +48,23 @@ export function resolveTenantContext(
   const sessionIdHeader = normalizedHeaders["x-session-id"];
   const conversationIdHeader = normalizedHeaders["x-conversation-id"];
 
-  // Validate missing Authorization header
+  // 1. Validate missing Authorization header
   if (!authorizationHeader || !authorizationHeader.trim()) {
     return {
       success: false,
       error: {
         code: "UNAUTHORIZED",
-        message:
-          "Missing or empty Authorization header. Expected format: 'Bearer <token>'",
+        message: "Missing or empty Authorization header. Expected format: 'Bearer <token>'",
         retryable: false,
         details: { requiredHeader: "Authorization" },
       },
     };
   }
 
-  // Validate missing x-tenant-id header
-  if (!tenantIdHeader || !tenantIdHeader.trim()) {
-    return {
-      success: false,
-      error: {
-        code: "BAD_REQUEST",
-        message: "Missing or empty x-tenant-id header",
-        retryable: false,
-        details: { requiredHeader: "x-tenant-id" },
-      },
-    };
-  }
-
-  // Decode token via JWT validator
+  // 2. Decode token via dev-only mock validator
   let decodedClaims: Partial<TenantContext>;
   try {
-    decodedClaims = decodeMockAzureJwt(authorizationHeader);
+    decodedClaims = decodeMockCognitoJwt(authorizationHeader);
   } catch (err) {
     return {
       success: false,
@@ -81,56 +76,67 @@ export function resolveTenantContext(
     };
   }
 
-  // STRICT TENANT ISOLATION CHECK (ZERO-TRUST SPOOFING GUARD)
+  // 3. Zero-trust tenant resolution.
   const tokenTenantId = decodedClaims.tenantId;
-  const requestedTenantId = tenantIdHeader.trim();
 
-  if (tokenTenantId && tokenTenantId !== requestedTenantId) {
+  // 3a. Fail closed if the authenticated token carries no tenant claim at all.
+  //     (Dev shortcut tokens like "dev-token-staff" hit this too, by design —
+  //     use a 3-part mock JWT with a custom:tenant_id claim to test tenant flows.)
+  if (!tokenTenantId) {
     return {
       success: false,
       error: {
         code: "FORBIDDEN",
-        message: `Tenant ID spoofing detected. Tenant mismatch error: Token tenant '${tokenTenantId}' does not match requested header tenant '${requestedTenantId}'.`,
+        message:
+          "Authenticated token carries no tenant claim (custom:tenant_id). Request rejected.",
         retryable: false,
-        details: { tokenTenantId, requestedTenantId },
+        details: { reason: "TENANT_CLAIM_MISSING" },
       },
     };
   }
 
-  const tenantId = tokenTenantId || requestedTenantId;
+  // 3b. If the caller also sent x-tenant-id, it must agree with the token's
+  //     tenant. Disagreement is treated as spoofing, not as "pick one".
+  if (tenantIdHeader && tenantIdHeader.trim() && tenantIdHeader.trim() !== tokenTenantId) {
+    return {
+      success: false,
+      error: {
+        code: "FORBIDDEN",
+        message: `x-tenant-id header ('${tenantIdHeader.trim()}') does not match the tenant bound to the authenticated token ('${tokenTenantId}').`,
+        retryable: false,
+        details: { reason: "TENANT_MISMATCH", httpStatus: 403 },
+      },
+    };
+  }
 
-  // Resolve Channel
+  // 4. Resolve Channel with fallback default ("web")
   let channel: TenantContext["channel"] = "web";
-  if (
-    channelHeader &&
-    ALLOWED_CHANNELS.includes(
-      channelHeader.toLowerCase() as TenantContext["channel"]
-    )
-  ) {
+  if (channelHeader && ALLOWED_CHANNELS.includes(channelHeader.toLowerCase() as TenantContext["channel"])) {
     channel = channelHeader.toLowerCase() as TenantContext["channel"];
   }
 
-  // Resolve Session ID
+  // 5. Resolve Session ID (reuse existing header if provided, otherwise generate new sess-<uuid>)
   const sessionId =
     sessionIdHeader && sessionIdHeader.trim()
       ? sessionIdHeader.trim()
       : `sess-${randomUUID()}`;
 
-  // Resolve Conversation ID
+  // 6. Resolve Conversation ID (reuse existing header if provided, otherwise generate new conv-<uuid>)
+  /**
+   * ARCHITECTURAL NOTE ON conversationId vs sessionId:
+   * - sessionId represents the broader authenticated user session, which persists across multiple actions and user interactions.
+   * - conversationId tracks a specific, individual conversation thread. Multiple conversationIds can exist sequentially or concurrently within a single user sessionId.
+   */
   const conversationId =
     conversationIdHeader && conversationIdHeader.trim()
       ? conversationIdHeader.trim()
       : `conv-${randomUUID()}`;
 
   const context: TenantContext = {
-    tenantId,
+    tenantId: tokenTenantId,
     userId: decodedClaims.userId || "dev-user-001",
     role: decodedClaims.role || "staff",
-    permissions: decodedClaims.permissions || [
-      "billing:read",
-      "usage:read",
-      "faults:read",
-    ],
+    permissions: decodedClaims.permissions || ["billing:read", "usage:read", "faults:read"],
     channel,
     sessionId,
     conversationId,
