@@ -427,6 +427,122 @@ resource "aws_api_gateway_integration_response" "route_post_mock_422" {
 }
 
 # ------------------------------------------------------------------------------
+# Company Onboarding Endpoint (POST /tenants/register)
+# ------------------------------------------------------------------------------
+# Same conditional-integration pattern as /route POST above: AWS_PROXY to the real
+# onboarding Lambda when its invoke ARN is supplied, otherwise a MOCK integration
+# for local testing without a deployed Lambda.
+
+resource "aws_api_gateway_resource" "tenants" {
+  rest_api_id = aws_api_gateway_rest_api.omni_channel.id
+  parent_id   = aws_api_gateway_rest_api.omni_channel.root_resource_id
+  path_part   = "tenants"
+}
+
+resource "aws_api_gateway_resource" "tenants_register" {
+  rest_api_id = aws_api_gateway_rest_api.omni_channel.id
+  parent_id   = aws_api_gateway_resource.tenants.id
+  path_part   = "register"
+}
+
+resource "aws_api_gateway_method" "tenants_register_post" {
+  rest_api_id   = aws_api_gateway_rest_api.omni_channel.id
+  resource_id   = aws_api_gateway_resource.tenants_register.id
+  http_method   = "POST"
+  authorization = "NONE" # Authorization is enforced in the Lambda (staff-only check in services/onboarding/handler.ts), not at the gateway.
+
+  request_parameters = {
+    "method.request.header.Authorization" = false
+  }
+}
+
+resource "aws_api_gateway_integration" "tenants_register_integration" {
+  rest_api_id             = aws_api_gateway_rest_api.omni_channel.id
+  resource_id             = aws_api_gateway_resource.tenants_register.id
+  http_method             = aws_api_gateway_method.tenants_register_post.http_method
+  integration_http_method = var.onboarding_lambda_invoke_arn != "" ? "POST" : null
+  type                    = var.onboarding_lambda_invoke_arn != "" ? "AWS_PROXY" : "MOCK"
+  uri                     = var.onboarding_lambda_invoke_arn != "" ? var.onboarding_lambda_invoke_arn : null
+
+  request_templates = var.onboarding_lambda_invoke_arn == "" ? {
+    "application/json" = <<EOF
+#set($auth = $input.params('Authorization'))
+#if($auth == "")
+  {"statusCode": 401}
+#else
+  {"statusCode": 201}
+#end
+EOF
+  } : null
+}
+
+resource "aws_api_gateway_method_response" "tenants_register_201" {
+  rest_api_id = aws_api_gateway_rest_api.omni_channel.id
+  resource_id = aws_api_gateway_resource.tenants_register.id
+  http_method = aws_api_gateway_method.tenants_register_post.http_method
+  status_code = "201"
+
+  response_models = {
+    "application/json" = "Empty"
+  }
+}
+
+resource "aws_api_gateway_method_response" "tenants_register_401" {
+  rest_api_id = aws_api_gateway_rest_api.omni_channel.id
+  resource_id = aws_api_gateway_resource.tenants_register.id
+  http_method = aws_api_gateway_method.tenants_register_post.http_method
+  status_code = "401"
+
+  response_models = {
+    "application/json" = "Empty"
+  }
+}
+
+resource "aws_api_gateway_integration_response" "tenants_register_mock_201" {
+  rest_api_id = aws_api_gateway_rest_api.omni_channel.id
+  resource_id = aws_api_gateway_resource.tenants_register.id
+  http_method = aws_api_gateway_method.tenants_register_post.http_method
+  status_code = aws_api_gateway_method_response.tenants_register_201.status_code
+
+  response_templates = {
+    "application/json" = jsonencode({
+      success = true
+      data = {
+        tenantId      = "mock-tenant"
+        companyName   = "Mock Company"
+        adminUsername = "admin@mock.test"
+        status        = "provisioned"
+        createdAt     = "$context.requestTime"
+      }
+    })
+  }
+
+  depends_on = [aws_api_gateway_integration.tenants_register_integration]
+}
+
+resource "aws_api_gateway_integration_response" "tenants_register_mock_401" {
+  rest_api_id = aws_api_gateway_rest_api.omni_channel.id
+  resource_id = aws_api_gateway_resource.tenants_register.id
+  http_method = aws_api_gateway_method.tenants_register_post.http_method
+  status_code = aws_api_gateway_method_response.tenants_register_401.status_code
+  selection_pattern = "401"
+
+  response_templates = {
+    "application/json" = jsonencode({
+      success = false
+      error = {
+        code      = "UNAUTHORIZED"
+        message   = "Missing or empty Authorization header. Expected format: 'Bearer <token>'"
+        retryable = false
+        details   = { requiredHeader = "Authorization" }
+      }
+    })
+  }
+
+  depends_on = [aws_api_gateway_integration.tenants_register_integration]
+}
+
+# ------------------------------------------------------------------------------
 # Deployment & Stage Settings (Throttling & Rate Limiting Baseline)
 # ------------------------------------------------------------------------------
 
@@ -443,6 +559,9 @@ resource "aws_api_gateway_deployment" "deployment" {
       aws_api_gateway_integration.route_mock.id,
       aws_api_gateway_method.route_post.id,
       aws_api_gateway_integration.route_post_mock.id,
+      aws_api_gateway_resource.tenants_register.id,
+      aws_api_gateway_method.tenants_register_post.id,
+      aws_api_gateway_integration.tenants_register_integration.id,
     ]))
   }
 
@@ -459,6 +578,8 @@ resource "aws_api_gateway_deployment" "deployment" {
     aws_api_gateway_integration_response.route_post_mock_400,
     aws_api_gateway_integration_response.route_post_mock_401,
     aws_api_gateway_integration_response.route_post_mock_422,
+    aws_api_gateway_integration_response.tenants_register_mock_201,
+    aws_api_gateway_integration_response.tenants_register_mock_401,
   ]
 }
 

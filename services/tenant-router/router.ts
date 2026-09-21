@@ -1,9 +1,18 @@
+import { GetCommand, DynamoDBDocumentClient } from "@aws-sdk/lib-dynamodb";
+import { docClient } from "../../agents/utils/dynamo-client";
 import { TenantContext } from "../../shared/types/tenant-context";
 import { AgentActionResponse } from "../../shared/types/agent-action";
 
 export interface TenantConfig {
   tenantId: string;
   name: string;
+  /**
+   * Lowercased/trimmed form of `name` (see shared/utils/tenant-name.ts), stored so
+   * the NormalizedNameIndex GSI on omni-channel-tenants can catch a company being
+   * onboarded twice under different capitalization/spacing. Optional here because
+   * routing itself never needs it — only onboarding's duplicate check does.
+   */
+  normalizedName?: string;
   status: "active" | "suspended" | "inactive";
   allowedChannels: TenantContext["channel"][];
   defaultAgent: string;
@@ -21,38 +30,41 @@ export interface RoutingDecisionResult {
   error?: AgentActionResponse["error"];
 }
 
-/**
- * Multi-Tenant Registry Store
- * Configured so adding a second tenant later is a simple configuration addition without logic changes.
- */
-export const TENANT_REGISTRY: Record<string, TenantConfig> = {
-  slt: {
-    tenantId: "slt",
-    name: "Sri Lanka Telecom",
-    status: "active",
-    allowedChannels: ["web", "whatsapp", "sms", "messenger"],
-    defaultAgent: "main-agent",
-  },
-  "tenant-test-123": {
-    tenantId: "tenant-test-123",
-    name: "Test Tenant 123",
-    status: "active",
-    allowedChannels: ["web", "whatsapp", "sms", "messenger"],
-    defaultAgent: "main-agent",
-  },
-};
+export interface TenantRouterDeps {
+  dynamo: DynamoDBDocumentClient;
+}
 
-/**
- * Evaluates a TenantContext against tenant configuration and returns a routing decision.
- *
- * @param context Resolved TenantContext
- * @returns RoutingDecisionResult with targetAgent handoff boundary or error
- */
-export function routeRequest(context: TenantContext): RoutingDecisionResult {
-  const tenantConfig = TENANT_REGISTRY[context.tenantId];
+function defaultDeps(): TenantRouterDeps {
+  return { dynamo: docClient };
+}
+
+export async function routeRequest(
+  context: TenantContext,
+  deps?: TenantRouterDeps
+): Promise<RoutingDecisionResult> {
+  const { dynamo } = deps || defaultDeps();
+
+  let tenantConfig: TenantConfig | undefined;
+  try {
+    const result = await dynamo.send(
+      new GetCommand({ TableName: "omni-channel-tenants", Key: { tenantId: context.tenantId } })
+    );
+    tenantConfig = result.Item as TenantConfig | undefined;
+  } catch (err) {
+    console.error(`[TenantRouter] DynamoDB lookup failed for tenant '${context.tenantId}':`, err);
+    return {
+      success: false,
+      error: {
+        code: "INTERNAL_ERROR",
+        message: `Failed to look up tenant configuration: ${(err as Error).message}`,
+        retryable: true,
+        details: { tenantId: context.tenantId },
+      },
+    };
+  }
 
   if (!tenantConfig) {
-    console.warn(`[TenantRouter] Routing failed: Tenant '${context.tenantId}' not found in registry.`);
+    console.warn(`[TenantRouter] Routing failed: Tenant '${context.tenantId}' not found in omni-channel-tenants.`);
     return {
       success: false,
       error: {
@@ -80,7 +92,6 @@ export function routeRequest(context: TenantContext): RoutingDecisionResult {
   const targetAgent = tenantConfig.defaultAgent;
   const routedAt = new Date().toISOString();
 
-  // Log routing decision clearly as handoff boundary
   console.log(
     `[TenantRouter] Successfully routed request for tenant '${context.tenantId}' ` +
       `(user: '${context.userId}', channel: '${context.channel}', conversationId: '${context.conversationId}') ` +

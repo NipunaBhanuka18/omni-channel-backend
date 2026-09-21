@@ -1,7 +1,7 @@
 export interface TenantContext {
   tenantId: string;
   userId: string;
-  role: "staff" | "admin";
+  role: "staff" | "admin" | "live_agent";
   permissions: string[];
   channel: "web" | "whatsapp" | "sms" | "messenger";
   sessionId: string;

@@ -30,8 +30,8 @@ export async function handleTenantRequest(request: HttpRequestPayload): Promise<
     };
   }
 
-  // Step 2: Route request using resolved TenantContext
-  const routerResult: RoutingDecisionResult = routeRequest(resolverResult.context);
+  // Step 2: Route request using resolved TenantContext (DynamoDB, ADR-014)
+  const routerResult: RoutingDecisionResult = await routeRequest(resolverResult.context);
 
   if (!routerResult.success || !routerResult.data) {
     return {

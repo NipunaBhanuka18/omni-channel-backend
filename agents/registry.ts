@@ -1,6 +1,6 @@
 import { handler as billingSpecialistHandler } from "./specialists/billing/handler";
 import { handler as usageSpecialistHandler } from "./specialists/usage/handler";
-import { handler as supportSpecialistHandler } from "./specialists/support/handler"; // <--- ADD THIS
+import { handler as supportSpecialistHandler } from "./specialists/support/handler"; 
 
 // The Dynamic Agent Registry
 export const agentRegistry: Record<

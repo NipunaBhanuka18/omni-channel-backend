@@ -32,3 +32,8 @@ output "route_invoke_url" {
   description = "Invoke URL for the Tenant Router endpoint"
   value       = "${aws_api_gateway_stage.stage.invoke_url}/route"
 }
+
+output "onboarding_invoke_url" {
+  description = "Invoke URL for the Company Onboarding endpoint"
+  value       = "${aws_api_gateway_stage.stage.invoke_url}/tenants/register"
+}
