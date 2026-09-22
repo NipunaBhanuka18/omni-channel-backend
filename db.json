@@ -102,6 +102,22 @@
       ],
       "tenantId": "tenant-hemas",
       "onboardedAt": "2026-09-22T06:44:48.920Z"
+    },
+    {
+      "id": "reg-1790061341900",
+      "companyName": "Dialog Axiata",
+      "companySlug": "dialog-axiata",
+      "businessRegNumber": "BR-PENDING",
+      "companyEmail": "admin@dialog.lk",
+      "adminName": "Pubudini Rathnayake",
+      "password": "company123",
+      "status": "Pending",
+      "submissionDate": "2026-09-22",
+      "tier": "Standard",
+      "allocatedAgents": 5,
+      "channels": [
+        "Web"
+      ]
     }
   ]
 }

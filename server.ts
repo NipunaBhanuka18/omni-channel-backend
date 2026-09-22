@@ -161,10 +161,54 @@ app.post("/api/auth/register-admin", (req, res) => {
 // 2. COMPANY REGISTRATION & APPROVAL ROUTES
 // ==========================================
 
-// GET /api/registrations
+function normalizeRegistration(r: any) {
+  const companyName = r.companyName || r.name || "Unnamed Company";
+  const email = r.companyEmail || r.email || r.adminEmail || "";
+  const submissionDate = r.submissionDate || r.date || r.requestedDate || new Date().toISOString().split("T")[0];
+  const industry = r.industry || r.companyType || "Technology";
+
+  return {
+    ...r,
+    companyName,
+    name: companyName,
+    companyEmail: email,
+    email: email,
+    adminName: r.adminName || "Admin",
+    adminEmail: r.adminEmail || email,
+    phone: r.phone || r.adminPhone || "-",
+    adminPhone: r.adminPhone || r.phone || "-",
+    website: r.website || "-",
+    industry,
+    companyType: industry,
+    country: r.country || "Sri Lanka",
+    city: r.city || "",
+    address: r.address || "",
+    employeeCount: r.employeeCount || "",
+    about: r.about || "",
+    status: r.status || "Pending",
+    submissionDate,
+    date: submissionDate,
+    requestedDate: submissionDate,
+    tier: r.tier || "Standard",
+    allocatedAgents: r.allocatedAgents || 5,
+    channels: r.channels || ["Web"],
+  };
+}
+
+// GET /api/registrations (supports ?status=pending or ?status=approved)
 app.get("/api/registrations", (req, res) => {
   const db = readDB();
-  res.json({ success: true, registrations: db.registrations });
+  const rawList = (db.registrations || []).map(normalizeRegistration);
+  const statusParam = req.query.status as string;
+
+  if (statusParam) {
+    const filtered = rawList.filter(
+      (r: any) => (r.status || "").toLowerCase() === statusParam.toLowerCase()
+    );
+    return res.json(filtered);
+  }
+
+  return res.json({ success: true, registrations: rawList });
 });
 
 // POST /api/registrations
@@ -172,21 +216,37 @@ app.post("/api/registrations", (req, res) => {
   const body = req.body;
   const db = readDB();
 
-  const cleanSlug = (body.companyName || "company").toLowerCase().replace(/[^a-z0-9]/g, "-");
-  const newReg = {
+  const cleanSlug = (body.companyName || body.name || "company").toLowerCase().replace(/[^a-z0-9]/g, "-");
+  const dateStr = new Date().toISOString().split("T")[0];
+  const newReg = normalizeRegistration({
     id: `reg-${Date.now()}`,
-    companyName: body.companyName || "Unnamed Company",
+    companyName: body.companyName || body.name || "Unnamed Company",
+    name: body.companyName || body.name || "Unnamed Company",
     companySlug: body.companySlug || cleanSlug,
     businessRegNumber: body.businessRegNumber || "BR-PENDING",
-    companyEmail: body.companyEmail || "",
-    adminName: body.adminName || "",
+    companyEmail: body.companyEmail || body.email || "",
+    email: body.companyEmail || body.email || body.adminEmail || "",
+    adminName: body.adminName || "Admin",
+    adminEmail: body.adminEmail || body.companyEmail || body.email || "",
+    adminPhone: body.adminPhone || body.phone || "-",
+    phone: body.phone || body.adminPhone || "-",
+    website: body.website || "-",
+    industry: body.industry || body.companyType || "Technology",
+    companyType: body.companyType || body.industry || "Technology",
+    country: body.country || "Sri Lanka",
+    city: body.city || "",
+    address: body.address || "",
+    employeeCount: body.employeeCount || "",
+    about: body.about || "",
     password: body.password || "company123",
     status: "Pending",
-    submissionDate: new Date().toISOString().split("T")[0],
+    submissionDate: dateStr,
+    date: dateStr,
+    requestedDate: dateStr,
     tier: body.tier || "Standard",
     allocatedAgents: body.allocatedAgents || 5,
     channels: body.channels || ["Web"],
-  };
+  });
 
   db.registrations.push(newReg);
   writeDB(db);
@@ -194,22 +254,24 @@ app.post("/api/registrations", (req, res) => {
   res.status(201).json({ success: true, registration: newReg });
 });
 
-// PUT /api/registrations/:id/status (Super Admin Approves / Rejects)
-app.put("/api/registrations/:id/status", async (req, res) => {
+// Handler for approving or rejecting registration
+const handleUpdateRegistrationStatus = async (req: express.Request, res: express.Response) => {
   const { id } = req.params;
-  const { status } = req.body;
+  const rawStatus = (req.body.status || "").toLowerCase();
 
   const db = readDB();
-  const reg = db.registrations.find((r: any) => r.id === id);
+  const regIndex = db.registrations.findIndex((r: any) => String(r.id) === String(id));
 
-  if (!reg) {
+  if (regIndex === -1) {
     return res.status(404).json({ success: false, error: "Registration not found" });
   }
 
-  reg.status = status;
+  const reg = db.registrations[regIndex];
+  const normalizedStatus = rawStatus === "approved" ? "Approved" : rawStatus === "rejected" ? "Rejected" : req.body.status || "Approved";
+  reg.status = normalizedStatus;
 
   // Auto-Provision Tenant Partition when Approved
-  if (status === "Approved" && !reg.tenantId) {
+  if (normalizedStatus === "Approved" && !reg.tenantId) {
     try {
       const onboardResult = await registerTenant({
         companyName: reg.companyName,
@@ -226,15 +288,25 @@ app.put("/api/registrations/:id/status", async (req, res) => {
     }
   }
 
+  db.registrations[regIndex] = normalizeRegistration(reg);
   writeDB(db);
-  res.json({ success: true, registration: reg });
-});
+  return res.json({ success: true, registration: db.registrations[regIndex] });
+};
+
+// PATCH /api/registrations/:id (Super Admin Approves / Rejects)
+app.patch("/api/registrations/:id", handleUpdateRegistrationStatus);
+
+// PUT /api/registrations/:id
+app.put("/api/registrations/:id", handleUpdateRegistrationStatus);
+
+// PUT /api/registrations/:id/status (Backwards compatibility)
+app.put("/api/registrations/:id/status", handleUpdateRegistrationStatus);
 
 // GET /api/stats (Admin Console Dashboard Stats)
 app.get("/api/stats", (req, res) => {
   const db = readDB();
-  const activeCount = db.registrations.filter((r: any) => r.status === "Approved").length;
-  const pendingCount = db.registrations.filter((r: any) => r.status === "Pending").length;
+  const activeCount = db.registrations.filter((r: any) => (r.status || "").toLowerCase() === "approved").length;
+  const pendingCount = db.registrations.filter((r: any) => (r.status || "").toLowerCase() === "pending").length;
 
   res.json({
     totalAvailability: activeCount,
@@ -244,6 +316,35 @@ app.get("/api/stats", (req, res) => {
     monthlyConversations: 14820,
     systemLatencyMs: 42,
   });
+});
+
+// GET /api/notifications (Admin Notifications)
+app.get("/api/notifications", (req, res) => {
+  const db = readDB();
+  const list = db.registrations || [];
+  const pendingRegs = list.filter((r: any) => (r.status || "").toLowerCase() === "pending");
+
+  const notifications = [
+    ...pendingRegs.map((r: any) => ({
+      id: `notif-reg-${r.id}`,
+      title: `Registration Request: ${r.companyName || r.name}`,
+      message: `${r.companyName || r.name} (${r.companyEmail || r.email || r.adminEmail || "Admin"}) submitted a registration request for approval.`,
+      type: "pending",
+      timestamp: r.submissionDate || r.date || new Date().toISOString().split("T")[0],
+      read: false,
+      companyId: r.id,
+    })),
+    {
+      id: "notif-system-1",
+      title: "Gateway Health Normal",
+      message: "SLT Global Node 01 health status verified 100%.",
+      type: "system",
+      timestamp: new Date().toISOString().split("T")[0],
+      read: true,
+    },
+  ];
+
+  res.json({ success: true, notifications });
 });
 
 // ==========================================
