@@ -242,7 +242,9 @@ async function main(): Promise<void> {
   console.log("\n--- Done. omni-channel-tools was created empty (Member 4 owns its records). ---");
 }
 
-main().catch((err) => {
-  console.error(" Fatal error while creating/seeding tenant tables:", err);
-  process.exitCode = 1;
-});
+if (require.main === module || process.argv[1]?.includes("create-tenants-table")) {
+  main().catch((err) => {
+    console.error(" Fatal error while creating/seeding tenant tables:", err);
+    process.exitCode = 1;
+  });
+}
