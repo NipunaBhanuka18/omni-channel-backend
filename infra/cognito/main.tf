@@ -74,6 +74,12 @@ resource "aws_cognito_user_pool_client" "client" {
   ]
 
   prevent_user_existence_errors = "ENABLED"
+
+  # Custom: tenant_id must be explicitly whitelisted per app Client or Cognito
+  # Omits it from issued ID tokens even though it's in the pool schema.
+  read_attributes = ["email", "custom:tenant_id"]
+  write_attributes = ["email", "custom:tenant_id"]
+
 }
 
 # Internal pilot user groups (Global context for Phase 1)

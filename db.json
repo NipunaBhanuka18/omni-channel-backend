@@ -64,6 +64,111 @@
         "WhatsApp"
       ],
       "tenantId": "tenant-reg-1789512029661"
+    },
+    {
+      "id": "reg-1790059431896",
+      "companyName": "Hemas Holdings",
+      "companySlug": "hemas",
+      "businessRegNumber": "BR-PENDING",
+      "companyEmail": "admin@hemas.com",
+      "adminName": "",
+      "password": "company123",
+      "status": "Approved",
+      "submissionDate": "2026-09-22",
+      "tier": "Enterprise",
+      "allocatedAgents": 5,
+      "channels": [
+        "Web",
+        "WhatsApp"
+      ],
+      "tenantId": "tenant-hemas",
+      "onboardedAt": "2026-09-22T06:43:52.537Z"
+    },
+    {
+      "id": "reg-1790059488034",
+      "companyName": "Hemas Holdings",
+      "companySlug": "hemas",
+      "businessRegNumber": "BR-PENDING",
+      "companyEmail": "admin@hemas.com",
+      "adminName": "",
+      "password": "company123",
+      "status": "Approved",
+      "submissionDate": "2026-09-22",
+      "tier": "Enterprise",
+      "allocatedAgents": 5,
+      "channels": [
+        "Web",
+        "WhatsApp"
+      ],
+      "tenantId": "tenant-hemas",
+      "onboardedAt": "2026-09-22T06:44:48.920Z"
+    },
+    {
+      "id": "reg-1790061341900",
+      "companyName": "Dialog Axiata",
+      "companySlug": "dialog-axiata",
+      "businessRegNumber": "BR-PENDING",
+      "companyEmail": "admin@dialog.lk",
+      "adminName": "Pubudini Rathnayake",
+      "password": "company123",
+      "status": "Approved",
+      "submissionDate": "2026-09-22",
+      "tier": "Standard",
+      "allocatedAgents": 5,
+      "channels": [
+        "Web"
+      ],
+      "tenantId": "tenant-dialog-axiata",
+      "onboardedAt": "2026-09-22T07:30:22.649Z",
+      "name": "Dialog Axiata",
+      "email": "admin@dialog.lk",
+      "adminEmail": "admin@dialog.lk",
+      "phone": "-",
+      "adminPhone": "-",
+      "website": "-",
+      "industry": "Technology",
+      "companyType": "Technology",
+      "country": "Sri Lanka",
+      "city": "",
+      "address": "",
+      "employeeCount": "",
+      "about": "",
+      "date": "2026-09-22",
+      "requestedDate": "2026-09-22"
+    },
+    {
+      "id": "reg-1790062391429",
+      "companyName": "Hemas Holdings",
+      "name": "Hemas Holdings",
+      "companySlug": "hemas",
+      "businessRegNumber": "BR-PENDING",
+      "companyEmail": "admin@hemas.com",
+      "email": "admin@hemas.com",
+      "adminName": "Admin",
+      "adminEmail": "admin@hemas.com",
+      "adminPhone": "-",
+      "phone": "-",
+      "website": "-",
+      "industry": "Technology",
+      "companyType": "Technology",
+      "country": "Sri Lanka",
+      "city": "",
+      "address": "",
+      "employeeCount": "",
+      "about": "",
+      "password": "company123",
+      "status": "Approved",
+      "submissionDate": "2026-09-22",
+      "date": "2026-09-22",
+      "requestedDate": "2026-09-22",
+      "tier": "Enterprise",
+      "allocatedAgents": 5,
+      "channels": [
+        "Web",
+        "WhatsApp"
+      ],
+      "tenantId": "tenant-hemas",
+      "onboardedAt": "2026-09-22T07:33:12.258Z"
     }
   ]
 }
