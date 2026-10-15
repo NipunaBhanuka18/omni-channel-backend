@@ -1,0 +1,6 @@
+aws_region      = "us-east-1"
+environment     = "dev"
+use_localstack = true
+localstack_url = "http://localhost:4566"
+# Set enable_waf = true when deploying to AWS or LocalStack Pro
+enable_waf     = false

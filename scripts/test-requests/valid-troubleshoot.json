@@ -1,0 +1,6 @@
+{
+  "intent": "troubleshoot_router",
+  "params": {
+    "query": "router blinking red"
+  }
+}
