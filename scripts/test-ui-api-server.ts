@@ -30,6 +30,19 @@ async function runUiServerTests() {
     }
   }
 
+  type UiApiResponse = {
+    totalAvailability?: number;
+    activeAgentsCount?: number;
+    success?: boolean;
+    user?: { role?: string };
+    registration?: { id?: string; status?: string; tenantId?: string };
+    status?: string;
+    assigned?: boolean;
+    s3Key?: string;
+    tenantId?: string;
+    agentId?: string;
+  };
+
   // Helper for HTTP requests
   async function api(path: string, options: { method?: string; body?: any } = {}) {
     const res = await fetch(`${baseUrl}${path}`, {
@@ -37,7 +50,7 @@ async function runUiServerTests() {
       headers: { "Content-Type": "application/json" },
       body: options.body ? JSON.stringify(options.body) : undefined,
     });
-    const json = await res.json().catch(() => ({}));
+    const json = (await res.json().catch(() => ({}))) as UiApiResponse;
     return { status: res.status, data: json };
   }
 
@@ -153,7 +166,7 @@ async function runUiServerTests() {
     });
     assert(
       "POST /api/workspace/upload-doc uploads document to tenant S3 prefix",
-      uploadRes.status === 201 && uploadRes.data.s3Key?.includes("tenants/slt/"),
+      uploadRes.status === 201 && uploadRes.data.s3Key?.includes("tenants/slt/") === true,
       JSON.stringify(uploadRes.data)
     );
 

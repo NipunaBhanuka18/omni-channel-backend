@@ -1,4 +1,4 @@
-import { CreateTableCommand } from "@aws-sdk/client-dynamodb";
+import { CreateTableCommand, type KeySchemaElement } from "@aws-sdk/client-dynamodb";
 import { docClient } from "../agents/utils/dynamo-client";
 
 interface TableSpec {
@@ -25,7 +25,7 @@ const handoffTables: TableSpec[] = [
 ];
 
 async function createTableIfNotExists(spec: TableSpec) {
-  const keySchema = [{ AttributeName: spec.pk, KeyType: "HASH" as const }];
+  const keySchema: KeySchemaElement[] = [{ AttributeName: spec.pk, KeyType: "HASH" }];
   const attributeDefinitions = [{ AttributeName: spec.pk, AttributeType: "S" as const }];
 
   if (spec.sk) {

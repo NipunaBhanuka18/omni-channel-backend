@@ -73,7 +73,7 @@ async function runMember4TestSuite() {
 
     try {
       const res = await fetch(`http://127.0.0.1:${TEST_PORT}/resolve-chat-url?company=slt&agent=support`);
-      const json = await res.json();
+      const json = (await res.json()) as { tenantId?: string; agentName?: string };
       assert(
         "GET /resolve-chat-url returns dynamic company chatbot configuration",
         res.status === 200 && json.tenantId === "slt" && json.agentName !== undefined,
