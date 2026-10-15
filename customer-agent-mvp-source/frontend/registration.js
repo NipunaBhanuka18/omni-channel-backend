@@ -1,0 +1,12 @@
+(function(){
+  "use strict";
+  const cfg=window.CHAT_CONFIG||{},api=(cfg.apiBaseUrl||"").replace(/\/$/,"");
+  const form=document.querySelector("#registrationForm"),status=document.querySelector("#formStatus");
+  let step=1,registrationId="";
+  function showStep(next){step=next;document.querySelectorAll("[data-step]").forEach(x=>x.classList.toggle("hidden",Number(x.dataset.step)!==step));document.querySelectorAll("[data-step-dot]").forEach(x=>{const n=Number(x.dataset.stepDot);x.classList.toggle("active",n===step);x.classList.toggle("done",n<step)});status.classList.add("hidden")}
+  function message(value){status.textContent=value;status.classList.remove("hidden");status.classList.add("error")}
+  async function post(path,body){if(!api)return demo(path,body);const res=await fetch(api+path,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});const data=await res.json().catch(()=>({}));if(!res.ok)throw new Error(data.message||"Request failed");return data}
+  function demo(path,body){if(path.endsWith("/start"))return Promise.resolve({registrationId:"reg_demo",maskedEmail:body.adminEmail.replace(/^(.{2}).*(@.*)$/,"$1***$2"),expiresIn:600});return Promise.resolve({status:"COMPLETED",tenantId:"ten_demo_workspace",tenantSlug:"acme-demo",message:"Demo workspace created. Connect the AWS backend to send real invitations."})}
+  form.addEventListener("submit",async event=>{event.preventDefault();const button=event.submitter;button.disabled=true;const label=button.textContent;button.textContent=step===1?"Sending code…":"Creating workspace…";try{if(step===1){const data=Object.fromEntries(new FormData(form).entries());data.acceptedTerms=Boolean(form.elements.acceptedTerms.checked);const result=await post("/v1/public/onboarding/start",data);registrationId=result.registrationId;document.querySelector("#maskedEmail").textContent=result.maskedEmail;showStep(2);form.elements.verificationCode.focus()}else if(step===2){const result=await post("/v1/public/onboarding/verify",{registrationId,verificationCode:form.elements.verificationCode.value});document.querySelector("#tenantSlug").textContent=result.tenantSlug;document.querySelector("#tenantId").textContent=result.tenantId;document.querySelector("#successMessage").textContent=result.message;showStep(3)}}catch(error){message(error.message)}finally{button.disabled=false;button.textContent=label}});
+  document.querySelector("#startOver").addEventListener("click",()=>{registrationId="";form.reset();showStep(1)});
+})();

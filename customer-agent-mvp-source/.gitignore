@@ -1,0 +1,7 @@
+.aws-sam/
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
+frontend/runtime-config.js
+

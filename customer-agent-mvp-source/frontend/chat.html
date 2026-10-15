@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#0057b8" />
+    <meta name="description" content="A secure AI customer assistant." />
+    <title>Connect AI</title>
+    <link rel="icon" href="./favicon.svg" type="image/svg+xml" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@600;700;800&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="page-shell">
+      <aside class="brand-panel" aria-label="Assistant information">
+        <div class="brand-lockup">
+          <span class="brand-mark" id="brandMark">CA</span>
+          <div>
+            <strong id="brandName">Connect AI</strong>
+            <span>Customer care, made simple</span>
+          </div>
+        </div>
+
+        <div class="brand-copy">
+          <p class="eyebrow">AVAILABLE 24/7</p>
+          <h1>Answers that move you forward.</h1>
+          <p>Ask a question, explore services, or get guided support—all in one conversation.</p>
+        </div>
+
+        <div class="trust-row">
+          <span><i class="status-dot"></i> AI assistant online</span>
+          <span>Secure conversation</span>
+        </div>
+      </aside>
+
+      <main class="chat-card" aria-label="Customer support chat">
+        <header class="chat-header">
+          <div class="agent-identity">
+            <div class="agent-avatar" aria-hidden="true">
+              <svg viewBox="0 0 24 24"><path d="M12 3a6 6 0 0 0-6 6v1a4 4 0 0 0-2 3.46V15a4 4 0 0 0 4 4h1v-7H6v-2a6 6 0 0 1 12 0v2h-3v7h1a4 4 0 0 0 4-4v-1.54A4 4 0 0 0 18 10V9a6 6 0 0 0-6-6Z"/></svg>
+            </div>
+            <div>
+              <div class="agent-name-row">
+                <h2 id="agentName">Connect AI Assistant</h2>
+                <span class="ai-badge">AI</span>
+              </div>
+              <p><span class="status-dot"></span><span id="agentStatus">Online · replies instantly</span></p>
+            </div>
+          </div>
+          <button class="icon-button" id="restartButton" type="button" aria-label="Start a new conversation" title="New conversation">
+            <svg viewBox="0 0 24 24"><path d="M12 5a7 7 0 1 1-6.32 4H8L4.5 5.5 1 9h2.62A9 9 0 1 0 12 3v2Z"/></svg>
+          </button>
+        </header>
+
+        <section class="messages" id="messages" aria-live="polite" aria-label="Conversation messages">
+          <div class="date-divider"><span>Today</span></div>
+          <div class="typing-message" id="loadingState">
+            <span></span><span></span><span></span>
+          </div>
+        </section>
+
+        <section class="suggestions" id="suggestions" aria-label="Suggested questions"></section>
+
+        <form class="composer" id="composer">
+          <label class="sr-only" for="messageInput">Type your message</label>
+          <textarea id="messageInput" rows="1" maxlength="4000" placeholder="Type your message…" autocomplete="off"></textarea>
+          <button class="send-button" id="sendButton" type="submit" aria-label="Send message">
+            <svg viewBox="0 0 24 24"><path d="m3.4 20.4 17.45-7.48a1 1 0 0 0 0-1.84L3.4 3.6a1 1 0 0 0-1.37 1.13L3.85 11H11a1 1 0 1 1 0 2H3.85l-1.82 6.27A1 1 0 0 0 3.4 20.4Z"/></svg>
+          </button>
+        </form>
+        <p class="disclaimer">AI responses can be inaccurate. Please verify important information.</p>
+      </main>
+    </div>
+
+    <template id="botMessageTemplate">
+      <article class="message-row bot-row">
+        <div class="mini-avatar" aria-hidden="true">AI</div>
+        <div class="message-stack">
+          <div class="bubble bot-bubble"></div>
+          <div class="message-meta">
+            <span class="message-time"></span>
+            <div class="feedback-controls" aria-label="Rate this answer">
+              <button type="button" data-rating="up" aria-label="Helpful answer">♡</button>
+              <button type="button" data-rating="down" aria-label="Not helpful">×</button>
+            </div>
+          </div>
+        </div>
+      </article>
+    </template>
+
+    <template id="userMessageTemplate">
+      <article class="message-row user-row">
+        <div class="message-stack">
+          <div class="bubble user-bubble"></div>
+          <span class="message-time"></span>
+        </div>
+      </article>
+    </template>
+
+    <script src="./config.js"></script>
+    <script src="./app.js"></script>
+  </body>
+</html>
+

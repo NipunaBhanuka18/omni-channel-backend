@@ -1,0 +1,439 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: Multi-tenant customer engagement, AI agent, admin, and live-agent platform
+
+Parameters:
+  BedrockModelId: {Type: String, Default: amazon.nova-lite-v1:0}
+  KnowledgeBaseId: {Type: String, Default: ""}
+  GuardrailId: {Type: String, Default: ""}
+  GuardrailVersion: {Type: String, Default: DRAFT}
+  AllowedOrigin: {Type: String, Default: "*"}
+  OnboardingEmailFrom:
+    Type: String
+    Description: SES-verified sender used for company email verification codes
+  CognitoDomainPrefix:
+    Type: String
+    Description: Globally unique lowercase prefix for the Cognito hosted login domain
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [arm64]
+    Timeout: 60
+    MemorySize: 768
+    Tracing: Active
+    Environment:
+      Variables:
+        PUBLIC_MAPPINGS_TABLE: !Ref PublicMappingsTable
+        AGENT_CONFIGS_TABLE: !Ref AgentConfigsTable
+        CONVERSATIONS_TABLE: !Ref ConversationsTable
+        KNOWLEDGE_BASES_TABLE: !Ref KnowledgeBasesTable
+        TOOLS_TABLE: !Ref ToolsTable
+        LIVE_AGENTS_TABLE: !Ref LiveAgentsTable
+        TENANTS_TABLE: !Ref TenantsTable
+        TENANT_SLUGS_TABLE: !Ref TenantSlugsTable
+        TENANT_MEMBERS_TABLE: !Ref TenantMembersTable
+        ONBOARDING_REGISTRATIONS_TABLE: !Ref OnboardingRegistrationsTable
+        SEAT_REQUESTS_TABLE: !Ref SeatRequestsTable
+        AUDIT_EVENTS_TABLE: !Ref AuditEventsTable
+        ONBOARDING_OTP_SECRET_ARN: !Ref OnboardingOtpSecret
+        ONBOARDING_EMAIL_FROM: !Ref OnboardingEmailFrom
+        KNOWLEDGE_BUCKET: !Ref KnowledgeDocumentsBucket
+        USER_POOL_ID: !Ref ConsoleUserPool
+        BEDROCK_MODEL_ID: !Ref BedrockModelId
+        KNOWLEDGE_BASE_ID: !Ref KnowledgeBaseId
+        GUARDRAIL_ID: !Ref GuardrailId
+        GUARDRAIL_VERSION: !Ref GuardrailVersion
+        ALLOWED_ORIGIN: !Ref AllowedOrigin
+
+Resources:
+  PublicApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: $default
+      CorsConfiguration:
+        AllowOrigins: [!Ref AllowedOrigin]
+        AllowHeaders: [content-type, authorization]
+        AllowMethods: [GET, POST, PUT, DELETE, OPTIONS]
+        MaxAge: 600
+      Auth:
+        Authorizers:
+          ConsoleJwtAuthorizer:
+            IdentitySource: $request.header.Authorization
+            JwtConfiguration:
+              issuer: !Sub https://cognito-idp.${AWS::Region}.${AWS::URLSuffix}/${ConsoleUserPool}
+              audience: [!Ref ConsoleUserPoolClient]
+
+  PublicAgentFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/src/
+      Handler: handler.lambda_handler
+      Events:
+        PublicProxy:
+          Type: HttpApi
+          Properties: {ApiId: !Ref PublicApi, Path: "/v1/public/{proxy+}", Method: ANY}
+        Health:
+          Type: HttpApi
+          Properties: {ApiId: !Ref PublicApi, Path: /health, Method: GET}
+      Policies:
+        - DynamoDBReadPolicy: {TableName: !Ref PublicMappingsTable}
+        - DynamoDBReadPolicy: {TableName: !Ref AgentConfigsTable}
+        - DynamoDBCrudPolicy: {TableName: !Ref ConversationsTable}
+        - Statement:
+            - {Effect: Allow, Action: [bedrock:InvokeModel, bedrock:InvokeModelWithResponseStream, bedrock:Retrieve, bedrock:ApplyGuardrail], Resource: "*"}
+            - Effect: Allow
+              Action: [secretsmanager:GetSecretValue]
+              Resource: !Sub arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:tenant/*
+            - {Effect: Allow, Action: [bedrock-agentcore:InvokeGateway], Resource: "*"}
+
+  CompanyOnboardingFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/src/
+      Handler: onboarding_handler.lambda_handler
+      Timeout: 30
+      Events:
+        OnboardingProxy:
+          Type: HttpApi
+          Properties: {ApiId: !Ref PublicApi, Path: "/v1/public/onboarding/{proxy+}", Method: ANY}
+      Policies:
+        - DynamoDBCrudPolicy: {TableName: !Ref OnboardingRegistrationsTable}
+        - DynamoDBCrudPolicy: {TableName: !Ref TenantsTable}
+        - DynamoDBCrudPolicy: {TableName: !Ref TenantSlugsTable}
+        - DynamoDBCrudPolicy: {TableName: !Ref TenantMembersTable}
+        - DynamoDBCrudPolicy: {TableName: !Ref LiveAgentsTable}
+        - DynamoDBCrudPolicy: {TableName: !Ref AuditEventsTable}
+        - AWSSecretsManagerGetSecretValuePolicy: {SecretArn: !Ref OnboardingOtpSecret}
+        - Statement:
+            - Effect: Allow
+              Action: [ses:SendEmail]
+              Resource: "*"
+            - Effect: Allow
+              Action: [cognito-idp:AdminCreateUser, cognito-idp:AdminGetUser]
+              Resource: !GetAtt ConsoleUserPool.Arn
+
+  AdminConsoleFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/src/
+      Handler: admin_handler.lambda_handler
+      Events:
+        AdminProxy:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref PublicApi
+            Path: /v1/admin/{proxy+}
+            Method: ANY
+            Auth: {Authorizer: ConsoleJwtAuthorizer}
+      Policies:
+        - DynamoDBCrudPolicy: {TableName: !Ref PublicMappingsTable}
+        - DynamoDBCrudPolicy: {TableName: !Ref AgentConfigsTable}
+        - DynamoDBCrudPolicy: {TableName: !Ref KnowledgeBasesTable}
+        - DynamoDBCrudPolicy: {TableName: !Ref ToolsTable}
+        - DynamoDBCrudPolicy: {TableName: !Ref LiveAgentsTable}
+        - DynamoDBCrudPolicy: {TableName: !Ref ConversationsTable}
+        - DynamoDBCrudPolicy: {TableName: !Ref TenantsTable}
+        - DynamoDBCrudPolicy: {TableName: !Ref TenantMembersTable}
+        - DynamoDBCrudPolicy: {TableName: !Ref SeatRequestsTable}
+        - DynamoDBCrudPolicy: {TableName: !Ref AuditEventsTable}
+        - S3WritePolicy: {BucketName: !Ref KnowledgeDocumentsBucket}
+        - Statement:
+            - {Effect: Allow, Action: [bedrock:StartIngestionJob, bedrock:GetKnowledgeBase, bedrock:ListTagsForResource], Resource: "*"}
+            - Effect: Allow
+              Action: [cognito-idp:AdminCreateUser, cognito-idp:AdminDeleteUser, cognito-idp:AdminDisableUser, cognito-idp:AdminEnableUser]
+              Resource: !GetAtt ConsoleUserPool.Arn
+
+  LiveAgentFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/src/
+      Handler: live_handler.lambda_handler
+      Events:
+        LiveProxy:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref PublicApi
+            Path: /v1/live/{proxy+}
+            Method: ANY
+            Auth: {Authorizer: ConsoleJwtAuthorizer}
+      Policies:
+        - DynamoDBReadPolicy: {TableName: !Ref AgentConfigsTable}
+        - DynamoDBReadPolicy: {TableName: !Ref PublicMappingsTable}
+        - DynamoDBCrudPolicy: {TableName: !Ref LiveAgentsTable}
+        - DynamoDBCrudPolicy: {TableName: !Ref ConversationsTable}
+
+  PublicMappingsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{AttributeName: publicAgentKey, AttributeType: S}]
+      KeySchema: [{AttributeName: publicAgentKey, KeyType: HASH}]
+      SSESpecification: {SSEEnabled: true}
+      PointInTimeRecoverySpecification: {PointInTimeRecoveryEnabled: true}
+
+  AgentConfigsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{AttributeName: tenantId, AttributeType: S}, {AttributeName: agentId, AttributeType: S}]
+      KeySchema: [{AttributeName: tenantId, KeyType: HASH}, {AttributeName: agentId, KeyType: RANGE}]
+      SSESpecification: {SSEEnabled: true}
+      PointInTimeRecoverySpecification: {PointInTimeRecoveryEnabled: true}
+
+  KnowledgeBasesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{AttributeName: tenantId, AttributeType: S}, {AttributeName: kbId, AttributeType: S}]
+      KeySchema: [{AttributeName: tenantId, KeyType: HASH}, {AttributeName: kbId, KeyType: RANGE}]
+      SSESpecification: {SSEEnabled: true}
+      PointInTimeRecoverySpecification: {PointInTimeRecoveryEnabled: true}
+
+  ToolsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{AttributeName: tenantId, AttributeType: S}, {AttributeName: toolId, AttributeType: S}]
+      KeySchema: [{AttributeName: tenantId, KeyType: HASH}, {AttributeName: toolId, KeyType: RANGE}]
+      SSESpecification: {SSEEnabled: true}
+      PointInTimeRecoverySpecification: {PointInTimeRecoveryEnabled: true}
+
+  LiveAgentsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{AttributeName: tenantId, AttributeType: S}, {AttributeName: userId, AttributeType: S}]
+      KeySchema: [{AttributeName: tenantId, KeyType: HASH}, {AttributeName: userId, KeyType: RANGE}]
+      SSESpecification: {SSEEnabled: true}
+      PointInTimeRecoverySpecification: {PointInTimeRecoveryEnabled: true}
+
+  TenantsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{AttributeName: tenantId, AttributeType: S}]
+      KeySchema: [{AttributeName: tenantId, KeyType: HASH}]
+      SSESpecification: {SSEEnabled: true}
+      PointInTimeRecoverySpecification: {PointInTimeRecoveryEnabled: true}
+
+  TenantSlugsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{AttributeName: tenantSlug, AttributeType: S}]
+      KeySchema: [{AttributeName: tenantSlug, KeyType: HASH}]
+      SSESpecification: {SSEEnabled: true}
+      PointInTimeRecoverySpecification: {PointInTimeRecoveryEnabled: true}
+
+  TenantMembersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{AttributeName: tenantId, AttributeType: S}, {AttributeName: userId, AttributeType: S}]
+      KeySchema: [{AttributeName: tenantId, KeyType: HASH}, {AttributeName: userId, KeyType: RANGE}]
+      SSESpecification: {SSEEnabled: true}
+      PointInTimeRecoverySpecification: {PointInTimeRecoveryEnabled: true}
+
+  OnboardingRegistrationsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{AttributeName: registrationId, AttributeType: S}]
+      KeySchema: [{AttributeName: registrationId, KeyType: HASH}]
+      TimeToLiveSpecification: {AttributeName: expiresAt, Enabled: true}
+      SSESpecification: {SSEEnabled: true}
+      PointInTimeRecoverySpecification: {PointInTimeRecoveryEnabled: true}
+
+  SeatRequestsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{AttributeName: tenantId, AttributeType: S}, {AttributeName: requestId, AttributeType: S}]
+      KeySchema: [{AttributeName: tenantId, KeyType: HASH}, {AttributeName: requestId, KeyType: RANGE}]
+      SSESpecification: {SSEEnabled: true}
+      PointInTimeRecoverySpecification: {PointInTimeRecoveryEnabled: true}
+
+  AuditEventsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{AttributeName: tenantId, AttributeType: S}, {AttributeName: eventId, AttributeType: S}]
+      KeySchema: [{AttributeName: tenantId, KeyType: HASH}, {AttributeName: eventId, KeyType: RANGE}]
+      SSESpecification: {SSEEnabled: true}
+      PointInTimeRecoverySpecification: {PointInTimeRecoveryEnabled: true}
+
+  OnboardingOtpSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: HMAC key for short-lived company verification codes
+      GenerateSecretString:
+        PasswordLength: 64
+        ExcludePunctuation: true
+
+  ConversationsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: sessionId, AttributeType: S}
+        - {AttributeName: itemKey, AttributeType: S}
+        - {AttributeName: tenantStatus, AttributeType: S}
+        - {AttributeName: updatedAt, AttributeType: N}
+      KeySchema: [{AttributeName: sessionId, KeyType: HASH}, {AttributeName: itemKey, KeyType: RANGE}]
+      GlobalSecondaryIndexes:
+        - IndexName: TenantStatusIndex
+          KeySchema: [{AttributeName: tenantStatus, KeyType: HASH}, {AttributeName: updatedAt, KeyType: RANGE}]
+          Projection: {ProjectionType: ALL}
+      TimeToLiveSpecification: {AttributeName: expiresAt, Enabled: true}
+      SSESpecification: {SSEEnabled: true}
+      PointInTimeRecoverySpecification: {PointInTimeRecoveryEnabled: true}
+
+  KnowledgeDocumentsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration: {BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: aws:kms}
+            BucketKeyEnabled: true
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ["*"]
+            AllowedMethods: [PUT]
+            AllowedOrigins: [!Ref AllowedOrigin]
+            MaxAge: 900
+
+  ConsoleUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub ${AWS::StackName}-console-users
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      MfaConfiguration: OPTIONAL
+      EnabledMfas: [SOFTWARE_TOKEN_MFA]
+      AdminCreateUserConfig: {AllowAdminCreateUserOnly: true}
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          TemporaryPasswordValidityDays: 7
+      AccountRecoverySetting:
+        RecoveryMechanisms: [{Name: verified_email, Priority: 1}]
+      Schema:
+        - {Name: name, AttributeDataType: String, Mutable: true, Required: true}
+        - Name: tenant_id
+          AttributeDataType: String
+          Mutable: false
+          StringAttributeConstraints: {MinLength: "2", MaxLength: "80"}
+        - Name: role
+          AttributeDataType: String
+          Mutable: false
+          StringAttributeConstraints: {MinLength: "2", MaxLength: "40"}
+
+  WebBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration: {BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+
+  WebOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub ${AWS::StackName}-web-oac
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  WebDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        HttpVersion: http2and3
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: web-s3
+            DomainName: !GetAtt WebBucket.RegionalDomainName
+            OriginAccessControlId: !Ref WebOriginAccessControl
+            S3OriginConfig: {}
+        DefaultCacheBehavior:
+          TargetOriginId: web-s3
+          ViewerProtocolPolicy: redirect-to-https
+          Compress: true
+          AllowedMethods: [GET, HEAD, OPTIONS]
+          CachedMethods: [GET, HEAD, OPTIONS]
+          ForwardedValues: {QueryString: true, Cookies: {Forward: none}}
+        CustomErrorResponses:
+          - {ErrorCode: 403, ResponseCode: 200, ResponsePagePath: /index.html, ErrorCachingMinTTL: 0}
+
+  WebBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WebBucket
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: {Service: cloudfront.amazonaws.com}
+            Action: s3:GetObject
+            Resource: !Sub ${WebBucket.Arn}/*
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${WebDistribution}
+
+  ConsoleUserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties: {Domain: !Ref CognitoDomainPrefix, UserPoolId: !Ref ConsoleUserPool}
+
+  ConsoleUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    DependsOn: WebDistribution
+    Properties:
+      ClientName: web-consoles
+      UserPoolId: !Ref ConsoleUserPool
+      GenerateSecret: false
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows: [code]
+      AllowedOAuthScopes: [openid, email, profile]
+      SupportedIdentityProviders: [COGNITO]
+      CallbackURLs:
+        - !Sub https://${WebDistribution.DomainName}/admin.html
+        - !Sub https://${WebDistribution.DomainName}/agent-console.html
+        - http://localhost:8080/admin.html
+        - http://localhost:8080/agent-console.html
+      LogoutURLs:
+        - !Sub https://${WebDistribution.DomainName}/admin.html
+        - !Sub https://${WebDistribution.DomainName}/agent-console.html
+        - http://localhost:8080/admin.html
+        - http://localhost:8080/agent-console.html
+      PreventUserExistenceErrors: ENABLED
+
+Outputs:
+  ApiUrl: {Value: !Sub "https://${PublicApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}"}
+  PublicMappingsTable: {Value: !Ref PublicMappingsTable}
+  AgentConfigsTable: {Value: !Ref AgentConfigsTable}
+  ConversationsTable: {Value: !Ref ConversationsTable}
+  KnowledgeBasesTable: {Value: !Ref KnowledgeBasesTable}
+  ToolsTable: {Value: !Ref ToolsTable}
+  LiveAgentsTable: {Value: !Ref LiveAgentsTable}
+  KnowledgeDocumentsBucket: {Value: !Ref KnowledgeDocumentsBucket}
+  ConsoleUserPoolId: {Value: !Ref ConsoleUserPool}
+  ConsoleUserPoolClientId: {Value: !Ref ConsoleUserPoolClient}
+  CognitoLoginDomain: {Value: !Sub "https://${CognitoDomainPrefix}.auth.${AWS::Region}.amazoncognito.com"}
+  WebBucket: {Value: !Ref WebBucket}
+  DistributionId: {Value: !Ref WebDistribution}
+  LandingPageUrl: {Value: !Sub "https://${WebDistribution.DomainName}/"}
+  CompanyRegistrationUrl: {Value: !Sub "https://${WebDistribution.DomainName}/register.html"}
+  CustomerChatUrl: {Value: !Sub "https://${WebDistribution.DomainName}/chat.html?agent=demo-support"}
+  AdminConsoleUrl: {Value: !Sub "https://${WebDistribution.DomainName}/admin.html"}
+  LiveAgentConsoleUrl: {Value: !Sub "https://${WebDistribution.DomainName}/agent-console.html"}
+  TenantsTable: {Value: !Ref TenantsTable}
+  TenantMembersTable: {Value: !Ref TenantMembersTable}
+  SeatRequestsTable: {Value: !Ref SeatRequestsTable}

@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#081a34"><title>Company Admin Console</title>
+  <link rel="icon" href="./favicon.svg"><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@600;700;800&display=swap" rel="stylesheet"><link rel="stylesheet" href="./console.css">
+</head>
+<body>
+  <section class="login-gate" id="loginGate"><div class="login-card"><div class="login-logo">AI</div><h1>Company Admin Console</h1><p>Sign in to manage your customer agents, knowledge, tools, and support team.</p><button class="primary-btn full" id="loginButton">Sign in securely</button></div></section>
+  <div class="console-shell hidden" id="adminApp">
+    <aside class="sidebar">
+      <div class="console-brand"><div class="mark">AI</div><div><strong>Agent Platform</strong><span>Company workspace</span></div></div>
+      <p class="nav-label">OVERVIEW</p><button class="nav-btn active" data-view="dashboard"><span class="nav-icon">▦</span>Dashboard</button>
+      <p class="nav-label">BUILD</p><button class="nav-btn" data-view="agents"><span class="nav-icon">◉</span>AI Agents</button><button class="nav-btn" data-view="knowledge"><span class="nav-icon">◇</span>Knowledge Bases</button><button class="nav-btn" data-view="tools"><span class="nav-icon">⌘</span>Tools & Forms</button>
+      <p class="nav-label">OPERATIONS</p><button class="nav-btn" data-view="liveAgents"><span class="nav-icon">♙</span>Live Agents</button><button class="nav-btn" data-view="chats"><span class="nav-icon">◌</span>Chat Monitor</button>
+      <p class="nav-label">WORKSPACE</p><button class="nav-btn" data-view="team"><span class="nav-icon">♧</span>Team & Seats</button>
+      <div class="sidebar-footer"><a class="nav-btn" href="./agent-console.html"><span class="nav-icon">↗</span>Open Agent Console</a></div>
+    </aside>
+    <main class="main-area">
+      <header class="topbar"><div class="topbar-title" id="currentSection">Dashboard</div><div class="profile"><div class="profile-avatar" id="profileAvatar">TA</div><div><strong id="profileName">Test Admin</strong><span>Company Admin</span></div><button class="link-btn" id="logoutButton">Sign out</button></div></header>
+      <div class="content">
+        <section class="view active" id="view-dashboard"><div class="page-heading"><div><h1>Dashboard overview</h1><p>Agent operations and customer support activity.</p></div><button class="secondary-btn" data-refresh>Refresh</button></div><div class="metric-grid" id="metrics"></div><div class="panel"><div class="panel-head"><h2>Platform readiness</h2><span class="status-line"><i class="dot"></i>Services operational</span></div><div id="readiness"></div></div></section>
+        <section class="view" id="view-agents"><div class="page-heading"><div><h1>AI agents</h1><p>Configure behavior, knowledge, specialist routing, and published chat URLs.</p></div><button class="primary-btn" data-open="agent">+ Create agent</button></div><div class="panel"><div id="agentsTable"></div></div></section>
+        <section class="view" id="view-knowledge"><div class="page-heading"><div><h1>Knowledge bases</h1><p>Register tenant-isolated Bedrock knowledge bases and manage source files.</p></div><button class="primary-btn" data-open="knowledge">+ Add knowledge base</button></div><div class="card-grid" id="knowledgeGrid"></div></section>
+        <section class="view" id="view-tools"><div class="page-heading"><div><h1>Tools & forms</h1><p>Connect approved APIs, AgentCore Gateway MCP tools, and customer forms.</p></div><button class="primary-btn" data-open="tool">+ Create tool</button></div><div class="card-grid" id="toolsGrid"></div></section>
+        <section class="view" id="view-liveAgents"><div class="page-heading"><div><h1>Live agents</h1><p>Create human support accounts and monitor availability.</p></div><button class="primary-btn" data-open="liveAgent">+ Invite live agent</button></div><div class="panel"><div id="liveAgentsTable"></div></div></section>
+        <section class="view" id="view-chats"><div class="page-heading"><div><h1>Chat monitor</h1><p>Review waiting, active, and recently closed human-assistance sessions.</p></div><button class="secondary-btn" data-refresh>Refresh</button></div><div class="panel"><div id="chatsTable"></div></div></section>
+        <section class="view" id="view-team"><div class="page-heading"><div><h1>Team & seats</h1><p>Role-based access stays inside this company workspace.</p></div><div class="heading-actions"><button class="secondary-btn" data-open="seatRequest">Request seats</button><button class="primary-btn" data-open="member">+ Invite member</button></div></div><div class="seat-grid" id="seatGrid"></div><div class="panel"><div class="panel-head"><h2>Workspace members</h2><span class="status-line"><i class="dot"></i>Tenant scoped</span></div><div id="teamTable"></div></div><div class="panel"><div class="panel-head"><h2>Seat requests</h2></div><div id="seatRequestsTable"></div></div></section>
+      </div>
+    </main>
+  </div>
+  <div class="modal-backdrop hidden" id="modalBackdrop"><div class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle"><div class="modal-head"><h2 id="modalTitle">Create</h2><button class="close-btn" data-close aria-label="Close">×</button></div><form id="modalForm"><div class="modal-body" id="modalBody"></div><div class="modal-foot"><button type="button" class="secondary-btn" data-close>Cancel</button><button type="submit" class="primary-btn" id="modalSubmit">Save</button></div></form></div></div>
+  <div class="toast hidden" id="toast"></div>
+  <script src="./config.js"></script><script src="./auth.js"></script><script src="./admin.js"></script>
+</body></html>
