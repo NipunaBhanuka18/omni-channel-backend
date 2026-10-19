@@ -10,7 +10,8 @@ import { uploadKbDocument } from "./agents/utils/s3-client";
 import { inMemoryTenants, inMemoryAgents, provisionTenantResources } from "./scripts/create-tenants-table";
 import { TenantContext } from "./shared/types/tenant-context";
 import { docClient } from "./agents/utils/dynamo-client";
-import { ScanCommand } from "@aws-sdk/lib-dynamodb";
+import { ScanCommand, GetCommand, UpdateCommand } from "@aws-sdk/lib-dynamodb";
+import { randomUUID } from "crypto";
 
 // Enable mock authorization for local development environment
 if (process.env.NODE_ENV !== "production") {
@@ -481,6 +482,88 @@ app.get("/api/dev/live/queue", async (req, res) => {
     return res.json({ assigned, waiting: [], demoOnly: true });
   } catch (error: any) {
     return res.status(503).json({ error: "Local handoff queue unavailable", detail: error.message });
+  }
+});
+
+// TEMPORARY LOCAL MESSAGE API — NOT SUITABLE FOR PRODUCTION.
+// The agent ID is fixed for the SLT demo and there is no Cognito identity here.
+// Keep these endpoints loopback-only until proper customer/agent authorization exists.
+function allowLocalMessageRequest(req: express.Request): boolean {
+  const remote = req.socket.remoteAddress || "";
+  const loopback = ["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(remote);
+  const origins = ["http://localhost:8080", "http://127.0.0.1:8080"];
+  return process.env.NODE_ENV !== "production" && loopback &&
+    (!req.headers.origin || origins.includes(req.headers.origin)) &&
+    req.query.tenantId === "slt" && req.query.agentId === "local-agent-01";
+}
+
+const LOCAL_SESSION_TABLE = "omni-channel-chat-sessions";
+const LOCAL_MAX_MESSAGES = 100; // Demo limit: each session is one DynamoDB item.
+
+app.get("/api/dev/live/conversations/:sessionId/messages", async (req, res) => {
+  if (!allowLocalMessageRequest(req)) return res.status(404).json({ error: "Not found" });
+  const sessionId = req.params.sessionId;
+  if (!/^[a-zA-Z0-9_-]{1,128}$/.test(sessionId)) {
+    return res.status(400).json({ error: "Invalid sessionId" });
+  }
+  try {
+    const result = await docClient.send(new GetCommand({
+      TableName: LOCAL_SESSION_TABLE, Key: { sessionId },
+    }));
+    const session = result.Item;
+    if (!session || session.tenantId !== "slt" || session.assignedAgentId !== "local-agent-01") {
+      return res.status(404).json({ error: "Conversation not found" });
+    }
+    if (session.status !== "HUMAN_ACTIVE" && session.status !== "RESOLVED") {
+      return res.status(409).json({ error: "Conversation is not active" });
+    }
+    return res.json({
+      session: { sessionId, status: session.status },
+      messages: session.messages || [], demoOnly: true,
+    });
+  } catch (error: any) {
+    console.error("[LocalMessages] Read error:", error);
+    return res.status(503).json({ error: "Message store unavailable" });
+  }
+});
+
+app.post("/api/dev/live/conversations/:sessionId/messages", async (req, res) => {
+  if (!allowLocalMessageRequest(req)) return res.status(404).json({ error: "Not found" });
+  const sessionId = req.params.sessionId;
+  if (!/^[a-zA-Z0-9_-]{1,128}$/.test(sessionId)) {
+    return res.status(400).json({ error: "Invalid sessionId" });
+  }
+  const role = req.body?.role;
+  const message = req.body?.message;
+  if ((role !== "user" && role !== "live_agent") ||
+      typeof message !== "string" || !message.trim() || message.length > 1600) {
+    return res.status(400).json({ error: "Role must be user or live_agent, and message must contain 1–1600 characters" });
+  }
+  const chatMessage = {
+    messageId: randomUUID(), role, text: message.trim(), createdAt: new Date().toISOString(),
+  };
+  try {
+    // Conditional append: do not create a missing session, cross tenants/agents,
+    // reopen a resolved session, or exceed the demo per-session message cap.
+    await docClient.send(new UpdateCommand({
+      TableName: LOCAL_SESSION_TABLE,
+      Key: { sessionId },
+      UpdateExpression: "SET #msgs = list_append(if_not_exists(#msgs, :empty), :new), updatedAt = :now",
+      ConditionExpression: "attribute_exists(sessionId) AND tenantId = :tenant AND assignedAgentId = :agent AND #st = :active AND (attribute_not_exists(#msgs) OR size(#msgs) < :limit)",
+      ExpressionAttributeNames: { "#msgs": "messages", "#st": "status" },
+      ExpressionAttributeValues: {
+        ":empty": [], ":new": [chatMessage], ":now": chatMessage.createdAt,
+        ":tenant": "slt", ":agent": "local-agent-01", ":active": "HUMAN_ACTIVE",
+        ":limit": LOCAL_MAX_MESSAGES,
+      },
+    }));
+    return res.status(201).json({ ...chatMessage, demoOnly: true });
+  } catch (error: any) {
+    if (error?.name === "ConditionalCheckFailedException") {
+      return res.status(409).json({ error: "Session is not active, assigned to this agent, or has reached the demo message limit" });
+    }
+    console.error("[LocalMessages] Write error:", error);
+    return res.status(503).json({ error: "Message store unavailable" });
   }
 });
 
