@@ -11,7 +11,7 @@
   // Chat messages stay in demo mode until the public message API is implemented.
   const demoMode = !apiBase || localBackendMode;
 
-  const state = { sessionId: null, conversationId: null, tenantId: null, agent: null, sending: false, humanMode: false, pollTimer: null, seenMessageIds: new Set() };
+  const state = { sessionId: null, conversationId: null, tenantId: null, agent: null, sending: false, humanMode: false, pollTimer: null, handoffRequested: false, seenMessageIds: new Set() };
   const el = {
     messages: document.getElementById("messages"), suggestions: document.getElementById("suggestions"),
     composer: document.getElementById("composer"), input: document.getElementById("messageInput"),
@@ -161,6 +161,43 @@
     return "The backend processed your request, but its response is not yet supported by this chat UI.";
   }
 
+  // Only the handoff request is integrated at this stage. The live-agent UI does
+  // not yet share an inbox or message transport with the TypeScript backend.
+  function wantsHumanAgent(text) {
+    return /\b(human|person|representative|someone|handoff|live[\s-]*agent)\b/i.test(text)
+      || /\b(?:talk|speak|connect|transfer)\s+(?:me\s+)?(?:to|with)\s+(?:(?:a|an)\s+)?agent\b/i.test(text);
+  }
+
+  async function requestLocalHandoff(text) {
+    if (state.handoffRequested) {
+      return {
+        messageId: makeId(),
+        message: "A human-support request has already been recorded for this local chat. Two-way messaging is not connected yet. Restart the chat to test another request.",
+        status: "completed"
+      };
+    }
+
+    const result = await api("/api/chat/handoff/request", {
+      method: "POST",
+      body: JSON.stringify({
+        tenantId: state.tenantId,
+        sessionId: state.sessionId,
+        reason: text,
+        customerInfo: { name: "Local Test Customer" }
+      })
+    });
+    // server.ts flattens the handoff result into { success, assigned, status, agentId, sessionId }.
+    if (!result.success || result.sessionId !== state.sessionId ||
+        !["HUMAN_ACTIVE", "MISSED_HANDOFF"].includes(result.status)) {
+      throw new Error(result.error?.message || "Could not confirm the handoff request.");
+    }
+    state.handoffRequested = true;
+    const message = result.status === "HUMAN_ACTIVE" && result.assigned
+      ? `Local handoff request assigned to agent ${result.agentId || "(unknown)"}. The live-agent console and two-way human messaging are NOT connected yet, so this is only a backend assignment test.`
+      : "No live agent was available. A missed handoff was recorded in the local backend. Customer follow-up notifications are not configured yet.";
+    return { messageId: makeId(), message, status: "completed" };
+  }
+
   async function localBackendReply(text, formSubmission) {
     if (location.hostname !== "localhost" && location.hostname !== "127.0.0.1") {
       throw new Error("Local testing is only allowed when the frontend runs on localhost.");
@@ -170,11 +207,13 @@
       throw new Error("Local testing requires a localhost backend. Do not use mock credentials on a public server.");
     }
 
+    // A request for a person takes precedence over billing or support keywords.
+    if (!formSubmission && wantsHumanAgent(text)) return requestLocalHandoff(text);
+
     const intent = formSubmission ? null : localIntent(text);
     if (!intent) {
       let message;
       if (formSubmission) message = "Demo form only: your details were not sent to a backend or saved.";
-      else if (/\b(human|person|agent|handoff)\b/i.test(text)) message = "Live-agent handoff is not connected to this chatbot yet; no human support request was queued.";
       else message = `${demoReply(text).message} (Demo response only — not sent to the backend.)`;
       return { messageId: makeId(), message, status: "completed" };
     }
@@ -268,7 +307,7 @@
       if (localBackendMode) state.conversationId = `conv-${makeId()}`;
       addBotMessage({ message: agent.welcomeMessage, messageId: "welcome", status: "completed" });
       if (localBackendMode) {
-        addNotice("handoff-note", "Local development: billing, usage, and router questions now call the TypeScript backend. Other responses are demo-only.");
+        addNotice("handoff-note", "Local development: specialist replies and human handoff requests call the TypeScript backend. Human messaging is NOT connected; other chat replies are demo-only.");
       }
     } catch (error) {
       applyAgent(demoAgent); addNotice("error-note", error.message || "This assistant could not be loaded."); el.agentStatus.textContent = "Temporarily unavailable";
@@ -279,7 +318,7 @@
   el.input.addEventListener("input", resizeInput);
   el.input.addEventListener("keydown", event => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); el.composer.requestSubmit(); } });
   el.restart.addEventListener("click", () => {
-    clearInterval(state.pollTimer); state.pollTimer = null; state.humanMode = false; state.seenMessageIds.clear(); state.sessionId = null; state.conversationId = null; state.tenantId = null;
+    clearInterval(state.pollTimer); state.pollTimer = null; state.humanMode = false; state.seenMessageIds.clear(); state.sessionId = null; state.conversationId = null; state.tenantId = null; state.handoffRequested = false;
     [...el.messages.querySelectorAll(".message-row,.handoff-note,.error-note")].forEach(x => x.remove()); initialize();
   });
   initialize();
