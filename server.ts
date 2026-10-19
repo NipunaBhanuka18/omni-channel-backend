@@ -9,6 +9,8 @@ import { registerTenant, handleRegisterTenantRequest } from "./services/onboardi
 import { uploadKbDocument } from "./agents/utils/s3-client";
 import { inMemoryTenants, inMemoryAgents, provisionTenantResources } from "./scripts/create-tenants-table";
 import { TenantContext } from "./shared/types/tenant-context";
+import { docClient } from "./agents/utils/dynamo-client";
+import { ScanCommand } from "@aws-sdk/lib-dynamodb";
 
 // Enable mock authorization for local development environment
 if (process.env.NODE_ENV !== "production") {
@@ -429,6 +431,58 @@ app.post(["/api/chat/handoff/resolve", "/chat/handoff/resolve"], async (req, res
   return res.status(200).json({ success: true, ...result.data });
 });
 
+
+// Local-development-only queue preview for the unified MVP live-agent console.
+// This route is NOT production authentication. Replace it with Cognito-based
+// agent identity and tenant-scoped authorization before deployment.
+app.get("/api/dev/live/queue", async (req, res) => {
+  const remote = req.socket.remoteAddress || "";
+  const loopback = ["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(remote);
+  const allowedOrigins = ["http://localhost:8080", "http://127.0.0.1:8080"];
+  if (process.env.NODE_ENV === "production" || !loopback ||
+      (req.headers.origin && !allowedOrigins.includes(req.headers.origin))) {
+    return res.status(404).json({ error: "Not found" });
+  }
+
+  const tenantId = String(req.query.tenantId || "");
+  const agentId = String(req.query.agentId || "");
+  if (tenantId !== "slt" || agentId !== "local-agent-01") {
+    return res.status(400).json({ error: "Only the local SLT test agent is supported" });
+  }
+
+  try {
+    const sessions: Array<Record<string, any>> = [];
+    let lastKey: Record<string, any> | undefined;
+    do {
+      const result = await docClient.send(new ScanCommand({
+        TableName: "omni-channel-chat-sessions",
+        FilterExpression: "tenantId = :tenant AND assignedAgentId = :agent AND #status = :active",
+        ExpressionAttributeNames: { "#status": "status" },
+        ExpressionAttributeValues: {
+          ":tenant": tenantId,
+          ":agent": agentId,
+          ":active": "HUMAN_ACTIVE",
+        },
+        ExclusiveStartKey: lastKey,
+      }));
+      sessions.push(...((result.Items || []) as Array<Record<string, any>>));
+      lastKey = result.LastEvaluatedKey;
+    } while (lastKey);
+
+    const assigned = sessions.sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)))
+      .map((session) => ({
+        sessionId: session.sessionId,
+        publicAgentKey: session.customerName || "Customer",
+        status: session.status,
+        assignedAgentId: session.assignedAgentId,
+        updatedAt: Math.floor(Date.parse(session.updatedAt || session.createdAt) / 1000) ||
+          Math.floor(Date.now() / 1000),
+      }));
+    return res.json({ assigned, waiting: [], demoOnly: true });
+  } catch (error: any) {
+    return res.status(503).json({ error: "Local handoff queue unavailable", detail: error.message });
+  }
+});
 
 // ==========================================
 // 5. WORKSPACE PORTAL & KB DOCUMENT UPLOAD
