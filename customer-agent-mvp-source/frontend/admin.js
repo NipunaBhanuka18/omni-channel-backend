@@ -53,6 +53,21 @@
           return {items:[],dataUnavailable:true};
         }
       }
+      if(path==="/v1/admin/knowledge-bases"){
+        try {
+          const response=await fetch(apiBase+"/api/dev/admin/knowledge-files?tenantId=slt");
+          if(!response.ok)throw new Error(`HTTP ${response.status}`);
+          const body=await response.json();
+          if(body.source!=="localstack-s3"||body.tenantId!=="slt"||!Array.isArray(body.items)){
+            throw new Error("Unexpected local S3 document inventory response");
+          }
+          return {items:body.items,bucket:body.bucket,bucketStatus:body.bucketStatus,
+            truncated:!!body.truncated,total:body.totalShown};
+        }catch(error){
+          console.warn("Local S3 document inventory unavailable:",error);
+          return {items:[],dataUnavailable:true};
+        }
+      }
       if(path==="/v1/admin/chats"){
         try {
           const response=await fetch(apiBase+"/api/dev/admin/chats?tenantId=slt");
@@ -96,7 +111,7 @@
   function aId(a){return `/agents/${a.agentId}/`}
   async function loadAll(){
     const [dashboard,agents,knowledge,tools,liveAgents,chats,team]=await Promise.all([request("/v1/admin/dashboard"),request("/v1/admin/agents"),request("/v1/admin/knowledge-bases"),request("/v1/admin/tools"),request("/v1/admin/live-agents"),request("/v1/admin/chats"),request("/v1/admin/team")]);
-    Object.assign(state,{dashboard,agents:agents.items||[],agentRecordsUnavailable:!!agents.dataUnavailable,knowledge:knowledge.items||[],tools:tools.items||[],liveAgents:liveAgents.items||[],chats:chats.items||[],chatMonitorUnavailable:!!chats.dataUnavailable,chatTotal:chats.total,team:team.items||[],workspace:team.workspace||{},seatRequests:team.seatRequests||[]});renderAll();
+    Object.assign(state,{dashboard,agents:agents.items||[],agentRecordsUnavailable:!!agents.dataUnavailable,knowledge:knowledge.items||[],knowledgeUnavailable:!!knowledge.dataUnavailable,kbBucketStatus:knowledge.bucketStatus,kbBucket:knowledge.bucket,kbTruncated:!!knowledge.truncated,tools:tools.items||[],liveAgents:liveAgents.items||[],chats:chats.items||[],chatMonitorUnavailable:!!chats.dataUnavailable,chatTotal:chats.total,team:team.items||[],workspace:team.workspace||{},seatRequests:team.seatRequests||[]});renderAll();
   }
   function renderAll(){renderDashboard();renderAgents();renderKnowledge();renderTools();renderLiveAgents();renderChats();renderTeam();if(localAdminPreview)disablePreviewWrites()}
   function disablePreviewWrites(){
@@ -116,8 +131,10 @@
     const banner=document.createElement("div");
     banner.setAttribute("role","status");
     banner.style.cssText="margin:18px 22px 0;padding:14px 18px;background:#fff4d8;color:#65420b;border:1px solid #f3dca6;border-radius:12px;line-height:1.5";
-    banner.textContent="LOCAL READ-ONLY PREVIEW — Dashboard counters are read from SLT records in LocalStack when available. AI Agents and Chat Monitor read SLT records from LocalStack. Other pages (knowledge, tools, team) still show SAMPLE DATA. No Cognito login or admin writes are enabled.";
+    banner.textContent="LOCAL READ-ONLY PREVIEW — Dashboard, AI Agents and Chat Monitor read SLT records from LocalStack. Knowledge Bases shows SLT S3 SOURCE FILES only (not Bedrock indexing). Tools and team still show SAMPLE DATA. No Cognito login or admin writes are enabled.";
     document.querySelector("#adminApp .content").before(banner);
+    $("#view-knowledge .page-heading h1").textContent="Knowledge source files (S3)";
+    $("#view-knowledge .page-heading p").textContent="SLT source files stored in LocalStack S3. Bedrock knowledge-base registration and indexing are not tracked.";
     const operational=document.querySelector("#view-dashboard .status-line");
     if(operational)operational.textContent="LocalStack (SLT test tenant; no authentication)";
     await loadAll();
@@ -153,7 +170,27 @@
       return;
     }
     $("#agentsTable").innerHTML=table(["Agent","Public URL","Model","Status","Actions"],state.agents.map(a=>`<tr><td><strong>${esc(a.displayName)}</strong><br><small>${esc(a.agentId)}</small></td><td>/chat.html?agent=${esc(a.publicAgentKey)}</td><td>${esc(a.modelId||"Default")}</td><td><span class="status-pill ${String(a.status).toLowerCase()}">${esc(a.status)}</span></td><td><div class="row-actions"><button class="small-btn" data-edit-agent="${esc(a.agentId)}">Edit</button>${a.status!=="PUBLISHED"?`<button class="small-btn" data-publish="${esc(a.agentId)}">Publish</button>`:""}<button class="small-btn" data-delete-agent="${esc(a.agentId)}">Delete</button></div></td></tr>`),"No AI agents yet")}
-  function renderKnowledge(){$("#knowledgeGrid").innerHTML=state.knowledge.length?state.knowledge.map(k=>`<article class="resource-card"><div class="resource-card-top"><h3>${esc(k.name)}</h3><span class="status-pill ready">${esc(k.status||"READY")}</span></div><p>${esc(k.description||"No description")}</p><div class="resource-meta"><span class="type-pill">Bedrock KB</span><span class="type-pill">${esc(k.kbId)}</span></div><div class="resource-actions"><button class="small-btn" data-upload="${esc(k.kbId)}">Upload files</button><button class="small-btn" data-sync="${esc(k.kbId)}">Sync</button><button class="small-btn" data-delete-kb="${esc(k.kbId)}">Delete</button></div></article>`).join(""):`<div class="empty-state"><strong>No knowledge bases</strong>Add a Bedrock knowledge base for tenant-specific answers.</div>`}
+  function renderKnowledge(){
+    if(localAdminPreview){
+      if(state.knowledgeUnavailable){
+        $("#knowledgeGrid").innerHTML='<div class="empty-state"><strong>Local S3 files unavailable</strong>Check LocalStack S3, then refresh. No sample knowledge bases are shown.</div>';
+        return;
+      }
+      if(state.kbBucketStatus==="missing"){
+        $("#knowledgeGrid").innerHTML='<div class="empty-state"><strong>Local S3 bucket not created</strong>Run: npx tsx scripts/create-kb-bucket.ts. This does not configure a Bedrock Knowledge Base.</div>';
+        return;
+      }
+      const cards=state.knowledge.map(k=>{
+        const size=Number.isFinite(k.bytes)?`${k.bytes} bytes`:"Size unknown";
+        const modified=k.lastModified?new Date(k.lastModified).toLocaleString():"Unknown date";
+        return `<article class="resource-card"><div class="resource-card-top"><h3>${esc(k.name)}</h3><span class="type-pill">S3 source file</span></div><p>Stored under the SLT tenant prefix. Bedrock indexing is not tracked.</p><div class="resource-meta"><span class="type-pill">${esc(size)}</span><span class="type-pill">${esc(modified)}</span></div><p><small>${esc(k.key)}</small></p></article>`;
+      });
+      if(state.kbTruncated)cards.unshift('<div class="empty-state"><strong>Partial listing</strong>Only the first 100 objects are displayed.</div>');
+      $("#knowledgeGrid").innerHTML=cards.join("")||'<div class="empty-state"><strong>No SLT S3 source files</strong>No files were found under tenants/slt/. A stored file alone would not confirm Bedrock ingestion.</div>';
+      return;
+    }
+    $("#knowledgeGrid").innerHTML=state.knowledge.length?state.knowledge.map(k=>`<article class="resource-card"><div class="resource-card-top"><h3>${esc(k.name)}</h3><span class="status-pill ready">${esc(k.status||"READY")}</span></div><p>${esc(k.description||"No description")}</p><div class="resource-meta"><span class="type-pill">Bedrock KB</span><span class="type-pill">${esc(k.kbId)}</span></div><div class="resource-actions"><button class="small-btn" data-upload="${esc(k.kbId)}">Upload files</button><button class="small-btn" data-sync="${esc(k.kbId)}">Sync</button><button class="small-btn" data-delete-kb="${esc(k.kbId)}">Delete</button></div></article>`).join(""):`<div class="empty-state"><strong>No knowledge bases</strong>Add a Bedrock knowledge base for tenant-specific answers.</div>`;
+  }
   function renderTools(){$("#toolsGrid").innerHTML=state.tools.length?state.tools.map(t=>`<article class="resource-card"><div class="resource-card-top"><h3>${esc(t.displayName||t.name)}</h3><span class="type-pill">${esc(String(t.type).toUpperCase())}</span></div><p>${esc(t.description||"No description")}</p><div class="resource-meta"><span class="status-pill ${t.enabled?'ready':'offline'}">${t.enabled?'Enabled':'Disabled'}</span><span class="type-pill">${esc(t.name)}</span></div><div class="resource-actions"><button class="small-btn" data-edit-tool="${esc(t.toolId)}">Edit</button><button class="small-btn" data-delete-tool="${esc(t.toolId)}">Delete</button></div></article>`).join(""):`<div class="empty-state"><strong>No tools or forms</strong>Create an API, MCP, or customer form tool.</div>`}
   function renderLiveAgents(){$("#liveAgentsTable").innerHTML=table(["Agent","Email","Presence","Account"],state.liveAgents.map(a=>`<tr><td><strong>${esc(a.name)}</strong></td><td>${esc(a.email)}</td><td><span class="status-pill ${String(a.presence).toLowerCase()}">${esc(a.presence)}</span></td><td>${esc(a.status)}</td></tr>`),"No live agents yet")}
   function renderChats(){

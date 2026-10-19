@@ -68,15 +68,14 @@ export const fetchKbDocument = async (
     }
     return Buffer.concat(chunks).toString("utf-8");
   } catch (error) {
-    // Local testing fallback if LocalStack S3 bucket object is not seeded
-    console.warn(`[S3 Client Warning] S3 fetch skipped/offline for '${isolatedKey}'. Using mock KB document.`);
-    
-    return `
-Issue: Slow Internet Connection
-Resolution: Restart your router by unplugging the power cable for 30 seconds.
-Issue: Router Power LED OFF
-Resolution: Check if the power adapter is firmly plugged in.
-    `.trim();
+    console.error(
+      `[S3 Client Error] Failed to fetch '${isolatedKey}' from bucket '${KB_BUCKET_NAME}':`,
+      error
+    );
+
+    throw new Error(
+      `Knowledge Base document unavailable for tenant '${context.tenantId}'.`
+    );
   }
 };
 

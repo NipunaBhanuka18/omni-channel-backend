@@ -26,14 +26,14 @@ export const handler = async (
   // Search the knowledge base based on the user's params with Tenant Context
   try {
     const userQuery = params.query || "slow internet";
-    
+
     // Pass userQuery and authenticated context into isolated KB retriever
     const searchResult = await searchKnowledgeBase(userQuery, context);
 
     return {
       success: true,
       data: {
-        source: "Vector Index (Mocked)",
+        source: "Tenant S3 Knowledge Document",
         query: userQuery,
         result: searchResult,
       },

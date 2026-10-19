@@ -1,6 +1,7 @@
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 
 const s3Client = new S3Client({
+
   region: "us-east-1",
   endpoint: "http://127.0.0.1:4566",
   forcePathStyle: true,
@@ -8,6 +9,7 @@ const s3Client = new S3Client({
     accessKeyId: "mock_access_key",
     secretAccessKey: "mock_secret_key",
   },
+  requestChecksumCalculation: "WHEN_REQUIRED",
 });
 
 const mockDocumentContent = `
@@ -26,11 +28,14 @@ Issue: Slow Internet Speed
 
 async function uploadDoc() {
   try {
+    const documentBody = Buffer.from(mockDocumentContent, "utf8");
+
     const command = new PutObjectCommand({
       Bucket: "omni-channel-kb-docs",
-      Key: "router-troubleshooting-guide.txt",
-      Body: mockDocumentContent,
-      ContentType: "text/plain",
+      Key: "tenants/slt/router-troubleshooting-guide.txt",
+      Body: documentBody,
+      ContentLength: documentBody.length,
+      ContentType: "text/plain; charset=utf-8",
     });
     await s3Client.send(command);
     console.log("✅ Knowledge Base document uploaded successfully!");

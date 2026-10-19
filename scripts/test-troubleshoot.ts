@@ -3,7 +3,7 @@ import { TenantContext } from "../shared/types/tenant-context";
 import { PERMISSIONS } from "../shared/constants/permissions";
 
 const mockContext: TenantContext = {
-  tenantId: "tenant-001",
+  tenantId: "slt",
   userId: "user-123",
   role: "staff",
   permissions: [
@@ -26,13 +26,22 @@ async function runTest() {
   });
 
   console.log("\n--- Result ---");
-  if (result.success && result.data?.source === "Vector Index (Mocked)") {
+  console.log(JSON.stringify(result, null, 2));
+  const retrievedRealGuide =
+    result.success &&
+    typeof result.data?.result === "string" &&
+    result.data.result.includes("[Tenant: slt]") &&
+    result.data.result.includes("speedtest.slt.lk");
+
+  if (retrievedRealGuide) {
     console.log(
-      "✅ SUCCESS: Dynamic routing to Support Agent worked! It queried the mock Vector Index.",
+      "✅ PASS: Support Specialist returned content from the real SLT S3 document."
     );
   } else {
-    console.log("❌ ERROR: Did not route to support agent correctly.");
-    console.log(JSON.stringify(result, null, 2));
+    console.error(
+      "❌ FAIL: Expected SLT S3 troubleshooting content was not returned."
+    );
+    process.exitCode = 1;
   }
 }
 

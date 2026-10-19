@@ -7,7 +7,8 @@ import { handleHandoffApi } from "./services/handoff/handler";
 import { adjustActiveChats } from "./services/handoff/presence-manager";
 
 import { registerTenant, handleRegisterTenantRequest } from "./services/onboarding/register-tenant";
-import { uploadKbDocument } from "./agents/utils/s3-client";
+import { s3Client, uploadKbDocument } from "./agents/utils/s3-client";
+import { ListObjectsV2Command } from "@aws-sdk/client-s3";
 import { inMemoryTenants, inMemoryAgents, provisionTenantResources } from "./scripts/create-tenants-table";
 import { TenantContext } from "./shared/types/tenant-context";
 import { docClient } from "./agents/utils/dynamo-client";
@@ -644,6 +645,60 @@ app.get("/api/dev/admin/agents", async (req, res) => {
   } catch (error) {
     console.error("[LocalAdminAgents] LocalStack query failed:", error);
     return res.status(503).json({ error: "Agent list unavailable; check the agent DynamoDB table" });
+  }
+});
+
+// Read-only S3 source file inventory for the local SLT admin preview.
+// An S3 object is NOT proof of a Bedrock Knowledge Base registration or successful indexing.
+// This endpoint has no Cognito authorization and must not be deployed publicly.
+app.get("/api/dev/admin/knowledge-files", async (req, res) => {
+  const remote = req.socket.remoteAddress || "";
+  const loopback = ["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(remote);
+  const allowedOrigins = ["http://localhost:8080", "http://127.0.0.1:8080"];
+  if (process.env.NODE_ENV === "production" || process.env.IS_LOCAL === "false" || !loopback ||
+      (req.headers.origin && !allowedOrigins.includes(req.headers.origin))) {
+    return res.status(404).json({ error: "Not found" });
+  }
+  if (req.query.tenantId !== "slt") {
+    return res.status(400).json({ error: "Only the local SLT test tenant is supported" });
+  }
+
+  const bucket = process.env.KB_BUCKET_NAME || "omni-channel-kb-docs";
+  const prefix = "tenants/slt/";
+  try {
+    // A bounded listing keeps this local debugging endpoint inexpensive.
+    // If more than 100 objects exist, show that the inventory is incomplete.
+    const result = await s3Client.send(new ListObjectsV2Command({
+      Bucket: bucket, Prefix: prefix, MaxKeys: 100,
+    }));
+    const items = (result.Contents || [])
+      .filter(object => object.Key && object.Key !== prefix && !object.Key.endsWith("/"))
+      .map(object => ({
+        key: object.Key as string,
+        name: (object.Key as string).slice(prefix.length),
+        bytes: object.Size ?? null,
+        lastModified: object.LastModified?.toISOString() || null,
+        storageStatus: "STORED_IN_S3",
+        indexedInBedrock: null, // Not tracked by this backend.
+      }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+    return res.json({
+      tenantId: "slt", source: "localstack-s3", demoOnly: true,
+      bucket, prefix, bucketStatus: "available",
+      totalShown: items.length, truncated: !!result.IsTruncated, items,
+      bedrockKnowledgeBasesTracked: false,
+    });
+  } catch (error: any) {
+    if (["NoSuchBucket", "NotFound"].includes(error?.name)) {
+      return res.json({
+        tenantId: "slt", source: "localstack-s3", demoOnly: true,
+        bucket, prefix, bucketStatus: "missing",
+        totalShown: 0, truncated: false, items: [],
+        bedrockKnowledgeBasesTracked: false,
+      });
+    }
+    console.error("[LocalAdminKnowledge] S3 list failed:", error);
+    return res.status(503).json({ error: "Local S3 inventory unavailable" });
   }
 });
 
