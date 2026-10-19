@@ -598,6 +598,55 @@ app.get("/api/dev/admin/chats", async (req, res) => {
   }
 });
 
+// Local SLT agent list. This is only for the loopback-only admin preview.
+// Do not expose this endpoint in production; it has no Cognito authorization.
+app.get("/api/dev/admin/agents", async (req, res) => {
+  const remote = req.socket.remoteAddress || "";
+  const loopback = ["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(remote);
+  const allowedOrigins = ["http://localhost:8080", "http://127.0.0.1:8080"];
+  if (process.env.NODE_ENV === "production" || !loopback ||
+      (req.headers.origin && !allowedOrigins.includes(req.headers.origin))) {
+    return res.status(404).json({ error: "Not found" });
+  }
+  if (req.query.tenantId !== "slt") {
+    return res.status(400).json({ error: "Only the local SLT test tenant is supported" });
+  }
+
+  try {
+    const records: Array<Record<string, any>> = [];
+    let lastKey: Record<string, any> | undefined;
+    do {
+      const result = await docClient.send(new QueryCommand({
+        TableName: "omni-channel-agents",
+        KeyConditionExpression: "tenantId = :tenant",
+        ExpressionAttributeValues: { ":tenant": "slt" },
+        ExclusiveStartKey: lastKey,
+      }));
+      records.push(...((result.Items || []) as Array<Record<string, any>>));
+      lastKey = result.LastEvaluatedKey;
+    } while (lastKey);
+
+    records.sort((a, b) => String(a.agentId || "").localeCompare(String(b.agentId || "")));
+    return res.json({
+      tenantId: "slt", source: "localstack", demoOnly: true,
+      total: records.length,
+      items: records.map(a => ({
+        agentId: String(a.agentId || ""),
+        displayName: String(a.displayName || a.name || a.agentName || a.agentId || "Unnamed agent"),
+        modelId: typeof a.modelId === "string" ? a.modelId :
+          (typeof a.defaultModel === "string" ? a.defaultModel : null),
+        status: typeof a.status === "string" ? a.status.toUpperCase() : "UNKNOWN",
+        // Seeded agent records do not necessarily have a published chat URL.
+        publicAgentKey: typeof a.publicAgentKey === "string" && a.publicAgentKey.trim()
+          ? a.publicAgentKey : null,
+      })),
+    });
+  } catch (error) {
+    console.error("[LocalAdminAgents] LocalStack query failed:", error);
+    return res.status(503).json({ error: "Agent list unavailable; check the agent DynamoDB table" });
+  }
+});
+
 // TEMPORARY LOCAL MESSAGE API — NOT SUITABLE FOR PRODUCTION.
 // The agent ID is fixed for the SLT demo and there is no Cognito identity here.
 // Keep these endpoints loopback-only until proper customer/agent authorization exists.
