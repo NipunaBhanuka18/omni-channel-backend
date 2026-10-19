@@ -11,7 +11,7 @@ import { uploadKbDocument } from "./agents/utils/s3-client";
 import { inMemoryTenants, inMemoryAgents, provisionTenantResources } from "./scripts/create-tenants-table";
 import { TenantContext } from "./shared/types/tenant-context";
 import { docClient } from "./agents/utils/dynamo-client";
-import { ScanCommand, GetCommand, UpdateCommand } from "@aws-sdk/lib-dynamodb";
+import { ScanCommand, QueryCommand, GetCommand, UpdateCommand } from "@aws-sdk/lib-dynamodb";
 import { randomUUID } from "crypto";
 
 // Enable mock authorization for local development environment
@@ -483,6 +483,69 @@ app.get("/api/dev/live/queue", async (req, res) => {
     return res.json({ assigned, waiting: [], demoOnly: true });
   } catch (error: any) {
     return res.status(503).json({ error: "Local handoff queue unavailable", detail: error.message });
+  }
+});
+
+// Read-only SLT dashboard counts from LocalStack. This is a local test adapter,
+// NOT an authenticated company-admin endpoint. Never deploy this route publicly.
+app.get("/api/dev/admin/overview", async (req, res) => {
+  const remote = req.socket.remoteAddress || "";
+  const loopback = ["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(remote);
+  const allowedOrigins = ["http://localhost:8080", "http://127.0.0.1:8080"];
+  if (process.env.NODE_ENV === "production" || !loopback ||
+      (req.headers.origin && !allowedOrigins.includes(req.headers.origin))) {
+    return res.status(404).json({ error: "Not found" });
+  }
+  if (req.query.tenantId !== "slt") {
+    return res.status(400).json({ error: "Only the local SLT test tenant is supported" });
+  }
+
+  // Query tenant-partitioned tables; scan session table only for this small local demo.
+  // Production needs authenticated role/tenant authorization and indexed queries.
+  const readTenantRows = async (tableName: string, scan = false) => {
+    const rows: Array<Record<string, any>> = [];
+    let nextKey: Record<string, any> | undefined;
+    do {
+      const args = {
+        TableName: tableName,
+        ...(scan ? { FilterExpression: "tenantId = :tenant" } : {
+          KeyConditionExpression: "tenantId = :tenant",
+        }),
+        ExpressionAttributeValues: { ":tenant": "slt" },
+        ExclusiveStartKey: nextKey,
+      };
+      const response = scan
+        ? await docClient.send(new ScanCommand(args))
+        : await docClient.send(new QueryCommand(args));
+      rows.push(...((response.Items || []) as Array<Record<string, any>>));
+      nextKey = response.LastEvaluatedKey;
+    } while (nextKey);
+    return rows;
+  };
+
+  try {
+    const [agents, tools, liveAgents, sessions] = await Promise.all([
+      readTenantRows("omni-channel-agents"),
+      readTenantRows("omni-channel-tools"),
+      readTenantRows("omni-channel-agent-presence"),
+      readTenantRows("omni-channel-chat-sessions", true),
+    ]);
+    return res.json({
+      tenantId: "slt", source: "localstack", demoOnly: true,
+      dashboard: {
+        agents: agents.length,
+        publishedAgents: null, // No shared publication-status model yet.
+        knowledgeBases: null, // No unified knowledge-base table yet.
+        tools: tools.length,
+        liveAgents: liveAgents.length,
+        onlineAgents: liveAgents.filter(a => ["AVAILABLE", "BUSY"].includes(a.status)).length,
+        waitingHandoffs: sessions.filter(s => s.status === "WAITING_FOR_HUMAN").length,
+        activeHumanChats: sessions.filter(s => s.status === "HUMAN_ACTIVE").length,
+      },
+    });
+  } catch (error) {
+    console.error("[LocalAdminOverview] LocalStack query failed:", error);
+    return res.status(503).json({ error: "Local dashboard metrics unavailable; check the DynamoDB tables" });
   }
 });
 

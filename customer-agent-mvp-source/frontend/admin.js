@@ -25,6 +25,20 @@
       if((options.method||"GET").toUpperCase()!=="GET"){
         throw new Error("Read-only local preview: admin changes are not connected to the backend.");
       }
+      if(path==="/v1/admin/dashboard"){
+        try {
+          const response=await fetch(apiBase+"/api/dev/admin/overview?tenantId=slt");
+          if(!response.ok)throw new Error(`HTTP ${response.status}`);
+          const body=await response.json();
+          if(body.source!=="localstack"||body.tenantId!=="slt"||!body.dashboard)throw new Error("Unexpected local overview response");
+          return body.dashboard;
+        } catch(error){
+          console.warn("Local dashboard metrics unavailable:",error);
+          // Show unavailable rather than silently replacing real metrics with demo numbers.
+          return {agents:null,knowledgeBases:null,tools:null,onlineAgents:null,
+            waitingHandoffs:null,activeHumanChats:null,publishedAgents:null,dataUnavailable:true};
+        }
+      }
       return demoRequest(path,options);
     }
     if(!apiBase)return demoRequest(path,options);
@@ -74,24 +88,23 @@
     const banner=document.createElement("div");
     banner.setAttribute("role","status");
     banner.style.cssText="margin:18px 22px 0;padding:14px 18px;background:#fff4d8;color:#65420b;border:1px solid #f3dca6;border-radius:12px;line-height:1.5";
-    banner.textContent="LOCAL READ-ONLY PREVIEW — All dashboard figures, agents, knowledge bases, tools, and team members shown below are SAMPLE DATA. No Cognito login or admin writes are enabled.";
+    banner.textContent="LOCAL READ-ONLY PREVIEW — Dashboard counters are read from SLT records in LocalStack when available. Other pages (agents, knowledge, tools, team, chat monitor) still show SAMPLE DATA. No Cognito login or admin writes are enabled.";
     document.querySelector("#adminApp .content").before(banner);
     const operational=document.querySelector("#view-dashboard .status-line");
-    if(operational)operational.textContent="Sample dashboard indicators";
+    if(operational)operational.textContent="LocalStack (SLT test tenant; no authentication)";
     await loadAll();
-    try{
-      const response=await fetch(apiBase+"/api/stats");
-      if(!response.ok)throw new Error("HTTP "+response.status);
-      await response.json();
-      banner.textContent+=" Local TypeScript API is reachable, but the dashboard is not yet reading real admin data.";
-    }catch(_){
-      banner.textContent+=" Local TypeScript API is currently unreachable; sample data are still displayed.";
+    if(state.dashboard.dataUnavailable){
+      banner.textContent+=" Dashboard metrics are unavailable. Check that the backend and LocalStack tables are running; no sample counters are substituted.";
     }
   }
   function renderDashboard(){
-    const d=state.dashboard,metrics=[["◉",d.agents||0,"AI agents"],["◇",d.knowledgeBases||0,"Knowledge bases"],["⌘",d.tools||0,"Connected tools"],["♙",d.onlineAgents||0,"Agents online"],["◌",d.waitingHandoffs||0,"Waiting handoffs"],["↔",d.activeHumanChats||0,"Active human chats"]];
-    $("#metrics").innerHTML=metrics.map(x=>`<article class="metric-card"><span class="metric-icon">${x[0]}</span><strong>${x[1]}</strong><span>${x[2]}</span></article>`).join("");
-    $("#readiness").innerHTML=`<table class="data-table"><tr><td>Published customer agents</td><td><span class="status-pill published">${d.publishedAgents||0} live</span></td></tr><tr><td>Human assistance queue</td><td><span class="status-pill ${d.waitingHandoffs?'waiting':'ready'}">${d.waitingHandoffs||0} waiting</span></td></tr><tr><td>Tenant data boundary</td><td><span class="status-pill ready">${localAdminPreview?"Sample only":"Enforced"}</span></td></tr></table>`;
+    const d=state.dashboard;
+    const display=v=>Number.isFinite(v)?v:"—";
+    const metrics=[["◉",d.agents,"AI agents"],["◇",d.knowledgeBases,"Knowledge bases"],["⌘",d.tools,"Connected tools"],["♙",d.onlineAgents,"Agents online"],["◌",d.waitingHandoffs,"Waiting handoffs"],["↔",d.activeHumanChats,"Active human chats"]];
+    $("#metrics").innerHTML=metrics.map(x=>`<article class="metric-card"><span class="metric-icon">${x[0]}</span><strong>${display(x[1])}</strong><span>${x[2]}</span></article>`).join("");
+    const published=Number.isFinite(d.publishedAgents)?`${d.publishedAgents} live`:"Not tracked";
+    const waiting=Number.isFinite(d.waitingHandoffs)?`${d.waitingHandoffs} waiting`:"Unavailable";
+    $("#readiness").innerHTML=`<table class="data-table"><tr><td>Published customer agents</td><td><span class="status-pill published">${published}</span></td></tr><tr><td>Human assistance queue</td><td><span class="status-pill ${d.waitingHandoffs?'waiting':'ready'}">${waiting}</span></td></tr><tr><td>Tenant data boundary</td><td><span class="status-pill ready">${localAdminPreview?"Local tenant filtering only (no auth)":"Enforced"}</span></td></tr></table>`;
   }
   function table(headers,rows,empty){return rows.length?`<table class="data-table"><thead><tr>${headers.map(h=>`<th>${h}</th>`).join("")}</tr></thead><tbody>${rows.join("")}</tbody></table>`:`<div class="empty-state"><strong>${empty}</strong>Create the first item to get started.</div>`}
   function renderAgents(){$("#agentsTable").innerHTML=table(["Agent","Public URL","Model","Status","Actions"],state.agents.map(a=>`<tr><td><strong>${esc(a.displayName)}</strong><br><small>${esc(a.agentId)}</small></td><td>/chat.html?agent=${esc(a.publicAgentKey)}</td><td>${esc(a.modelId||"Default")}</td><td><span class="status-pill ${String(a.status).toLowerCase()}">${esc(a.status)}</span></td><td><div class="row-actions"><button class="small-btn" data-edit-agent="${esc(a.agentId)}">Edit</button>${a.status!=="PUBLISHED"?`<button class="small-btn" data-publish="${esc(a.agentId)}">Publish</button>`:""}<button class="small-btn" data-delete-agent="${esc(a.agentId)}">Delete</button></div></td></tr>`),"No AI agents yet")}
