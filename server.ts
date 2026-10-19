@@ -4,6 +4,7 @@ import fs from "fs";
 import path from "path";
 import { handleTenantRequest } from "./services/tenant-router/handler";
 import { handleHandoffApi } from "./services/handoff/handler";
+import { adjustActiveChats } from "./services/handoff/presence-manager";
 
 import { registerTenant, handleRegisterTenantRequest } from "./services/onboarding/register-tenant";
 import { uploadKbDocument } from "./agents/utils/s3-client";
@@ -499,6 +500,39 @@ function allowLocalMessageRequest(req: express.Request): boolean {
 
 const LOCAL_SESSION_TABLE = "omni-channel-chat-sessions";
 const LOCAL_MAX_MESSAGES = 100; // Demo limit: each session is one DynamoDB item.
+
+// Local-only resolution endpoint: the conditional write is the source of truth.
+// Unlike the legacy resolve endpoint, it does not report success if the session
+// was absent, assigned to someone else, or already resolved.
+app.post("/api/dev/live/conversations/:sessionId/close", async (req, res) => {
+  if (!allowLocalMessageRequest(req)) return res.status(404).json({ error: "Not found" });
+  const sessionId = req.params.sessionId;
+  if (!/^[a-zA-Z0-9_-]{1,128}$/.test(sessionId)) {
+    return res.status(400).json({ error: "Invalid sessionId" });
+  }
+  try {
+    await docClient.send(new UpdateCommand({
+      TableName: LOCAL_SESSION_TABLE,
+      Key: { sessionId },
+      UpdateExpression: "SET #st = :resolved, updatedAt = :now",
+      ConditionExpression: "attribute_exists(sessionId) AND tenantId = :tenant AND assignedAgentId = :agent AND #st = :active",
+      ExpressionAttributeNames: { "#st": "status" },
+      ExpressionAttributeValues: {
+        ":tenant": "slt", ":agent": "local-agent-01",
+        ":active": "HUMAN_ACTIVE", ":resolved": "RESOLVED", ":now": new Date().toISOString(),
+      },
+    }));
+    // Decrement only after the first successful transition, not on repeat clicks.
+    await adjustActiveChats("slt", "local-agent-01", -1);
+    return res.json({ sessionId, status: "RESOLVED", demoOnly: true });
+  } catch (error: any) {
+    if (error?.name === "ConditionalCheckFailedException") {
+      return res.status(409).json({ error: "Conversation is missing, already resolved, or not assigned to this local agent" });
+    }
+    console.error("[LocalMessages] Resolution error:", error);
+    return res.status(503).json({ error: "Conversation resolution unavailable" });
+  }
+});
 
 app.get("/api/dev/live/conversations/:sessionId/messages", async (req, res) => {
   if (!allowLocalMessageRequest(req)) return res.status(404).json({ error: "Not found" });

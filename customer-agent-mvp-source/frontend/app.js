@@ -118,7 +118,7 @@
     return form;
   }
 
-  function setSending(value) { state.sending = value; el.send.disabled = value; el.input.disabled = value; el.loading.classList.toggle("visible", value); if (value) scrollBottom(); }
+  function setSending(value) { state.sending = value; el.send.disabled = value || state.handoffClosed; el.input.disabled = value || state.handoffClosed; el.loading.classList.toggle("visible", value); if (value) scrollBottom(); }
 
   function demoReply(text, formSubmission) {
     if (formSubmission) return { messageId: makeId(), message: "Thank you. Your details have been recorded and our team can follow up with you.", route: "lead", status: "completed" };
@@ -275,7 +275,7 @@
   }
 
   async function sendMessage(text, formSubmission, showUserMessage = true) {
-    text = (text || "").trim(); if ((!text && !formSubmission) || state.sending) return;
+    text = (text || "").trim(); if ((!text && !formSubmission) || state.sending || state.handoffClosed) return;
     if (showUserMessage) addUserMessage(text); el.input.value = ""; resizeInput(); renderSuggestions([]); setSending(true);
     try {
       let response;
@@ -322,6 +322,7 @@
       if (result.session?.status === "RESOLVED" || result.sessionStatus === "CLOSED") {
         clearInterval(state.pollTimer); state.pollTimer = null;
         state.humanMode = false; state.handoffClosed = true;
+        setSending(false);
         el.agentStatus.textContent = "Conversation closed";
         addNotice("handoff-note", "The human agent has closed this conversation. Select Restart to begin another chat.");
       }
@@ -369,7 +370,7 @@
   el.input.addEventListener("input", resizeInput);
   el.input.addEventListener("keydown", event => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); el.composer.requestSubmit(); } });
   el.restart.addEventListener("click", () => {
-    clearInterval(state.pollTimer); state.pollTimer = null; state.humanMode = false; state.seenMessageIds.clear(); state.sessionId = null; state.conversationId = null; state.tenantId = null; state.handoffRequested = false; state.handoffClosed = false; state.localAgentId = null; state.pollErrorShown = false;
+    clearInterval(state.pollTimer); state.pollTimer = null; state.humanMode = false; state.seenMessageIds.clear(); state.sessionId = null; state.conversationId = null; state.tenantId = null; state.handoffRequested = false; state.handoffClosed = false; state.localAgentId = null; state.pollErrorShown = false; setSending(false); el.agentStatus.textContent = "Online · replies instantly";
     [...el.messages.querySelectorAll(".message-row,.handoff-note,.error-note")].forEach(x => x.remove()); initialize();
   });
   initialize();
