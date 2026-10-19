@@ -1,6 +1,12 @@
 (function(){
   "use strict";
   const cfg=window.CHAT_CONFIG||{}, apiBase=(cfg.apiBaseUrl||"").replace(/\/$/,"");
+  // This preview is limited to a frontend served on loopback with the local TypeScript dev API.
+  // It never authenticates a real user or invokes any administrative write endpoints.
+  const localAdminPreview = cfg.backendMode === "local-typescript" &&
+    ["localhost", "127.0.0.1"].includes(window.location.hostname) &&
+    /^http:\/\/(localhost|127\.0\.0\.1):3001$/.test(apiBase) &&
+    !(cfg.auth && (cfg.auth.domain || cfg.auth.clientId));
   let auth=null, modalMode=null, editingId=null;
   const state={dashboard:{},agents:[],knowledge:[],tools:[],liveAgents:[],chats:[],team:[],workspace:{},seatRequests:[]};
   const demo={
@@ -15,6 +21,12 @@
   };
   const $=s=>document.querySelector(s), esc=v=>String(v??"").replace(/[&<>'"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;","'":"&#39;",'"':"&quot;"}[c]));
   async function request(path,options={}){
+    if(localAdminPreview){
+      if((options.method||"GET").toUpperCase()!=="GET"){
+        throw new Error("Read-only local preview: admin changes are not connected to the backend.");
+      }
+      return demoRequest(path,options);
+    }
     if(!apiBase)return demoRequest(path,options);
     const token=(auth||{}).id_token||(auth||{}).access_token; const res=await fetch(apiBase+path,{...options,headers:{"Content-Type":"application/json",Authorization:`Bearer ${token}`,...options.headers}});
     const body=await res.json().catch(()=>({})); if(!res.ok)throw new Error(body.message||"Request failed"); return body;
@@ -44,11 +56,42 @@
     const [dashboard,agents,knowledge,tools,liveAgents,chats,team]=await Promise.all([request("/v1/admin/dashboard"),request("/v1/admin/agents"),request("/v1/admin/knowledge-bases"),request("/v1/admin/tools"),request("/v1/admin/live-agents"),request("/v1/admin/chats"),request("/v1/admin/team")]);
     Object.assign(state,{dashboard,agents:agents.items||[],knowledge:knowledge.items||[],tools:tools.items||[],liveAgents:liveAgents.items||[],chats:chats.items||[],team:team.items||[],workspace:team.workspace||{},seatRequests:team.seatRequests||[]});renderAll();
   }
-  function renderAll(){renderDashboard();renderAgents();renderKnowledge();renderTools();renderLiveAgents();renderChats();renderTeam()}
+  function renderAll(){renderDashboard();renderAgents();renderKnowledge();renderTools();renderLiveAgents();renderChats();renderTeam();if(localAdminPreview)disablePreviewWrites()}
+  function disablePreviewWrites(){
+    document.querySelectorAll('#adminApp button[data-open],#adminApp button[data-edit-agent],#adminApp button[data-publish],#adminApp button[data-delete-agent],#adminApp button[data-delete-kb],#adminApp button[data-upload],#adminApp button[data-sync],#adminApp button[data-edit-tool],#adminApp button[data-delete-tool]').forEach(button=>{
+      button.disabled=true;
+      button.title="Unavailable in read-only local preview";
+    });
+  }
+  async function startLocalPreview(){
+    auth={claims:{name:"Local Admin Preview"}};
+    $("#loginGate").classList.add("hidden");
+    $("#adminApp").classList.remove("hidden");
+    $("#profileName").textContent="Local Admin Preview";
+    $("#profileAvatar").textContent="LP";
+    $("#logoutButton").disabled=true;
+    $("#logoutButton").title="No user is signed in during the local preview";
+    const banner=document.createElement("div");
+    banner.setAttribute("role","status");
+    banner.style.cssText="margin:18px 22px 0;padding:14px 18px;background:#fff4d8;color:#65420b;border:1px solid #f3dca6;border-radius:12px;line-height:1.5";
+    banner.textContent="LOCAL READ-ONLY PREVIEW — All dashboard figures, agents, knowledge bases, tools, and team members shown below are SAMPLE DATA. No Cognito login or admin writes are enabled.";
+    document.querySelector("#adminApp .content").before(banner);
+    const operational=document.querySelector("#view-dashboard .status-line");
+    if(operational)operational.textContent="Sample dashboard indicators";
+    await loadAll();
+    try{
+      const response=await fetch(apiBase+"/api/stats");
+      if(!response.ok)throw new Error("HTTP "+response.status);
+      await response.json();
+      banner.textContent+=" Local TypeScript API is reachable, but the dashboard is not yet reading real admin data.";
+    }catch(_){
+      banner.textContent+=" Local TypeScript API is currently unreachable; sample data are still displayed.";
+    }
+  }
   function renderDashboard(){
     const d=state.dashboard,metrics=[["◉",d.agents||0,"AI agents"],["◇",d.knowledgeBases||0,"Knowledge bases"],["⌘",d.tools||0,"Connected tools"],["♙",d.onlineAgents||0,"Agents online"],["◌",d.waitingHandoffs||0,"Waiting handoffs"],["↔",d.activeHumanChats||0,"Active human chats"]];
     $("#metrics").innerHTML=metrics.map(x=>`<article class="metric-card"><span class="metric-icon">${x[0]}</span><strong>${x[1]}</strong><span>${x[2]}</span></article>`).join("");
-    $("#readiness").innerHTML=`<table class="data-table"><tr><td>Published customer agents</td><td><span class="status-pill published">${d.publishedAgents||0} live</span></td></tr><tr><td>Human assistance queue</td><td><span class="status-pill ${d.waitingHandoffs?'waiting':'ready'}">${d.waitingHandoffs||0} waiting</span></td></tr><tr><td>Tenant data boundary</td><td><span class="status-pill ready">Enforced</span></td></tr></table>`;
+    $("#readiness").innerHTML=`<table class="data-table"><tr><td>Published customer agents</td><td><span class="status-pill published">${d.publishedAgents||0} live</span></td></tr><tr><td>Human assistance queue</td><td><span class="status-pill ${d.waitingHandoffs?'waiting':'ready'}">${d.waitingHandoffs||0} waiting</span></td></tr><tr><td>Tenant data boundary</td><td><span class="status-pill ready">${localAdminPreview?"Sample only":"Enforced"}</span></td></tr></table>`;
   }
   function table(headers,rows,empty){return rows.length?`<table class="data-table"><thead><tr>${headers.map(h=>`<th>${h}</th>`).join("")}</tr></thead><tbody>${rows.join("")}</tbody></table>`:`<div class="empty-state"><strong>${empty}</strong>Create the first item to get started.</div>`}
   function renderAgents(){$("#agentsTable").innerHTML=table(["Agent","Public URL","Model","Status","Actions"],state.agents.map(a=>`<tr><td><strong>${esc(a.displayName)}</strong><br><small>${esc(a.agentId)}</small></td><td>/chat.html?agent=${esc(a.publicAgentKey)}</td><td>${esc(a.modelId||"Default")}</td><td><span class="status-pill ${String(a.status).toLowerCase()}">${esc(a.status)}</span></td><td><div class="row-actions"><button class="small-btn" data-edit-agent="${esc(a.agentId)}">Edit</button>${a.status!=="PUBLISHED"?`<button class="small-btn" data-publish="${esc(a.agentId)}">Publish</button>`:""}<button class="small-btn" data-delete-agent="${esc(a.agentId)}">Delete</button></div></td></tr>`),"No AI agents yet")}
@@ -85,7 +128,7 @@
     if(target.dataset.upload){const input=document.createElement("input");input.type="file";input.accept=".pdf,.docx,.txt,.md,.csv,.html";input.onchange=async()=>{const file=input.files[0];if(!file)return;const result=await request(`/v1/admin/knowledge-bases/${target.dataset.upload}/upload-url`,{method:"POST",body:JSON.stringify({filename:file.name,contentType:file.type||"application/octet-stream"})});if(result.uploadUrl!=="demo"){const put=await fetch(result.uploadUrl,{method:"PUT",headers:{"Content-Type":file.type||"application/octet-stream"},body:file});if(!put.ok)throw new Error("Upload failed")}toast("File uploaded. Select Sync when ready.")};input.click()}
   }catch(e){toast(e.message,true)}}
   function toast(message,error){const el=$("#toast");el.textContent=message;el.style.background=error?"#a52e40":"#183754";el.classList.remove("hidden");setTimeout(()=>el.classList.add("hidden"),3200)}
-  async function init(){try{auth=await ConsoleAuth.requireAuth("COMPANY_ADMIN");if(!auth)return;$("#loginGate").classList.add("hidden");$("#adminApp").classList.remove("hidden");const name=auth.claims.name||auth.claims.email||"Admin";$("#profileName").textContent=name;$("#profileAvatar").textContent=name.split(/\s+/).map(x=>x[0]).join("").slice(0,2).toUpperCase();await loadAll()}catch(e){$("#loginGate p").textContent=e.message;toast(e.message,true)}}
+  async function init(){try{if(localAdminPreview){await startLocalPreview();return;}auth=await ConsoleAuth.requireAuth("COMPANY_ADMIN");if(!auth)return;$("#loginGate").classList.add("hidden");$("#adminApp").classList.remove("hidden");const name=auth.claims.name||auth.claims.email||"Admin";$("#profileName").textContent=name;$("#profileAvatar").textContent=name.split(/\s+/).map(x=>x[0]).join("").slice(0,2).toUpperCase();await loadAll()}catch(e){$("#loginGate p").textContent=e.message;toast(e.message,true)}}
   document.addEventListener("click",e=>{const t=e.target.closest("button,a");if(!t)return;if(t.dataset.view){document.querySelectorAll(".nav-btn").forEach(x=>x.classList.toggle("active",x===t));document.querySelectorAll(".view").forEach(x=>x.classList.toggle("active",x.id===`view-${t.dataset.view}`));$("#currentSection").textContent=t.textContent.trim()}if(t.dataset.open)openModal(t.dataset.open);if(t.hasAttribute("data-close"))closeModal();if(t.hasAttribute("data-refresh"))loadAll();action(t)});
   $("#modalForm").addEventListener("submit",submitModal);$("#loginButton").addEventListener("click",()=>ConsoleAuth.login());$("#logoutButton").addEventListener("click",()=>ConsoleAuth.logout());init();
 })();
