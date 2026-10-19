@@ -6,9 +6,12 @@
   const pathParts = window.location.pathname.split("/").filter(Boolean);
   const agentKey = params.get("agent") || (pathParts[0] === "chat" ? pathParts[1] : "") || config.defaultAgentKey || "demo-support";
   const apiBase = (config.apiBaseUrl || "").replace(/\/$/, "");
-  const demoMode = !apiBase;
+  const localBackendMode = config.backendMode === "local-typescript";
+  // While integrating, only agent configuration comes from the TypeScript server.
+  // Chat messages stay in demo mode until the public message API is implemented.
+  const demoMode = !apiBase || localBackendMode;
 
-  const state = { sessionId: null, agent: null, sending: false, humanMode: false, pollTimer: null, seenMessageIds: new Set() };
+  const state = { sessionId: null, conversationId: null, tenantId: null, agent: null, sending: false, humanMode: false, pollTimer: null, seenMessageIds: new Set() };
   const el = {
     messages: document.getElementById("messages"), suggestions: document.getElementById("suggestions"),
     composer: document.getElementById("composer"), input: document.getElementById("messageInput"),
@@ -31,7 +34,7 @@
   function escapeText(value) { return String(value == null ? "" : value); }
 
   async function api(path, options) {
-    const response = await fetch(apiBase + path, { headers: { "Content-Type": "application/json", ...(options && options.headers) }, ...options });
+    const response = await fetch(apiBase + path, { ...(options || {}), headers: { "Content-Type": "application/json", ...((options && options.headers) || {}) } });
     const data = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(data.message || "The assistant is temporarily unavailable.");
     return data;
@@ -127,12 +130,78 @@
     return { messageId: makeId(), message: "Thanks for reaching out. I can help with services, billing, technical support, or finding the right package. What would you like to do?", route: "general", status: "completed" };
   }
 
+  // Local development adapter only. The TypeScript API uses intent-based requests,
+  // and its current mock JWT verifier is NOT suitable for production authentication.
+  function localIntent(text) {
+    if (/\b(balance|bill|billing|charge|charges)\b/i.test(text)) return "check_balance";
+    if (/\b(usage|data used|data usage|consumption)\b/i.test(text)) return "check_usage";
+    if (/\b(router|wi-?fi|internet|technical|slow|fault|not working)\b/i.test(text)) return "troubleshoot_router";
+    return null;
+  }
+
+  function localMockToken() {
+    const claims = {
+      sub: "local-chat-test-user",
+      "custom:tenant_id": state.tenantId,
+      "cognito:groups": ["staff"]
+    };
+    return `e30.${btoa(JSON.stringify(claims)).replace(/=+$/, "").replace(/\+/g, "-").replace(/\//g, "_")}.local-test-signature`;
+  }
+
+  function formatLocalAgentResponse(intent, data) {
+    if (intent === "check_balance") {
+      return `Example billing data: your account balance is ${data.currency || "LKR"} ${Number(data.balance).toFixed(2)}. Account: ${data.accountNumber || "not available"}. Due date: ${data.dueDate || "not available"}. This is mock customer data.`;
+    }
+    if (intent === "check_usage") {
+      return `Example usage data for ${data.packageName || "your package"}: ${data.dataUsedGb} GB of ${data.dataTotalGb} GB used, and ${data.voiceUsedMins} of ${data.voiceTotalMins} voice minutes used. This is mock customer data.`;
+    }
+    if (intent === "troubleshoot_router") {
+      return `Local technical support result (mock knowledge base):\n${String(data.result || "No troubleshooting information returned.")}`;
+    }
+    return "The backend processed your request, but its response is not yet supported by this chat UI.";
+  }
+
+  async function localBackendReply(text, formSubmission) {
+    if (location.hostname !== "localhost" && location.hostname !== "127.0.0.1") {
+      throw new Error("Local testing is only allowed when the frontend runs on localhost.");
+    }
+    const backendUrl = new URL(apiBase);
+    if (!["localhost", "127.0.0.1"].includes(backendUrl.hostname)) {
+      throw new Error("Local testing requires a localhost backend. Do not use mock credentials on a public server.");
+    }
+
+    const intent = formSubmission ? null : localIntent(text);
+    if (!intent) {
+      let message;
+      if (formSubmission) message = "Demo form only: your details were not sent to a backend or saved.";
+      else if (/\b(human|person|agent|handoff)\b/i.test(text)) message = "Live-agent handoff is not connected to this chatbot yet; no human support request was queued.";
+      else message = `${demoReply(text).message} (Demo response only — not sent to the backend.)`;
+      return { messageId: makeId(), message, status: "completed" };
+    }
+
+    const result = await api("/api/agent", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${localMockToken()}`,
+        "x-tenant-id": state.tenantId,
+        "x-channel": "web",
+        "x-session-id": state.sessionId,
+        "x-conversation-id": state.conversationId
+      },
+      body: JSON.stringify({ intent, params: { query: text } })
+    });
+    // The existing server returns HTTP 200 even when AgentActionResponse.success is false.
+    if (!result.success) throw new Error(result.error?.message || "The backend rejected this request.");
+    return { messageId: makeId(), message: formatLocalAgentResponse(intent, result.data || {}), status: "completed" };
+  }
+
   async function sendMessage(text, formSubmission, showUserMessage = true) {
     text = (text || "").trim(); if ((!text && !formSubmission) || state.sending) return;
     if (showUserMessage) addUserMessage(text); el.input.value = ""; resizeInput(); renderSuggestions([]); setSending(true);
     try {
       let response;
-      if (demoMode) { await new Promise(resolve => setTimeout(resolve, 650)); response = demoReply(text, formSubmission); }
+      if (localBackendMode) response = await localBackendReply(text, formSubmission);
+      else if (demoMode) { await new Promise(resolve => setTimeout(resolve, 650)); response = demoReply(text, formSubmission); }
       else response = await api(`/v1/public/sessions/${encodeURIComponent(state.sessionId)}/messages`, { method: "POST", body: JSON.stringify({ message: text, formSubmission }) });
       if (response.message) addBotMessage(response);
       if (response.messageId) state.seenMessageIds.add(response.messageId);
@@ -177,10 +246,30 @@
   async function initialize() {
     el.loading.classList.add("visible");
     try {
-      const agent = demoMode ? demoAgent : await api(`/v1/public/agents/${encodeURIComponent(agentKey)}`);
+      let agent;
+      if (localBackendMode) {
+        const company = encodeURIComponent(config.companySlug || "slt");
+        const agentSlug = encodeURIComponent(config.agentSlug || "support");
+        const result = await api(`/api/resolve-chat-url?company=${company}&agent=${agentSlug}`);
+        if (!result.success || !result.tenantId) throw new Error("Backend did not provide an agent configuration.");
+        state.tenantId = result.tenantId;
+        agent = {
+          ...demoAgent,
+          displayName: result.agentName || demoAgent.displayName,
+          brandName: result.companyName || demoAgent.brandName,
+          welcomeMessage: result.welcomeMessage || demoAgent.welcomeMessage,
+          theme: { ...demoAgent.theme, primary: result.themeColor || demoAgent.theme.primary }
+        };
+      } else {
+        agent = demoMode ? demoAgent : await api(`/v1/public/agents/${encodeURIComponent(agentKey)}`);
+      }
       applyAgent(agent);
       state.sessionId = demoMode ? makeId() : (await api("/v1/public/sessions", { method: "POST", body: JSON.stringify({ agentKey }) })).sessionId;
+      if (localBackendMode) state.conversationId = `conv-${makeId()}`;
       addBotMessage({ message: agent.welcomeMessage, messageId: "welcome", status: "completed" });
+      if (localBackendMode) {
+        addNotice("handoff-note", "Local development: billing, usage, and router questions now call the TypeScript backend. Other responses are demo-only.");
+      }
     } catch (error) {
       applyAgent(demoAgent); addNotice("error-note", error.message || "This assistant could not be loaded."); el.agentStatus.textContent = "Temporarily unavailable";
     } finally { el.loading.classList.remove("visible"); el.input.focus(); }
@@ -190,7 +279,7 @@
   el.input.addEventListener("input", resizeInput);
   el.input.addEventListener("keydown", event => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); el.composer.requestSubmit(); } });
   el.restart.addEventListener("click", () => {
-    clearInterval(state.pollTimer); state.pollTimer = null; state.humanMode = false; state.seenMessageIds.clear(); state.sessionId = null;
+    clearInterval(state.pollTimer); state.pollTimer = null; state.humanMode = false; state.seenMessageIds.clear(); state.sessionId = null; state.conversationId = null; state.tenantId = null;
     [...el.messages.querySelectorAll(".message-row,.handoff-note,.error-note")].forEach(x => x.remove()); initialize();
   });
   initialize();
