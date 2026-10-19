@@ -39,6 +39,20 @@
             waitingHandoffs:null,activeHumanChats:null,publishedAgents:null,dataUnavailable:true};
         }
       }
+      if(path==="/v1/admin/chats"){
+        try {
+          const response=await fetch(apiBase+"/api/dev/admin/chats?tenantId=slt");
+          if(!response.ok)throw new Error(`HTTP ${response.status}`);
+          const body=await response.json();
+          if(body.source!=="localstack"||body.tenantId!=="slt"||!Array.isArray(body.items)){
+            throw new Error("Unexpected local chat monitor response");
+          }
+          return {items:body.items,total:body.total};
+        }catch(error){
+          console.warn("Local Chat Monitor unavailable:",error);
+          return {items:[],dataUnavailable:true};
+        }
+      }
       return demoRequest(path,options);
     }
     if(!apiBase)return demoRequest(path,options);
@@ -68,7 +82,7 @@
   function aId(a){return `/agents/${a.agentId}/`}
   async function loadAll(){
     const [dashboard,agents,knowledge,tools,liveAgents,chats,team]=await Promise.all([request("/v1/admin/dashboard"),request("/v1/admin/agents"),request("/v1/admin/knowledge-bases"),request("/v1/admin/tools"),request("/v1/admin/live-agents"),request("/v1/admin/chats"),request("/v1/admin/team")]);
-    Object.assign(state,{dashboard,agents:agents.items||[],knowledge:knowledge.items||[],tools:tools.items||[],liveAgents:liveAgents.items||[],chats:chats.items||[],team:team.items||[],workspace:team.workspace||{},seatRequests:team.seatRequests||[]});renderAll();
+    Object.assign(state,{dashboard,agents:agents.items||[],knowledge:knowledge.items||[],tools:tools.items||[],liveAgents:liveAgents.items||[],chats:chats.items||[],chatMonitorUnavailable:!!chats.dataUnavailable,chatTotal:chats.total,team:team.items||[],workspace:team.workspace||{},seatRequests:team.seatRequests||[]});renderAll();
   }
   function renderAll(){renderDashboard();renderAgents();renderKnowledge();renderTools();renderLiveAgents();renderChats();renderTeam();if(localAdminPreview)disablePreviewWrites()}
   function disablePreviewWrites(){
@@ -88,7 +102,7 @@
     const banner=document.createElement("div");
     banner.setAttribute("role","status");
     banner.style.cssText="margin:18px 22px 0;padding:14px 18px;background:#fff4d8;color:#65420b;border:1px solid #f3dca6;border-radius:12px;line-height:1.5";
-    banner.textContent="LOCAL READ-ONLY PREVIEW — Dashboard counters are read from SLT records in LocalStack when available. Other pages (agents, knowledge, tools, team, chat monitor) still show SAMPLE DATA. No Cognito login or admin writes are enabled.";
+    banner.textContent="LOCAL READ-ONLY PREVIEW — Dashboard counters are read from SLT records in LocalStack when available. Other pages (agents, knowledge, tools, team) still show SAMPLE DATA. Chat Monitor reads SLT handoff sessions from LocalStack. No Cognito login or admin writes are enabled.";
     document.querySelector("#adminApp .content").before(banner);
     const operational=document.querySelector("#view-dashboard .status-line");
     if(operational)operational.textContent="LocalStack (SLT test tenant; no authentication)";
@@ -111,7 +125,27 @@
   function renderKnowledge(){$("#knowledgeGrid").innerHTML=state.knowledge.length?state.knowledge.map(k=>`<article class="resource-card"><div class="resource-card-top"><h3>${esc(k.name)}</h3><span class="status-pill ready">${esc(k.status||"READY")}</span></div><p>${esc(k.description||"No description")}</p><div class="resource-meta"><span class="type-pill">Bedrock KB</span><span class="type-pill">${esc(k.kbId)}</span></div><div class="resource-actions"><button class="small-btn" data-upload="${esc(k.kbId)}">Upload files</button><button class="small-btn" data-sync="${esc(k.kbId)}">Sync</button><button class="small-btn" data-delete-kb="${esc(k.kbId)}">Delete</button></div></article>`).join(""):`<div class="empty-state"><strong>No knowledge bases</strong>Add a Bedrock knowledge base for tenant-specific answers.</div>`}
   function renderTools(){$("#toolsGrid").innerHTML=state.tools.length?state.tools.map(t=>`<article class="resource-card"><div class="resource-card-top"><h3>${esc(t.displayName||t.name)}</h3><span class="type-pill">${esc(String(t.type).toUpperCase())}</span></div><p>${esc(t.description||"No description")}</p><div class="resource-meta"><span class="status-pill ${t.enabled?'ready':'offline'}">${t.enabled?'Enabled':'Disabled'}</span><span class="type-pill">${esc(t.name)}</span></div><div class="resource-actions"><button class="small-btn" data-edit-tool="${esc(t.toolId)}">Edit</button><button class="small-btn" data-delete-tool="${esc(t.toolId)}">Delete</button></div></article>`).join(""):`<div class="empty-state"><strong>No tools or forms</strong>Create an API, MCP, or customer form tool.</div>`}
   function renderLiveAgents(){$("#liveAgentsTable").innerHTML=table(["Agent","Email","Presence","Account"],state.liveAgents.map(a=>`<tr><td><strong>${esc(a.name)}</strong></td><td>${esc(a.email)}</td><td><span class="status-pill ${String(a.presence).toLowerCase()}">${esc(a.presence)}</span></td><td>${esc(a.status)}</td></tr>`),"No live agents yet")}
-  function renderChats(){$("#chatsTable").innerHTML=table(["Session","Customer agent","Status","Updated"],state.chats.map(c=>`<tr><td>${esc(c.sessionId)}</td><td>${esc(c.publicAgentKey||c.agentId)}</td><td><span class="status-pill ${c.status==="HANDOFF_REQUESTED"?'waiting':c.status==="CLOSED"?'offline':'online'}">${esc(c.status)}</span></td><td>${new Date(Number(c.updatedAt)*1000).toLocaleString()}</td></tr>`),"No human-assistance chats")}
+  function renderChats(){
+    if(localAdminPreview){
+      if(state.chatMonitorUnavailable){
+        $("#chatsTable").innerHTML='<div class="empty-state"><strong>Chat Monitor unavailable</strong>Check the backend and omni-channel-chat-sessions table in LocalStack. No demo records are substituted.</div>';
+        return;
+      }
+      const rows=state.chats.map(c=>{
+        const parsed=c.updatedAt?new Date(c.updatedAt):null;
+        const updated=parsed&&!Number.isNaN(parsed.getTime())?parsed.toLocaleString():"—";
+        const style=["HANDOFF_REQUESTED","WAITING_FOR_HUMAN"].includes(c.status)?"waiting":
+          ["RESOLVED","CLOSED","MISSED_HANDOFF"].includes(c.status)?"offline":"online";
+        return `<tr><td>${esc(c.sessionId)}</td><td>${esc(c.customerName||"Guest Customer")}</td><td>${esc(c.assignedAgentId||"—")}</td><td><span class="status-pill ${style}">${esc(c.status)}</span></td><td>${esc(updated)}</td></tr>`;
+      });
+      $("#chatsTable").innerHTML=rows.length?
+        table(["Session","Customer","Human agent","Status","Updated"],rows,"")+
+          (state.chatTotal>100?'<p>Showing the 100 most recently updated SLT sessions.</p>':""):
+        '<div class="empty-state"><strong>No SLT handoff conversations yet</strong>Create a local handoff from the customer chatbot to populate this table.</div>';
+      return;
+    }
+    $("#chatsTable").innerHTML=table(["Session","Customer agent","Status","Updated"],state.chats.map(c=>`<tr><td>${esc(c.sessionId)}</td><td>${esc(c.publicAgentKey||c.agentId)}</td><td><span class="status-pill ${c.status==="HANDOFF_REQUESTED"?'waiting':c.status==="CLOSED"?'offline':'online'}">${esc(c.status)}</span></td><td>${new Date(Number(c.updatedAt)*1000).toLocaleString()}</td></tr>`),"No human-assistance chats");
+  }
   function renderTeam(){const w=state.workspace||{},seats=[{title:"Company admin seats",used:w.usedAdminSeats||0,limit:w.adminSeatLimit||0,role:"Full workspace control"},{title:"Live-agent seats",used:w.usedLiveAgentSeats||0,limit:w.liveAgentSeatLimit||0,role:"Human support console"}];$("#seatGrid").innerHTML=`<article class="workspace-summary"><span>${esc(w.plan||"STARTER")} WORKSPACE</span><strong>${esc(w.companyName||"Company")}</strong><small>${esc(w.tenantSlug||w.tenantId||"")}</small></article>`+seats.map(s=>`<article class="seat-card"><div><span>${esc(s.title)}</span><b>${s.used} <i>/ ${s.limit}</i></b></div><div class="seat-bar"><i style="width:${Math.min(100,s.limit?s.used/s.limit*100:0)}%"></i></div><small>${esc(s.role)}</small></article>`).join("");$("#teamTable").innerHTML=table(["Member","Email","Role","Account"],state.team.map(m=>`<tr><td><strong>${esc(m.name)}</strong></td><td>${esc(m.email)}</td><td><span class="type-pill">${esc(String(m.role||"").replace("_"," "))}</span></td><td><span class="status-pill ready">${esc(m.status||"ACTIVE")}</span></td></tr>`),"No workspace members");$("#seatRequestsTable").innerHTML=table(["Request","Admin seats","Live seats","Status"],state.seatRequests.map(r=>`<tr><td>${esc(r.requestId)}</td><td>+${Number(r.adminSeats||0)}</td><td>+${Number(r.liveAgentSeats||0)}</td><td><span class="status-pill waiting">${esc(r.status)}</span></td></tr>`),"No seat requests")}
   function field(label,name,value="",type="text",span=""){return `<div class="field ${span}"><label for="f-${name}">${label}</label><input id="f-${name}" name="${name}" type="${type}" value="${esc(value)}"></div>`}
   function openModal(type,id){modalMode=type;editingId=id||null;let title="",html="";

@@ -549,6 +549,55 @@ app.get("/api/dev/admin/overview", async (req, res) => {
   }
 });
 
+// Read-only Chat Monitor for the fixed SLT local-development tenant.
+// No message contents are returned. This must NOT be deployed as an admin API:
+// proper Cognito authentication and tenant authorization are required first.
+app.get("/api/dev/admin/chats", async (req, res) => {
+  const remote = req.socket.remoteAddress || "";
+  const loopback = ["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(remote);
+  const allowedOrigins = ["http://localhost:8080", "http://127.0.0.1:8080"];
+  if (process.env.NODE_ENV === "production" || !loopback ||
+      (req.headers.origin && !allowedOrigins.includes(req.headers.origin))) {
+    return res.status(404).json({ error: "Not found" });
+  }
+  if (req.query.tenantId !== "slt") {
+    return res.status(400).json({ error: "Only the local SLT test tenant is supported" });
+  }
+
+  try {
+    const sessions: Array<Record<string, any>> = [];
+    let nextKey: Record<string, any> | undefined;
+    do {
+      const response = await docClient.send(new ScanCommand({
+        TableName: "omni-channel-chat-sessions",
+        FilterExpression: "tenantId = :tenant",
+        ExpressionAttributeValues: { ":tenant": "slt" },
+        ExclusiveStartKey: nextKey,
+      }));
+      sessions.push(...((response.Items || []) as Array<Record<string, any>>));
+      nextKey = response.LastEvaluatedKey;
+    } while (nextKey);
+
+    // ISO timestamps sort chronologically; use createdAt if updatedAt is absent.
+    sessions.sort((a, b) => String(b.updatedAt || b.createdAt || "")
+      .localeCompare(String(a.updatedAt || a.createdAt || "")));
+    return res.json({
+      tenantId: "slt", source: "localstack", demoOnly: true,
+      total: sessions.length,
+      items: sessions.slice(0, 100).map(s => ({
+        sessionId: s.sessionId,
+        customerName: s.customerName || "Guest Customer",
+        assignedAgentId: s.assignedAgentId || null,
+        status: s.status || "UNKNOWN",
+        updatedAt: s.updatedAt || s.createdAt || null,
+      })),
+    });
+  } catch (error) {
+    console.error("[LocalAdminChats] LocalStack query failed:", error);
+    return res.status(503).json({ error: "Chat Monitor unavailable; check the handoff DynamoDB table" });
+  }
+});
+
 // TEMPORARY LOCAL MESSAGE API — NOT SUITABLE FOR PRODUCTION.
 // The agent ID is fixed for the SLT demo and there is no Cognito identity here.
 // Keep these endpoints loopback-only until proper customer/agent authorization exists.
