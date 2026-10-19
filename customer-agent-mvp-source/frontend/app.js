@@ -11,7 +11,7 @@
   // Chat messages stay in demo mode until the public message API is implemented.
   const demoMode = !apiBase || localBackendMode;
 
-  const state = { sessionId: null, conversationId: null, tenantId: null, agent: null, sending: false, humanMode: false, pollTimer: null, handoffRequested: false, seenMessageIds: new Set() };
+  const state = { sessionId: null, conversationId: null, tenantId: null, agent: null, sending: false, humanMode: false, pollTimer: null, handoffRequested: false, handoffClosed: false, localAgentId: null, pollErrorShown: false, seenMessageIds: new Set() };
   const el = {
     messages: document.getElementById("messages"), suggestions: document.getElementById("suggestions"),
     composer: document.getElementById("composer"), input: document.getElementById("messageInput"),
@@ -172,7 +172,7 @@
     if (state.handoffRequested) {
       return {
         messageId: makeId(),
-        message: "A human-support request has already been recorded for this local chat. Two-way messaging is not connected yet. Restart the chat to test another request.",
+        message: "A human-support request was already recorded for this chat. Restart the chat to test a new request.",
         status: "completed"
       };
     }
@@ -192,10 +192,45 @@
       throw new Error(result.error?.message || "Could not confirm the handoff request.");
     }
     state.handoffRequested = true;
-    const message = result.status === "HUMAN_ACTIVE" && result.assigned
-      ? `Local handoff request assigned to agent ${result.agentId || "(unknown)"}. The live-agent console and two-way human messaging are NOT connected yet, so this is only a backend assignment test.`
-      : "No live agent was available. A missed handoff was recorded in the local backend. Customer follow-up notifications are not configured yet.";
-    return { messageId: makeId(), message, status: "completed" };
+    if (result.status === "HUMAN_ACTIVE" && result.assigned) {
+      // The local message API currently supports this one fixed development agent.
+      if (result.agentId !== "local-agent-01") {
+        return {
+          messageId: makeId(), status: "completed",
+          message: `Your handoff was assigned to ${result.agentId || "another agent"}, but the local two-way chat preview only supports local-agent-01. Messaging has not been enabled for this session.`
+        };
+      }
+      state.localAgentId = result.agentId;
+      return {
+        messageId: makeId(), status: "delivered_to_human",
+        message: "You're connected to local-agent-01 in the local test environment. Your next messages will go to the human-agent console, and their replies will appear here. This is a demo, not a production support service."
+      };
+    }
+    return {
+      messageId: makeId(), status: "completed",
+      message: "No human agent was available. The local backend recorded a missed handoff; follow-up notifications are not configured."
+    };
+  }
+
+  // TEMPORARY LOCAL-ONLY shared messaging route. Production needs real customer
+  // authentication and separate customer/agent authorization (not agentId in a URL).
+  function localHumanMessagePath() {
+    if (!state.sessionId || state.tenantId !== "slt" || state.localAgentId !== "local-agent-01") {
+      throw new Error("This local human-chat session is not available.");
+    }
+    return `/api/dev/live/conversations/${encodeURIComponent(state.sessionId)}/messages?tenantId=slt&agentId=local-agent-01`;
+  }
+
+  async function sendLocalHumanMessage(text) {
+    if (text.length > 1600) throw new Error("Human-chat messages are limited to 1600 characters in this local demo.");
+    const result = await api(localHumanMessagePath(), {
+      method: "POST", body: JSON.stringify({role: "user", message: text})
+    });
+    if (!result.messageId || result.role !== "user") {
+      throw new Error("The human-chat message was not confirmed by the backend.");
+    }
+    // The customer's bubble is already displayed by sendMessage(); no fake bot reply.
+    return { messageId: result.messageId, status: "human_message_saved" };
   }
 
   async function localBackendReply(text, formSubmission) {
@@ -206,6 +241,11 @@
     if (!["localhost", "127.0.0.1"].includes(backendUrl.hostname)) {
       throw new Error("Local testing requires a localhost backend. Do not use mock credentials on a public server.");
     }
+
+    if (state.handoffClosed) throw new Error("This human conversation is closed. Select Restart to start a new chat.");
+    // Once connected, all customer messages go to the human conversation, not
+    // the intent-based billing/usage/support demo handlers.
+    if (state.humanMode && !formSubmission) return sendLocalHumanMessage(text);
 
     // A request for a person takes precedence over billing or support keywords.
     if (!formSubmission && wantsHumanAgent(text)) return requestLocalHandoff(text);
@@ -261,25 +301,36 @@
 
   function startHumanPolling() {
     state.humanMode = true;
-    if (demoMode || state.pollTimer) return;
+    if ((demoMode && !localBackendMode) || state.pollTimer) return;
+    el.agentStatus.textContent = "Human agent (local demo)";
     pollHumanMessages();
     state.pollTimer = setInterval(pollHumanMessages, 3000);
   }
 
   async function pollHumanMessages() {
-    if (!state.sessionId || demoMode) return;
+    if (!state.sessionId || !state.humanMode || (demoMode && !localBackendMode)) return;
     try {
-      const result = await api(`/v1/public/sessions/${encodeURIComponent(state.sessionId)}/messages`);
+      const result = localBackendMode
+        ? await api(localHumanMessagePath())
+        : await api(`/v1/public/sessions/${encodeURIComponent(state.sessionId)}/messages`);
+      state.pollErrorShown = false;
       (result.messages || []).forEach(message => {
         if (message.role === "live_agent" && !state.seenMessageIds.has(message.messageId)) {
-          addBotMessage({messageId: message.messageId, message: message.text, status: "human_reply"});
+          addBotMessage({ messageId: message.messageId, message: `Human agent: ${message.text}`, status: "human_reply" });
         }
       });
-      if (result.sessionStatus === "CLOSED") {
-        clearInterval(state.pollTimer); state.pollTimer = null; state.humanMode = false;
-        addNotice("handoff-note", "This conversation has been closed by the support agent. You can start a new conversation at any time.");
+      if (result.session?.status === "RESOLVED" || result.sessionStatus === "CLOSED") {
+        clearInterval(state.pollTimer); state.pollTimer = null;
+        state.humanMode = false; state.handoffClosed = true;
+        el.agentStatus.textContent = "Conversation closed";
+        addNotice("handoff-note", "The human agent has closed this conversation. Select Restart to begin another chat.");
       }
-    } catch (_) { /* keep the customer conversation usable during a transient poll failure */ }
+    } catch (error) {
+      if (!state.pollErrorShown) {
+        state.pollErrorShown = true;
+        addNotice("error-note", `Can't retrieve human-agent replies right now: ${error.message || "connection unavailable"}`);
+      }
+    }
   }
 
   async function initialize() {
@@ -307,7 +358,7 @@
       if (localBackendMode) state.conversationId = `conv-${makeId()}`;
       addBotMessage({ message: agent.welcomeMessage, messageId: "welcome", status: "completed" });
       if (localBackendMode) {
-        addNotice("handoff-note", "Local development: specialist replies and human handoff requests call the TypeScript backend. Human messaging is NOT connected; other chat replies are demo-only.");
+        addNotice("handoff-note", "Local development: billing, usage and support use mock backend services. Human handoff and two-way messages use LocalStack. Other replies are demo-only.");
       }
     } catch (error) {
       applyAgent(demoAgent); addNotice("error-note", error.message || "This assistant could not be loaded."); el.agentStatus.textContent = "Temporarily unavailable";
@@ -318,7 +369,7 @@
   el.input.addEventListener("input", resizeInput);
   el.input.addEventListener("keydown", event => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); el.composer.requestSubmit(); } });
   el.restart.addEventListener("click", () => {
-    clearInterval(state.pollTimer); state.pollTimer = null; state.humanMode = false; state.seenMessageIds.clear(); state.sessionId = null; state.conversationId = null; state.tenantId = null; state.handoffRequested = false;
+    clearInterval(state.pollTimer); state.pollTimer = null; state.humanMode = false; state.seenMessageIds.clear(); state.sessionId = null; state.conversationId = null; state.tenantId = null; state.handoffRequested = false; state.handoffClosed = false; state.localAgentId = null; state.pollErrorShown = false;
     [...el.messages.querySelectorAll(".message-row,.handoff-note,.error-note")].forEach(x => x.remove()); initialize();
   });
   initialize();
