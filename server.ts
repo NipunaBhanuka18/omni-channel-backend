@@ -720,6 +720,170 @@ app.post("/api/dev/admin/agents", async (req, res) => {
   }
 });
 
+// LOCAL DEMO ONLY: retrieve an agent's stored configuration for inspection/editing.
+// Never expose these local administration routes on a publicly reachable backend.
+app.get("/api/dev/admin/agents/:agentId", async (req, res) => {
+  const remote = req.socket.remoteAddress || "";
+  const loopback = ["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(remote);
+  const origin = req.headers.origin;
+  if (process.env.NODE_ENV === "production" || process.env.IS_LOCAL === "false" || !loopback ||
+      (origin && origin !== "http://localhost:8080" && origin !== "http://127.0.0.1:8080")) {
+    return res.status(404).json({ error: "Not found" });
+  }
+  if (req.query.tenantId !== "slt" ||
+      !/^(?:main-agent|agent-[a-zA-Z0-9-]{1,80})$/.test(req.params.agentId)) {
+    return res.status(400).json({ error: "Invalid local tenant or agent ID" });
+  }
+  try {
+    const result = await docClient.send(new GetCommand({
+      TableName: "omni-channel-agents",
+      Key: { tenantId: "slt", agentId: req.params.agentId },
+    }));
+    if (!result.Item) return res.status(404).json({ error: "Agent not found" });
+    const agent = result.Item;
+    return res.json({
+      source: "localstack", tenantId: "slt", demoOnly: true,
+      item: {
+        agentId: agent.agentId,
+        displayName: agent.displayName || agent.name || agent.agentId,
+        brandName: agent.brandName || "",
+        modelId: agent.modelId || agent.defaultModel || "",
+        publicAgentKey: agent.publicAgentKey || "",
+        status: String(agent.status || "UNKNOWN").toUpperCase(),
+        welcomeMessage: agent.welcomeMessage || "",
+        systemPrompt: agent.systemPrompt || "",
+        knowledgeBaseRef: agent.knowledgeBaseRef || "",
+        suggestedPrompts: agent.suggestedPrompts || [],
+        toolIds: agent.toolIds || [],
+        enabledSubAgents: agent.enabledSubAgents || [],
+        deploymentStatus: agent.deploymentStatus || "NOT_DEPLOYED",
+        updatedAt: agent.updatedAt || null,
+      },
+    });
+  } catch (error) {
+    console.error("[LocalAdminAgentDetail] Failed:", error);
+    return res.status(503).json({ error: "Agent details unavailable; check LocalStack" });
+  }
+});
+
+// LOCAL DEMO ONLY: edit approved configuration fields on a DRAFT agent record.
+// A loopback/header gate is not authentication. Real admin writes require Cognito.
+app.patch("/api/dev/admin/agents/:agentId", async (req, res) => {
+  const remote = req.socket.remoteAddress || "";
+  const loopback = ["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(remote);
+  const origin = req.headers.origin;
+  const allowedOrigin = origin === "http://localhost:8080" || origin === "http://127.0.0.1:8080";
+  if (process.env.NODE_ENV === "production" || process.env.IS_LOCAL === "false" ||
+      process.env.ENABLE_LOCAL_AGENT_EDITING !== "true" || !loopback || !allowedOrigin ||
+      req.headers["x-local-admin-demo"] !== "edit-agent" || !req.is("application/json")) {
+    return res.status(404).json({ error: "Local draft editing unavailable" });
+  }
+  const agentId = req.params.agentId;
+  if (!/^agent-[a-zA-Z0-9-]{1,80}$/.test(agentId)) {
+    return res.status(400).json({ error: "Only local demo agent IDs can be edited" });
+  }
+  const payload: Record<string, unknown> =
+    req.body && typeof req.body === "object" && !Array.isArray(req.body) ? req.body : {};
+  const allowedFields = new Set([
+    "displayName", "brandName", "modelId", "publicAgentKey", "welcomeMessage",
+    "systemPrompt", "knowledgeBaseRef", "suggestedPrompts", "toolIds", "enabledSubAgents",
+  ]);
+  const keys = Object.keys(payload);
+  if (!keys.length || keys.some(key => !allowedFields.has(key))) {
+    return res.status(400).json({ error: "Specify only editable agent configuration fields" });
+  }
+  const maxLengths: Record<string, number> = {
+    displayName: 100, brandName: 100, modelId: 180, publicAgentKey: 63,
+    welcomeMessage: 1000, systemPrompt: 8000, knowledgeBaseRef: 160,
+  };
+  const changes: Record<string, string | string[]> = {};
+  for (const key of keys) {
+    const value = payload[key];
+    if (Object.prototype.hasOwnProperty.call(maxLengths, key)) {
+      if (typeof value !== "string" || value.trim().length > maxLengths[key]) {
+        return res.status(400).json({ error: `Invalid ${key}` });
+      }
+      const cleaned = value.trim();
+      if ((key === "displayName" || key === "modelId") && !cleaned) {
+        return res.status(400).json({ error: `${key} cannot be empty` });
+      }
+      if (key === "publicAgentKey" && cleaned &&
+          (!/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(cleaned) || cleaned === "support")) {
+        return res.status(400).json({ error: "Invalid or reserved public URL key" });
+      }
+      changes[key] = cleaned;
+    } else {
+      const maxItems = key === "toolIds" ? 25 : key === "suggestedPrompts" ? 15 : 10;
+      if (!Array.isArray(value) || value.length > maxItems ||
+          !value.every(item => typeof item === "string" && item.trim().length > 0 && item.length <= 150)) {
+        return res.status(400).json({ error: `Invalid ${key} list` });
+      }
+      const cleaned = value.map(item => (item as string).trim());
+      if (new Set(cleaned).size !== cleaned.length ||
+          (key === "enabledSubAgents" &&
+            !cleaned.every(item => ["general", "sales", "billing", "technical", "lead"].includes(item)))) {
+        return res.status(400).json({ error: `Invalid or duplicate ${key} values` });
+      }
+      changes[key] = cleaned;
+    }
+  }
+  try {
+    const key = { tenantId: "slt", agentId };
+    const existing = await docClient.send(new GetCommand({ TableName: "omni-channel-agents", Key: key }));
+    if (!existing.Item) return res.status(404).json({ error: "Agent not found" });
+    if (String(existing.Item.status).toUpperCase() !== "DRAFT") {
+      return res.status(409).json({ error: "Only draft agent records can be edited" });
+    }
+    if (typeof changes.publicAgentKey === "string" && changes.publicAgentKey) {
+      let lastKey: Record<string, any> | undefined;
+      do {
+        const page = await docClient.send(new QueryCommand({
+          TableName: "omni-channel-agents",
+          KeyConditionExpression: "tenantId = :tenant",
+          ExpressionAttributeValues: { ":tenant": "slt" },
+          ExclusiveStartKey: lastKey,
+        }));
+        if ((page.Items || []).some(other =>
+          other.agentId !== agentId && other.publicAgentKey === changes.publicAgentKey)) {
+          return res.status(409).json({ error: "Public URL key is already used by another agent" });
+        }
+        lastKey = page.LastEvaluatedKey;
+      } while (lastKey);
+    }
+    // Only update permitted fields; never accept caller-supplied tenant, ID or status.
+    if (typeof changes.displayName === "string") changes.name = changes.displayName;
+    if (typeof changes.modelId === "string") changes.defaultModel = changes.modelId;
+    changes.updatedAt = new Date().toISOString();
+    const names: Record<string, string> = { "#status": "status" };
+    const values: Record<string, unknown> = { ":draft": "draft", ":draftUpper": "DRAFT" };
+    const setters = Object.entries(changes).map(([field, value], index) => {
+      names[`#f${index}`] = field;
+      values[`:v${index}`] = value;
+      return `#f${index} = :v${index}`;
+    });
+    const result = await docClient.send(new UpdateCommand({
+      TableName: "omni-channel-agents", Key: key,
+      UpdateExpression: `SET ${setters.join(", ")}`,
+      ConditionExpression: "attribute_exists(agentId) AND (#status = :draft OR #status = :draftUpper)",
+      ExpressionAttributeNames: names,
+      ExpressionAttributeValues: values,
+      ReturnValues: "ALL_NEW",
+    }));
+    const updated = result.Attributes || {};
+    return res.json({
+      source: "localstack", tenantId: "slt", demoOnly: true,
+      agentId, status: "DRAFT", updatedAt: updated.updatedAt,
+      updatedFields: keys,
+    });
+  } catch (error: any) {
+    if (error?.name === "ConditionalCheckFailedException") {
+      return res.status(409).json({ error: "Agent changed or is no longer a draft; refresh and retry" });
+    }
+    console.error("[LocalAdminAgentEdit] Failed:", error);
+    return res.status(503).json({ error: "Could not update agent in LocalStack" });
+  }
+});
+
 // LOCAL DEMO ONLY: publishing here makes a stored configuration accessible via
 // the existing mock-backed chat UI. It does NOT deploy an AI agent or expose a
 // public internet URL. Production requires real admin authentication and hosting.
