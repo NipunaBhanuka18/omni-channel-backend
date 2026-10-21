@@ -1018,6 +1018,61 @@ app.post("/api/dev/admin/agents/:agentId/publish", async (req, res) => {
   }
 });
 
+// LOCAL DEMO ONLY: unpublish a NOT_DEPLOYED agent without deleting its record.
+// New chat links for this public URL key stop resolving once the status changes.
+// This does NOT revoke already-active sessions or perform Bedrock undeployment.
+app.post("/api/dev/admin/agents/:agentId/unpublish", async (req, res) => {
+  const remote = req.socket.remoteAddress || "";
+  const loopback = ["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(remote);
+  const origin = req.headers.origin;
+  const allowedOrigin = origin === "http://localhost:8080" || origin === "http://127.0.0.1:8080";
+  if (process.env.NODE_ENV === "production" || process.env.IS_LOCAL === "false" ||
+      process.env.ENABLE_LOCAL_AGENT_UNPUBLISHING !== "true" || !loopback || !allowedOrigin ||
+      req.headers["x-local-admin-demo"] !== "unpublish-agent" || !req.is("application/json")) {
+    return res.status(404).json({ error: "Local unpublishing unavailable" });
+  }
+  if (req.query.tenantId !== "slt") {
+    return res.status(400).json({ error: "Only the SLT local test tenant is supported" });
+  }
+  const agentId = req.params.agentId;
+  if (!/^agent-[a-zA-Z0-9-]{1,80}$/.test(agentId) ||
+      req.headers["x-confirm-unpublish-agent"] !== agentId) {
+    return res.status(400).json({ error: "Confirm the exact local agent ID to unpublish" });
+  }
+  const key = { tenantId: "slt", agentId };
+  try {
+    const result = await docClient.send(new GetCommand({ TableName: "omni-channel-agents", Key: key }));
+    if (!result.Item) return res.status(404).json({ error: "Agent not found" });
+    if (String(result.Item.status).toUpperCase() !== "PUBLISHED") {
+      return res.status(409).json({ error: "Only published agents can be unpublished" });
+    }
+    if (result.Item.deploymentStatus !== "NOT_DEPLOYED") {
+      return res.status(409).json({ error: "Deployed agents require a separate undeployment workflow" });
+    }
+    const now = new Date().toISOString();
+    await docClient.send(new UpdateCommand({
+      TableName: "omni-channel-agents", Key: key,
+      UpdateExpression: "SET #status = :draft, updatedAt = :now REMOVE publishedAt",
+      ConditionExpression: "attribute_exists(agentId) AND #status = :published AND deploymentStatus = :notDeployed",
+      ExpressionAttributeNames: { "#status": "status" },
+      ExpressionAttributeValues: {
+        ":draft": "DRAFT", ":published": "PUBLISHED",
+        ":notDeployed": "NOT_DEPLOYED", ":now": now,
+      },
+    }));
+    return res.json({
+      tenantId: "slt", agentId, status: "DRAFT", demoOnly: true,
+      deploymentStatus: "NOT_DEPLOYED", publicLinkActive: false, updatedAt: now,
+    });
+  } catch (error: any) {
+    if (error?.name === "ConditionalCheckFailedException") {
+      return res.status(409).json({ error: "Agent was changed or is no longer an undeployed published agent" });
+    }
+    console.error("[LocalAgentUnpublish] Failed:", error);
+    return res.status(503).json({ error: "Local unpublishing unavailable; check DynamoDB" });
+  }
+});
+
 // Read-only S3 source file inventory for the local SLT admin preview.
 // An S3 object is NOT proof of a Bedrock Knowledge Base registration or successful indexing.
 // This endpoint has no Cognito authorization and must not be deployed publicly.
