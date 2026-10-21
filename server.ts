@@ -12,7 +12,7 @@ import { ListObjectsV2Command } from "@aws-sdk/client-s3";
 import { inMemoryTenants, inMemoryAgents, provisionTenantResources } from "./scripts/create-tenants-table";
 import { TenantContext } from "./shared/types/tenant-context";
 import { docClient } from "./agents/utils/dynamo-client";
-import { ScanCommand, QueryCommand, GetCommand, UpdateCommand } from "@aws-sdk/lib-dynamodb";
+import { ScanCommand, QueryCommand, GetCommand, UpdateCommand, DeleteCommand } from "@aws-sdk/lib-dynamodb";
 import { randomUUID } from "crypto";
 
 // Enable mock authorization for local development environment
@@ -881,6 +881,67 @@ app.patch("/api/dev/admin/agents/:agentId", async (req, res) => {
     }
     console.error("[LocalAdminAgentEdit] Failed:", error);
     return res.status(503).json({ error: "Could not update agent in LocalStack" });
+  }
+});
+
+// LOCAL DEMO ONLY: delete disposable DRAFT agent records, never published agents.
+// This is not authenticated administration. Keep disabled outside a loopback demo.
+// DELETE is irreversible: this action removes the stored configuration, not an AI deployment.
+app.delete("/api/dev/admin/agents/:agentId", async (req, res) => {
+  const remote = req.socket.remoteAddress || "";
+  const loopback = ["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(remote);
+  const origin = req.headers.origin;
+  const allowedOrigin = origin === "http://localhost:8080" || origin === "http://127.0.0.1:8080";
+  if (process.env.NODE_ENV === "production" || process.env.IS_LOCAL === "false" ||
+      process.env.ENABLE_LOCAL_AGENT_DELETION !== "true" || !loopback || !allowedOrigin ||
+      req.headers["x-local-admin-demo"] !== "delete-draft-agent") {
+    return res.status(404).json({ error: "Local draft deletion unavailable" });
+  }
+  if (req.query.tenantId !== "slt") {
+    return res.status(400).json({ error: "Only the SLT local test tenant is supported" });
+  }
+  const agentId = req.params.agentId;
+  if (!/^agent-[a-zA-Z0-9-]{1,80}$/.test(agentId) || agentId === "main-agent") {
+    return res.status(400).json({ error: "Only disposable local draft agent IDs can be deleted" });
+  }
+  // Require an explicit matching confirmation header to reduce accidental deletes.
+  if (req.headers["x-confirm-delete-agent"] !== agentId) {
+    return res.status(400).json({ error: "Confirm the exact agent ID to delete" });
+  }
+
+  const key = { tenantId: "slt", agentId };
+  try {
+    const existing = await docClient.send(new GetCommand({
+      TableName: "omni-channel-agents", Key: key,
+    }));
+    if (!existing.Item) return res.status(404).json({ error: "Agent not found" });
+    if (String(existing.Item.status).toUpperCase() !== "DRAFT" ||
+        ![undefined, "NOT_DEPLOYED"].includes(existing.Item.deploymentStatus)) {
+      return res.status(409).json({ error: "Only non-deployed DRAFT agents can be deleted" });
+    }
+
+    // Atomic status check protects against publication between the read and delete.
+    await docClient.send(new DeleteCommand({
+      TableName: "omni-channel-agents", Key: key,
+      ConditionExpression:
+        "attribute_exists(tenantId) AND attribute_exists(agentId) " +
+        "AND (#status = :draft OR #status = :draftLower) " +
+        "AND (attribute_not_exists(deploymentStatus) OR deploymentStatus = :notDeployed)",
+      ExpressionAttributeNames: { "#status": "status" },
+      ExpressionAttributeValues: {
+        ":draft": "DRAFT", ":draftLower": "draft", ":notDeployed": "NOT_DEPLOYED",
+      },
+    }));
+    return res.json({
+      source: "localstack", tenantId: "slt", demoOnly: true,
+      deleted: true, agentId, previousStatus: "DRAFT",
+    });
+  } catch (error: any) {
+    if (error?.name === "ConditionalCheckFailedException") {
+      return res.status(409).json({ error: "Agent changed or is no longer a non-deployed draft" });
+    }
+    console.error("[LocalAdminDraftDelete] Failed:", error);
+    return res.status(503).json({ error: "Could not delete draft agent from LocalStack" });
   }
 });
 
