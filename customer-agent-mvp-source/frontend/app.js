@@ -36,7 +36,7 @@
   async function api(path, options) {
     const response = await fetch(apiBase + path, { ...(options || {}), headers: { "Content-Type": "application/json", ...((options && options.headers) || {}) } });
     const data = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(data.message || "The assistant is temporarily unavailable.");
+    if (!response.ok) throw new Error(data.error?.message || data.error || data.message || "The assistant is temporarily unavailable.");
     return data;
   }
 
@@ -339,8 +339,8 @@
     try {
       let agent;
       if (localBackendMode) {
-        const company = encodeURIComponent(config.companySlug || "slt");
-        const agentSlug = encodeURIComponent(config.agentSlug || "support");
+        const company = encodeURIComponent(params.get("company") || config.companySlug || "slt");
+        const agentSlug = encodeURIComponent(params.get("agent") || config.agentSlug || "support");
         const result = await api(`/api/resolve-chat-url?company=${company}&agent=${agentSlug}`);
         if (!result.success || !result.tenantId) throw new Error("Backend did not provide an agent configuration.");
         state.tenantId = result.tenantId;
@@ -349,6 +349,7 @@
           displayName: result.agentName || demoAgent.displayName,
           brandName: result.companyName || demoAgent.brandName,
           welcomeMessage: result.welcomeMessage || demoAgent.welcomeMessage,
+          suggestedPrompts: Array.isArray(result.suggestedPrompts) ? result.suggestedPrompts : demoAgent.suggestedPrompts,
           theme: { ...demoAgent.theme, primary: result.themeColor || demoAgent.theme.primary }
         };
       } else {
@@ -359,10 +360,14 @@
       if (localBackendMode) state.conversationId = `conv-${makeId()}`;
       addBotMessage({ message: agent.welcomeMessage, messageId: "welcome", status: "completed" });
       if (localBackendMode) {
-        addNotice("handoff-note", "Local development: billing, usage and support use mock backend services. Human handoff and two-way messages use LocalStack. Other replies are demo-only.");
+        addNotice("handoff-note", "LOCAL DEMO CHAT — Agent name, welcome message and prompts come from the published record. Replies use shared mock/local specialist routes; custom model and system instructions are not deployed. This localhost link is not public on the internet.");
       }
     } catch (error) {
-      applyAgent(demoAgent); addNotice("error-note", error.message || "This assistant could not be loaded."); el.agentStatus.textContent = "Temporarily unavailable";
+      applyAgent(demoAgent);
+      addNotice("error-note", error.message || "This assistant could not be loaded.");
+      el.agentStatus.textContent = "Temporarily unavailable";
+      // Do not allow a missing or unpublished agent URL to silently become a working fake chatbot.
+      el.input.disabled = true; el.send.disabled = true;
     } finally { el.loading.classList.remove("visible"); el.input.focus(); }
   }
 

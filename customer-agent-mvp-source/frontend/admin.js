@@ -23,7 +23,27 @@
   async function request(path,options={}){
     if(localAdminPreview){
       if((options.method||"GET").toUpperCase()!=="GET"){
-        throw new Error("Read-only local preview: admin changes are not connected to the backend.");
+        // Explicitly allow only agent-record creation in the restricted local demo.
+        if(path==="/v1/admin/agents" && options.method==="POST"){
+          const response=await fetch(apiBase+"/api/dev/admin/agents",{
+            method:"POST",
+            headers:{"Content-Type":"application/json","X-Local-Admin-Demo":"create-agent"},
+            body:options.body
+          });
+          const body=await response.json().catch(()=>({}));
+          if(!response.ok)throw new Error(body.error||`Agent creation failed (HTTP ${response.status})`);
+          return body;
+        }
+        const publishMatch = path.match(/^\/v1\/admin\/agents\/(agent-[a-zA-Z0-9-]+)\/publish$/);
+        if(publishMatch && options.method === "POST"){
+          const response=await fetch(apiBase+`/api/dev/admin/agents/${encodeURIComponent(publishMatch[1])}/publish`,{
+            method:"POST",headers:{"Content-Type":"application/json","X-Local-Admin-Demo":"publish-agent"},body:"{}"
+          });
+          const body=await response.json().catch(()=>({}));
+          if(!response.ok)throw new Error(body.error||`Publishing failed (HTTP ${response.status})`);
+          return body;
+        }
+        throw new Error("This admin action is not available in the local preview.");
       }
       if(path==="/v1/admin/dashboard"){
         try {
@@ -115,7 +135,7 @@
   }
   function renderAll(){renderDashboard();renderAgents();renderKnowledge();renderTools();renderLiveAgents();renderChats();renderTeam();if(localAdminPreview)disablePreviewWrites()}
   function disablePreviewWrites(){
-    document.querySelectorAll('#adminApp button[data-open],#adminApp button[data-edit-agent],#adminApp button[data-publish],#adminApp button[data-delete-agent],#adminApp button[data-delete-kb],#adminApp button[data-upload],#adminApp button[data-sync],#adminApp button[data-edit-tool],#adminApp button[data-delete-tool]').forEach(button=>{
+    document.querySelectorAll('#adminApp button[data-open]:not([data-open="agent"]),#adminApp button[data-edit-agent],#adminApp button[data-delete-agent],#adminApp button[data-delete-kb],#adminApp button[data-upload],#adminApp button[data-sync],#adminApp button[data-edit-tool],#adminApp button[data-delete-tool]').forEach(button=>{
       button.disabled=true;
       button.title="Unavailable in read-only local preview";
     });
@@ -131,7 +151,7 @@
     const banner=document.createElement("div");
     banner.setAttribute("role","status");
     banner.style.cssText="margin:18px 22px 0;padding:14px 18px;background:#fff4d8;color:#65420b;border:1px solid #f3dca6;border-radius:12px;line-height:1.5";
-    banner.textContent="LOCAL READ-ONLY PREVIEW — Dashboard, AI Agents and Chat Monitor read SLT records from LocalStack. Knowledge Bases shows SLT S3 SOURCE FILES only (not Bedrock indexing). Tools and team still show SAMPLE DATA. No Cognito login or admin writes are enabled.";
+    banner.textContent="LOCAL DEVELOPMENT PREVIEW — AI agent DRAFT records can be created only when the backend explicitly enables local writes. No Cognito login or agent deployment. Publishing creates a LOCAL DEMO chat link only, not an internet-accessible or Bedrock-deployed chatbot. Other admin writes are disabled. Dashboard, AI Agents and Chat Monitor read SLT records from LocalStack; Knowledge Bases lists S3 source files. Tools and team show sample data.";
     document.querySelector("#adminApp .content").before(banner);
     $("#view-knowledge .page-heading h1").textContent="Knowledge source files (S3)";
     $("#view-knowledge .page-heading p").textContent="SLT source files stored in LocalStack S3. Bedrock knowledge-base registration and indexing are not tracked.";
@@ -162,10 +182,18 @@
         $("#agentsTable").innerHTML='<div class="empty-state"><strong>No SLT agent records</strong>No agents were found in the local DynamoDB table.</div>';
         return;
       }
-      $("#agentsTable").innerHTML=table(["Agent","Public URL","Model","Record status","Actions"],state.agents.map(a=>{
-        const publicUrl=a.publicAgentKey?`/chat.html?agent=${esc(a.publicAgentKey)}`:"Not configured";
-        const active=String(a.status).toUpperCase()==="ACTIVE";
-        return `<tr><td><strong>${esc(a.displayName)}</strong><br><small>${esc(a.agentId)}</small></td><td>${publicUrl}</td><td>${esc(a.modelId||"Not configured")}</td><td><span class="status-pill ${active?"ready":"offline"}">${esc(a.status)}</span></td><td><span class="type-pill">Read-only</span></td></tr>`;
+      $("#agentsTable").innerHTML=table(["Agent","Local chat link","Model","Record status","Actions"],state.agents.map(a=>{
+        const status=String(a.status||"").toUpperCase();
+        const published=status==="PUBLISHED" && !!a.publicAgentKey;
+        const key=encodeURIComponent(a.publicAgentKey||"");
+        const publicUrl=published?`<small>/chat.html?company=slt&amp;agent=${esc(key)}</small>`:
+          status==="DRAFT"?"Reserved only (not published)":"Not configured";
+        const actions=published
+          ? `<button class="small-btn" data-copy-chat="${esc(a.publicAgentKey)}">Copy local link</button><button class="small-btn" data-open-chat="${esc(a.publicAgentKey)}">Open chat</button>`
+          : status==="DRAFT" && a.publicAgentKey
+            ? `<button class="small-btn" data-publish="${esc(a.agentId)}">Publish local demo</button>`
+            : '<span class="type-pill">No publishing action</span>';
+        return `<tr><td><strong>${esc(a.displayName)}</strong><br><small>${esc(a.agentId)}</small></td><td>${publicUrl}</td><td>${esc(a.modelId||"Not configured")}</td><td><span class="status-pill ${published||status==="ACTIVE"?"ready":"offline"}">${esc(status)}</span></td><td><div class="row-actions">${actions}</div></td></tr>`;
       }),"No SLT agent records");
       return;
     }
@@ -223,6 +251,9 @@
     if(type==="liveAgent"){title="Invite live agent";html=`<div class="form-grid">${field("Full name","name")}${field("Email address","email","","email")}</div>`}
     if(type==="member"){title="Invite workspace member";html=`<div class="form-grid">${field("Full name","name")}${field("Work email","email","","email")}<div class="field full-span"><label>Role</label><select name="role"><option value="LIVE_AGENT">Live agent</option><option value="COMPANY_ADMIN">Company admin</option></select></div></div>`}
     if(type==="seatRequest"){title="Request additional seats";html=`<div class="form-grid">${field("Additional admin seats","adminSeats","0","number")}${field("Additional live-agent seats","liveAgentSeats","1","number")}<div class="field full-span"><label>Business reason</label><textarea name="reason" placeholder="Expected team growth, support volume, or rollout date"></textarea></div></div>`}
+    if(localAdminPreview && type==="agent" && !id){
+      html='<p role="status">Local demo: this form saves a DRAFT record to LocalStack only. It does not deploy a Bedrock agent, publish a chat URL, or activate tools.</p>'+html;
+    }
     $("#modalTitle").textContent=title;$("#modalBody").innerHTML=html;$("#modalBackdrop").classList.remove("hidden");
   }
   function closeModal(){$("#modalBackdrop").classList.add("hidden");modalMode=null;editingId=null}
@@ -237,7 +268,20 @@
   }catch(e){toast(e.message,true)}}
   async function action(target){try{
     if(target.dataset.editAgent)return openModal("agent",target.dataset.editAgent);if(target.dataset.editTool)return openModal("tool",target.dataset.editTool);
-    if(target.dataset.publish){await request(`/v1/admin/agents/${target.dataset.publish}/publish`,{method:"POST",body:"{}"});await loadAll();return toast("Agent published")}
+    if(target.dataset.copyChat || target.dataset.openChat){
+      if(!localAdminPreview)throw new Error("Only local-demo links are available here.");
+      const key=target.dataset.copyChat || target.dataset.openChat;
+      const row=state.agents.find(a=>a.publicAgentKey===key && String(a.status).toUpperCase()==="PUBLISHED");
+      if(!row)throw new Error("This agent is not published.");
+      const url=new URL(`/chat.html?company=slt&agent=${encodeURIComponent(key)}`,window.location.origin).href;
+      if(target.dataset.openChat){window.open(url,"_blank","noopener,noreferrer");return;}
+      await navigator.clipboard.writeText(url);return toast("Local demo link copied (works on this laptop only)");
+    }
+    if(target.dataset.publish){
+      if(localAdminPreview && !confirm("Publish this agent configuration for LOCAL demo chat only? This does not deploy a Bedrock agent or provide a public internet URL."))return;
+      await request(`/v1/admin/agents/${target.dataset.publish}/publish`,{method:"POST",body:"{}"});
+      await loadAll();return toast(localAdminPreview?"Local demo chatbot enabled — use Copy local link":"Agent published");
+    }
     const deletions=[["deleteAgent","agents"],["deleteKb","knowledge-bases"],["deleteTool","tools"]];for(const [key,path] of deletions)if(target.dataset[key]){if(confirm("Delete this item?")){await request(`/v1/admin/${path}/${target.dataset[key]}`,{method:"DELETE"});await loadAll();toast("Deleted")};return}
     if(target.dataset.sync){await request(`/v1/admin/knowledge-bases/${target.dataset.sync}/sync`,{method:"POST",body:"{}"});return toast("Knowledge sync started")}
     if(target.dataset.upload){const input=document.createElement("input");input.type="file";input.accept=".pdf,.docx,.txt,.md,.csv,.html";input.onchange=async()=>{const file=input.files[0];if(!file)return;const result=await request(`/v1/admin/knowledge-bases/${target.dataset.upload}/upload-url`,{method:"POST",body:JSON.stringify({filename:file.name,contentType:file.type||"application/octet-stream"})});if(result.uploadUrl!=="demo"){const put=await fetch(result.uploadUrl,{method:"PUT",headers:{"Content-Type":file.type||"application/octet-stream"},body:file});if(!put.ok)throw new Error("Upload failed")}toast("File uploaded. Select Sync when ready.")};input.click()}

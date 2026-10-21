@@ -648,6 +648,151 @@ app.get("/api/dev/admin/agents", async (req, res) => {
   }
 });
 
+// Explicitly opt-in to creating DRAFT agent records for the fixed SLT local demo.
+// SECURITY: This is intentionally NOT a production admin API. Localhost alone is
+// not authentication; remove/replace this route with Cognito authorization before deploy.
+app.post("/api/dev/admin/agents", async (req, res) => {
+  const remote = req.socket.remoteAddress || "";
+  const loopback = ["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(remote);
+  const origin = req.headers.origin;
+  const validOrigin = origin === "http://localhost:8080" || origin === "http://127.0.0.1:8080";
+  if (process.env.NODE_ENV === "production" || process.env.IS_LOCAL === "false" ||
+      process.env.ENABLE_LOCAL_AGENT_CREATION !== "true" || !loopback || !validOrigin ||
+      req.headers["x-local-admin-demo"] !== "create-agent" ||
+      !req.is("application/json")) {
+    return res.status(404).json({ error: "Local agent record creation is disabled or request not allowed" });
+  }
+
+  const body: Record<string, unknown> = req.body && typeof req.body === "object" && !Array.isArray(req.body)
+    ? req.body : {};
+  if (body.tenantId !== undefined && body.tenantId !== "slt") {
+    return res.status(400).json({ error: "Only tenant slt can be used in this local demo" });
+  }
+  const trimmed = (name: string) => typeof body[name] === "string" ? (body[name] as string).trim() : "";
+  const displayName = trimmed("displayName");
+  const brandName = trimmed("brandName");
+  const publicAgentKey = trimmed("publicAgentKey");
+  const modelId = trimmed("modelId");
+  const welcomeMessage = trimmed("welcomeMessage");
+  const systemPrompt = trimmed("systemPrompt");
+  const knowledgeBaseRef = trimmed("knowledgeBaseRef");
+  if (!displayName || displayName.length > 100 || !modelId || modelId.length > 180 ||
+      brandName.length > 100 || welcomeMessage.length > 1000 ||
+      systemPrompt.length > 8000 || knowledgeBaseRef.length > 160 ||
+      (publicAgentKey && !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(publicAgentKey))) {
+    return res.status(400).json({ error: "Invalid agent name, model ID, URL key or configuration field length" });
+  }
+  const stringArray = (name: string, max: number) =>
+    Array.isArray(body[name]) && (body[name] as unknown[]).length <= max &&
+    (body[name] as unknown[]).every(x => typeof x === "string" && x.length <= 150)
+      ? body[name] as string[] : null;
+  const toolIds = stringArray("toolIds", 25);
+  const enabledSubAgents = stringArray("enabledSubAgents", 10);
+  const suggestedPrompts = stringArray("suggestedPrompts", 15);
+  const supportedSpecialists = new Set(["general", "sales", "billing", "technical", "lead"]);
+  if (!toolIds || !enabledSubAgents || !suggestedPrompts ||
+      !enabledSubAgents.every(x => supportedSpecialists.has(x))) {
+    return res.status(400).json({ error: "Invalid agent list configuration" });
+  }
+
+  const agentId = `agent-${randomUUID()}`;
+  const createdAt = new Date().toISOString();
+  const item = {
+    tenantId: "slt", agentId, name: displayName, displayName, brandName,
+    modelId, defaultModel: modelId, publicAgentKey,
+    status: "draft", createdAt, updatedAt: createdAt,
+    welcomeMessage, systemPrompt, knowledgeBaseRef,
+    suggestedPrompts, toolIds, enabledSubAgents,
+    // Configuration is metadata until the runtime/publishing integration is implemented.
+    deploymentStatus: "NOT_DEPLOYED",
+  };
+  try {
+    const { PutCommand } = await import("@aws-sdk/lib-dynamodb");
+    await docClient.send(new PutCommand({
+      TableName: "omni-channel-agents",
+      Item: item,
+      ConditionExpression: "attribute_not_exists(tenantId) AND attribute_not_exists(agentId)",
+    }));
+    return res.status(201).json({ source: "localstack", tenantId: "slt", demoOnly: true, item });
+  } catch (error) {
+    console.error("[LocalAdminAgents] Could not create DRAFT agent record:", error);
+    return res.status(503).json({ error: "Could not save agent record to LocalStack DynamoDB" });
+  }
+});
+
+// LOCAL DEMO ONLY: publishing here makes a stored configuration accessible via
+// the existing mock-backed chat UI. It does NOT deploy an AI agent or expose a
+// public internet URL. Production requires real admin authentication and hosting.
+app.post("/api/dev/admin/agents/:agentId/publish", async (req, res) => {
+  const remote = req.socket.remoteAddress || "";
+  const loopback = ["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(remote);
+  const origin = req.headers.origin;
+  const validOrigin = origin === "http://localhost:8080" || origin === "http://127.0.0.1:8080";
+  if (process.env.NODE_ENV === "production" || process.env.IS_LOCAL === "false" ||
+      process.env.ENABLE_LOCAL_AGENT_PUBLISHING !== "true" || !loopback || !validOrigin ||
+      req.headers["x-local-admin-demo"] !== "publish-agent" || !req.is("application/json")) {
+    return res.status(404).json({ error: "Local publishing is not enabled" });
+  }
+  const agentId = req.params.agentId;
+  if (!/^agent-[a-zA-Z0-9-]{1,80}$/.test(agentId)) {
+    return res.status(400).json({ error: "Invalid draft agent ID" });
+  }
+  try {
+    const record = await docClient.send(new GetCommand({
+      TableName: "omni-channel-agents", Key: { tenantId: "slt", agentId },
+    }));
+    const agent = record.Item;
+    if (!agent) return res.status(404).json({ error: "Draft agent not found" });
+    if (String(agent.status).toLowerCase() !== "draft") {
+      return res.status(409).json({ error: "Only draft agents can be published in this demo" });
+    }
+    const publicKey = typeof agent.publicAgentKey === "string" ? agent.publicAgentKey.trim() : "";
+    if (!/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(publicKey) || publicKey === "support") {
+      return res.status(400).json({ error: "Set a valid unique public URL key (not 'support') before publishing" });
+    }
+
+    // Reject duplicate slugs for this tenant. The production model should
+    // enforce slug uniqueness atomically with a separate slug-lock item.
+    let lastKey: Record<string, any> | undefined;
+    do {
+      const page = await docClient.send(new QueryCommand({
+        TableName: "omni-channel-agents",
+        KeyConditionExpression: "tenantId = :tenant",
+        ExpressionAttributeValues: { ":tenant": "slt" },
+        ExclusiveStartKey: lastKey,
+      }));
+      if ((page.Items || []).some(other =>
+        other.agentId !== agentId && other.publicAgentKey === publicKey)) {
+        return res.status(409).json({ error: "This public URL key is already reserved by another agent" });
+      }
+      lastKey = page.LastEvaluatedKey;
+    } while (lastKey);
+
+    const now = new Date().toISOString();
+    await docClient.send(new UpdateCommand({
+      TableName: "omni-channel-agents", Key: { tenantId: "slt", agentId },
+      UpdateExpression: "SET #status = :published, publishedAt = :now, updatedAt = :now",
+      ConditionExpression: "attribute_exists(agentId) AND (#status = :draft OR #status = :draftUpper) AND publicAgentKey = :publicKey",
+      ExpressionAttributeNames: { "#status": "status" },
+      ExpressionAttributeValues: {
+        ":published": "PUBLISHED", ":draft": "draft", ":draftUpper": "DRAFT",
+        ":publicKey": publicKey, ":now": now,
+      },
+    }));
+    return res.json({
+      tenantId: "slt", agentId, status: "PUBLISHED", demoOnly: true,
+      publicPath: `/chat.html?company=slt&agent=${encodeURIComponent(publicKey)}`,
+      deploymentStatus: "NOT_DEPLOYED",
+    });
+  } catch (error: any) {
+    if (error?.name === "ConditionalCheckFailedException") {
+      return res.status(409).json({ error: "Agent was modified or already published. Refresh and retry." });
+    }
+    console.error("[LocalAgentPublish] Failed:", error);
+    return res.status(503).json({ error: "Local publication unavailable; check DynamoDB" });
+  }
+});
+
 // Read-only S3 source file inventory for the local SLT admin preview.
 // An S3 object is NOT proof of a Bedrock Knowledge Base registration or successful indexing.
 // This endpoint has no Cognito authorization and must not be deployed publicly.
@@ -882,25 +1027,62 @@ app.get("/api/workspace/conversations", (req, res) => {
 // ==========================================
 
 // GET /api/resolve-chat-url?company={slug}&agent={agent}
-app.get(["/api/resolve-chat-url", "/resolve-chat-url"], (req, res) => {
-  const companySlug = (req.query.company as string) || "slt";
-  const agentSlug = (req.query.agent as string) || "support";
+app.get(["/api/resolve-chat-url", "/resolve-chat-url"], async (req, res) => {
+  const remote = req.socket.remoteAddress || "";
+  const loopback = ["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(remote);
+  if (process.env.NODE_ENV === "production" || process.env.IS_LOCAL === "false" || !loopback) {
+    return res.status(404).json({ error: "Local chat resolver is unavailable" });
+  }
+  const companySlug = typeof req.query.company === "string" ? req.query.company : "slt";
+  const agentSlug = typeof req.query.agent === "string" ? req.query.agent : "support";
+  if (companySlug !== "slt" || !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(agentSlug)) {
+    return res.status(404).json({ error: "Chatbot not found" });
+  }
 
-  const tenant = inMemoryTenants.get(companySlug) || inMemoryTenants.get(`tenant-${companySlug}`) || {
-    tenantId: companySlug,
-    companyName: companySlug.toUpperCase(),
-    config: { themeColor: "#005EB8" },
-  };
+  // Preserve the original SLT support chatbot for the existing demonstration.
+  if (agentSlug === "support") {
+    const tenant = inMemoryTenants.get("slt");
+    const companyName = tenant?.companyName || "Sri Lanka Telecom";
+    return res.json({
+      success: true, demoOnly: true, tenantId: "slt", companyName,
+      agentId: "agent-slt-support-01", agentName: `${companyName} Assistant`,
+      welcomeMessage: `Welcome to ${companyName}! How can we assist you today?`,
+      themeColor: tenant?.config?.themeColor || "#005EB8",
+      suggestedPrompts: ["Check my bill", "Check my usage", "Slow internet", "Talk to a person"],
+    });
+  }
 
-  return res.json({
-    success: true,
-    tenantId: tenant.tenantId,
-    companyName: tenant.companyName,
-    agentId: `agent-${companySlug}-${agentSlug}-01`,
-    agentName: `${tenant.companyName} Assistant`,
-    welcomeMessage: `Welcome to ${tenant.companyName}! How can we assist you today?`,
-    themeColor: tenant.config?.themeColor || "#005EB8",
-  });
+  try {
+    const records: Array<Record<string, any>> = [];
+    let nextKey: Record<string, any> | undefined;
+    do {
+      const page = await docClient.send(new QueryCommand({
+        TableName: "omni-channel-agents",
+        KeyConditionExpression: "tenantId = :tenant",
+        ExpressionAttributeValues: { ":tenant": "slt" },
+        ExclusiveStartKey: nextKey,
+      }));
+      records.push(...((page.Items || []) as Array<Record<string, any>>));
+      nextKey = page.LastEvaluatedKey;
+    } while (nextKey);
+    const matches = records.filter(agent =>
+      agent.publicAgentKey === agentSlug && String(agent.status).toUpperCase() === "PUBLISHED");
+    if (matches.length !== 1) return res.status(404).json({ error: "This chatbot has not been published" });
+    const agent = matches[0];
+    return res.json({
+      success: true, demoOnly: true, tenantId: "slt",
+      companyName: String(agent.brandName || "Sri Lanka Telecom"),
+      agentId: String(agent.agentId),
+      agentName: String(agent.displayName || agent.name || "Customer Assistant"),
+      welcomeMessage: String(agent.welcomeMessage || "Hello! How can I help you?"),
+      suggestedPrompts: Array.isArray(agent.suggestedPrompts) ? agent.suggestedPrompts : [],
+      themeColor: "#005EB8",
+      deploymentStatus: "NOT_DEPLOYED",
+    });
+  } catch (error) {
+    console.error("[LocalChatResolver] DynamoDB error:", error);
+    return res.status(503).json({ error: "Chatbot configuration unavailable" });
+  }
 });
 
 // ==========================================
