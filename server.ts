@@ -8,7 +8,7 @@ import { adjustActiveChats } from "./services/handoff/presence-manager";
 
 import { registerTenant, handleRegisterTenantRequest } from "./services/onboarding/register-tenant";
 import { s3Client, uploadKbDocument } from "./agents/utils/s3-client";
-import { ListObjectsV2Command } from "@aws-sdk/client-s3";
+import { ListObjectsV2Command, GetObjectCommand } from "@aws-sdk/client-s3";
 import { inMemoryTenants, inMemoryAgents, provisionTenantResources } from "./scripts/create-tenants-table";
 import { TenantContext } from "./shared/types/tenant-context";
 import { docClient } from "./agents/utils/dynamo-client";
@@ -1124,6 +1124,64 @@ app.get("/api/dev/admin/knowledge-files", async (req, res) => {
     }
     console.error("[LocalAdminKnowledge] S3 list failed:", error);
     return res.status(503).json({ error: "Local S3 inventory unavailable" });
+  }
+});
+
+// LOCAL DEMO ONLY: read a single small text document from the fixed SLT tenant.
+// Viewing source S3 content does not mean Bedrock indexing. Production requires
+// real Cognito authorization; localhost, Origin and demo headers are NOT auth.
+app.get("/api/dev/admin/knowledge-files/:documentName", async (req, res) => {
+  const remote = req.socket.remoteAddress || "";
+  const loopback = ["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(remote);
+  const origin = req.headers.origin;
+  const validOrigin = origin === "http://localhost:8080" || origin === "http://127.0.0.1:8080";
+  if (process.env.NODE_ENV === "production" || process.env.IS_LOCAL === "false" ||
+      process.env.ENABLE_LOCAL_KB_VIEWING !== "true" || !loopback || !validOrigin ||
+      req.headers["x-local-admin-demo"] !== "view-kb-document") {
+    return res.status(404).json({ error: "Local KB document viewing unavailable" });
+  }
+  if (req.query.tenantId !== "slt") {
+    return res.status(400).json({ error: "Only local demo tenant slt is supported" });
+  }
+  const documentName = req.params.documentName;
+  if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,79}\.(?:txt|md)$/.test(documentName)) {
+    return res.status(400).json({ error: "Invalid knowledge document filename" });
+  }
+
+  const bucket = process.env.KB_BUCKET_NAME || "omni-channel-kb-docs";
+  const key = `tenants/slt/${documentName}`;
+  const maxBytes = 32 * 1024;
+  try {
+    const object = await s3Client.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+    if (!object.Body) {
+      return res.status(503).json({ error: "Document content unavailable" });
+    }
+    const chunks: Buffer[] = [];
+    let bytes = 0;
+    // Limit bytes while streaming; don't trust S3 ContentLength or download
+    // an unbounded object into memory simply to display a preview.
+    const stream = object.Body as import("stream").Readable;
+    for await (const part of stream) {
+      const chunk = Buffer.isBuffer(part) ? part : Buffer.from(part);
+      bytes += chunk.length;
+      if (bytes > maxBytes) {
+        return res.status(413).json({ error: "Document exceeds the 32 KB local preview limit" });
+      }
+      chunks.push(chunk);
+    }
+    const content = Buffer.concat(chunks).toString("utf8");
+    return res.json({
+      tenantId: "slt", source: "localstack-s3", demoOnly: true,
+      name: documentName, key, bytes, content,
+      storageStatus: "STORED_IN_S3", indexedInBedrock: null,
+    });
+  } catch (error: any) {
+    if (["NoSuchKey", "NotFound"].includes(error?.name) ||
+        (error?.$metadata?.httpStatusCode === 404 && error?.name !== "NoSuchBucket")) {
+      return res.status(404).json({ error: "Knowledge document not found" });
+    }
+    console.error("[LocalKBView] S3 document retrieval failed:", error);
+    return res.status(503).json({ error: "Knowledge document unavailable; check LocalStack S3" });
   }
 });
 
