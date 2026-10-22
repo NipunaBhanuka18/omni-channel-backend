@@ -1246,34 +1246,62 @@ app.post("/api/dev/live/conversations/:sessionId/messages", async (req, res) => 
 // 5. WORKSPACE PORTAL & KB DOCUMENT UPLOAD
 // ==========================================
 
-// POST /api/workspace/upload-doc (Knowledge Base Upload)
+// LOCAL DEMO ONLY: create a small .txt/.md source document in tenant slt's S3 prefix.
+// This legacy route previously accepted unauthenticated tenant IDs and fabricated admin
+// context. It is disabled by default and MUST be replaced with Cognito authorization
+// before any production deployment. S3 storage does not mean Bedrock KB indexing.
 app.post("/api/workspace/upload-doc", async (req, res) => {
-  const { documentName, content, tenantId, userId } = req.body;
-  if (!documentName || !content) {
-    return res.status(400).json({ success: false, error: "Missing documentName or content" });
+  const remote = req.socket.remoteAddress || "";
+  const loopback = ["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(remote);
+  const origin = req.headers.origin;
+  const validOrigin = origin === "http://localhost:8080" || origin === "http://127.0.0.1:8080";
+  if (process.env.NODE_ENV === "production" || process.env.IS_LOCAL === "false" ||
+      process.env.ENABLE_LOCAL_KB_UPLOADING !== "true" || !loopback || !validOrigin ||
+      req.headers["x-local-admin-demo"] !== "upload-kb-document" ||
+      !req.is("application/json")) {
+    return res.status(404).json({ success: false, error: "Local KB document uploading unavailable" });
   }
 
-  const effectiveTenantId = tenantId || "slt";
+  const body: Record<string, unknown> = req.body && typeof req.body === "object" && !Array.isArray(req.body)
+    ? req.body : {};
+  // Never accept a user-controlled tenant identity or privileged user ID.
+  if (body.tenantId !== "slt") {
+    return res.status(400).json({ success: false, error: "Only local demo tenant slt is supported" });
+  }
+  const documentName = typeof body.documentName === "string" ? body.documentName.trim() : "";
+  const content = body.content;
+  // Flat, explicitly named text files only; reject separators, traversal, and
+  // reserved/hidden names instead of trusting the broader S3 key helper.
+  if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,79}\.(?:txt|md)$/.test(documentName)) {
+    return res.status(400).json({ success: false, error: "Use a simple .txt or .md filename (letters, digits, dash, underscore)" });
+  }
+  if (typeof content !== "string" || !content.trim() || Buffer.byteLength(content, "utf8") > 32 * 1024) {
+    return res.status(400).json({ success: false, error: "Document must contain 1-32768 bytes of UTF-8 text" });
+  }
+
   const context: TenantContext = {
-    tenantId: effectiveTenantId,
-    userId: userId || "console-admin",
-    role: "admin",
+    tenantId: "slt", userId: "local-kb-admin-demo", role: "admin",
     permissions: ["faults:read", "billing:read", "usage:read"],
-    channel: "web",
-    sessionId: `sess-${Date.now()}`,
+    channel: "web", sessionId: `sess-${Date.now()}`,
     conversationId: `conv-${Date.now()}`,
   };
 
   try {
-    const uploadedKey = await uploadKbDocument(context, documentName, content);
+    // A conditional S3 PUT prevents an existing document from being overwritten.
+    const uploadedKey = await uploadKbDocument(context, documentName, content, { createOnly: true });
     return res.status(201).json({
-      success: true,
-      s3Key: uploadedKey,
-      tenantId: effectiveTenantId,
-      message: `Document '${documentName}' uploaded successfully to tenant Knowledge Base.`,
+      success: true, demoOnly: true,
+      s3Key: uploadedKey, tenantId: "slt",
+      storageStatus: "STORED_IN_S3", indexedInBedrock: null,
+      message: `Document '${documentName}' stored in local S3.`,
     });
   } catch (err: any) {
-    return res.status(500).json({ success: false, error: err.message });
+    if (err?.name === "PreconditionFailed" || err?.$metadata?.httpStatusCode === 412 ||
+        err?.name === "ConditionalRequestConflict") {
+      return res.status(409).json({ success: false, error: "Document already exists or upload conflicted" });
+    }
+    console.error("[LocalKBUpload] S3 upload failed:", err);
+    return res.status(503).json({ success: false, error: "Document upload failed; check LocalStack S3" });
   }
 });
 

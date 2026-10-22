@@ -1,4 +1,4 @@
-import { S3Client, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
+import { S3Client, GetObjectCommand, PutObjectCommand, HeadObjectCommand } from "@aws-sdk/client-s3";
 import { TenantContext } from "../../shared/types/tenant-context";
 
 // Dynamic LocalStack vs AWS Cloud S3 configuration
@@ -9,6 +9,7 @@ const localstackEndpoint = process.env.LOCALSTACK_HOSTNAME
 
 export const s3Client = new S3Client({
   region: process.env.AWS_REGION || "us-east-1",
+  requestChecksumCalculation: "WHEN_REQUIRED",
   ...(isLocal && {
     endpoint: localstackEndpoint,
     forcePathStyle: true,
@@ -20,6 +21,8 @@ export const s3Client = new S3Client({
 });
 
 const KB_BUCKET_NAME = process.env.KB_BUCKET_NAME || "omni-channel-kb-docs";
+// Prevent simultaneous create-only uploads for the same key in this local process.
+const inFlightCreates = new Set<string>();
 
 /**
  * Helper: Builds an isolated S3 Object Key strictly partitioned by Tenant ID
@@ -85,19 +88,56 @@ export const fetchKbDocument = async (
 export const uploadKbDocument = async (
   context: TenantContext,
   docName: string,
-  content: string | Buffer
+  content: string | Buffer,
+  options: { createOnly?: boolean } = {}
 ): Promise<string> => {
   if (!context || !context.tenantId) {
     throw new Error("[S3 Isolation Guardrail] Missing authenticated TenantContext for RAG upload.");
   }
 
   const isolatedKey = buildTenantS3Key(context.tenantId, docName);
+  const documentBody = Buffer.isBuffer(content) ? content : Buffer.from(content, "utf8");
+
+  // LocalStack 3.0 may accept If-None-Match without enforcing it. A HEAD check
+  // blocks sequential overwrites in the local demo. The conditional PUT below
+  // remains necessary for atomic protection on S3 implementations that support it.
+  if (options.createOnly) {
+    if (inFlightCreates.has(isolatedKey)) {
+      const conflict = new Error("Another upload to this document is in progress");
+      conflict.name = "ConditionalRequestConflict";
+      throw conflict;
+    }
+    inFlightCreates.add(isolatedKey);
+  }
 
   try {
+    if (options.createOnly) {
+      let exists = true;
+      try {
+        await s3Client.send(new HeadObjectCommand({ Bucket: KB_BUCKET_NAME, Key: isolatedKey }));
+      } catch (error: any) {
+        if (error?.name === "NotFound" || error?.name === "NoSuchKey" ||
+            (error?.$metadata?.httpStatusCode === 404 && error?.name !== "NoSuchBucket")) {
+          exists = false;
+        } else {
+          // Do not interpret permission errors or connectivity failures as "not found".
+          throw error;
+        }
+      }
+      if (exists) {
+        const conflict = new Error("Document already exists in S3");
+        conflict.name = "PreconditionFailed";
+        throw conflict;
+      }
+    }
+
     const command = new PutObjectCommand({
       Bucket: KB_BUCKET_NAME,
       Key: isolatedKey,
-      Body: content,
+      Body: documentBody,
+      ContentLength: documentBody.length,
+      ContentType: "text/plain; charset=utf-8",
+      ...(options.createOnly ? { IfNoneMatch: "*" } : {}),
       Metadata: {
         "tenant-id": context.tenantId,
         "uploaded-by": context.userId,
@@ -107,7 +147,9 @@ export const uploadKbDocument = async (
     await s3Client.send(command);
     return isolatedKey;
   } catch (error) {
-    console.warn(`[S3 Client Warning] S3 Upload skipped for local test: ${isolatedKey}`);
-    return isolatedKey;
+    console.error(`[S3 Client Error] S3 Upload failed: ${isolatedKey}`, error);
+    throw error;
+  } finally {
+    if (options.createOnly) inFlightCreates.delete(isolatedKey);
   }
 };
