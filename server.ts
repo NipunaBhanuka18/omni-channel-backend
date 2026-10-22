@@ -8,7 +8,7 @@ import { adjustActiveChats } from "./services/handoff/presence-manager";
 
 import { registerTenant, handleRegisterTenantRequest } from "./services/onboarding/register-tenant";
 import { s3Client, uploadKbDocument } from "./agents/utils/s3-client";
-import { ListObjectsV2Command, GetObjectCommand, HeadObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
+import { ListObjectsV2Command, GetObjectCommand, HeadObjectCommand, PutObjectCommand, DeleteObjectCommand } from "@aws-sdk/client-s3";
 import { inMemoryTenants, inMemoryAgents, provisionTenantResources } from "./scripts/create-tenants-table";
 import { TenantContext } from "./shared/types/tenant-context";
 import { docClient } from "./agents/utils/dynamo-client";
@@ -1270,6 +1270,70 @@ app.patch("/api/dev/admin/knowledge-files/:documentName", async (req, res) => {
     }
     console.error("[LocalKBUpdate] S3 document update failed:", error);
     return res.status(503).json({ error: "Knowledge document update unavailable; check LocalStack S3" });
+  } finally {
+    localKbUpdatesInFlight.delete(key);
+  }
+});
+
+// LOCAL DEMO ONLY: permanently delete disposable KB test documents.
+// Do not expose this route publicly. It has no authenticated administrator identity.
+// Only kb-upload-test-* files are deletable; real support guides are intentionally protected.
+app.delete("/api/dev/admin/knowledge-files/:documentName", async (req, res) => {
+  const remote = req.socket.remoteAddress || "";
+  const loopback = ["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(remote);
+  const origin = req.headers.origin;
+  const validOrigin = origin === "http://localhost:8080" || origin === "http://127.0.0.1:8080";
+  if (process.env.NODE_ENV === "production" || process.env.IS_LOCAL === "false" ||
+      process.env.ENABLE_LOCAL_KB_DELETING !== "true" || !loopback || !validOrigin ||
+      req.headers["x-local-admin-demo"] !== "delete-kb-document") {
+    return res.status(404).json({ error: "Local KB document deletion unavailable" });
+  }
+  if (req.query.tenantId !== "slt") {
+    return res.status(400).json({ error: "Only local demo tenant slt is supported" });
+  }
+  const documentName = req.params.documentName;
+  if (!/^kb-upload-test-[A-Za-z0-9_-]{1,60}\.(?:txt|md)$/.test(documentName)) {
+    return res.status(400).json({ error: "Only disposable kb-upload-test-* text documents can be deleted" });
+  }
+  if (req.headers["x-confirm-delete-document"] !== documentName) {
+    return res.status(400).json({ error: "Confirm the exact document name to delete" });
+  }
+  const expectedEtag = req.headers["if-match"];
+  if (typeof expectedEtag !== "string" || !/^"[^"\r\n]{1,160}"$/.test(expectedEtag)) {
+    return res.status(428).json({ error: "Provide the current document ETag in If-Match" });
+  }
+
+  const bucket = process.env.KB_BUCKET_NAME || "omni-channel-kb-docs";
+  const key = `tenants/slt/${documentName}`;
+  // This lock coordinates with the local update route in this Node process only.
+  if (localKbUpdatesInFlight.has(key)) {
+    return res.status(409).json({ error: "A change to this document is already in progress" });
+  }
+  localKbUpdatesInFlight.add(key);
+  try {
+    const head = await s3Client.send(new HeadObjectCommand({ Bucket: bucket, Key: key }));
+    if (!head.ETag) return res.status(503).json({ error: "Document version unavailable" });
+    if (head.ETag !== expectedEtag) {
+      return res.status(409).json({ error: "Document changed; reload it before deleting" });
+    }
+    // AWS S3 checks IfMatch on DELETE. The HEAD check also protects normal
+    // sequential local testing when LocalStack does not enforce conditional headers.
+    await s3Client.send(new DeleteObjectCommand({ Bucket: bucket, Key: key, IfMatch: expectedEtag }));
+    return res.json({
+      success: true, demoOnly: true, tenantId: "slt", name: documentName, key,
+      deleted: true, previousEtag: expectedEtag, indexedInBedrock: null,
+    });
+  } catch (error: any) {
+    if (["NoSuchKey", "NotFound"].includes(error?.name) ||
+        (error?.$metadata?.httpStatusCode === 404 && error?.name !== "NoSuchBucket")) {
+      return res.status(404).json({ error: "Knowledge document not found" });
+    }
+    if (["PreconditionFailed", "ConditionalRequestConflict"].includes(error?.name) ||
+        [409, 412].includes(error?.$metadata?.httpStatusCode)) {
+      return res.status(409).json({ error: "Document changed or a conflicting deletion occurred" });
+    }
+    console.error("[LocalKBDelete] S3 document deletion failed:", error);
+    return res.status(503).json({ error: "Knowledge document deletion unavailable; check LocalStack S3" });
   } finally {
     localKbUpdatesInFlight.delete(key);
   }
