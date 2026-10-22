@@ -1631,7 +1631,7 @@ app.post(["/api/tenant/route", "/api/agent"], async (req, res) => {
 
 let server: any = null;
 if (require.main === module) {
-  server = app.listen(PORT, () => {
+  server = app.listen(Number(PORT), "127.0.0.1", () => {
     console.log(`🚀 omni-channel-backend API Server running at http://localhost:${PORT}`);
   });
 }
