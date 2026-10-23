@@ -16,3 +16,7 @@ node_modules/
 .localstack/
 dist/
 build/
+
+# Local demo database and backup
+/db.json
+/db.json.backup-before-ui-test
