@@ -7,6 +7,7 @@ import { handleHandoffApi } from "./services/handoff/handler";
 import { adjustActiveChats } from "./services/handoff/presence-manager";
 
 import { provisionPendingCompanyApproval } from "./services/onboarding/approval-workflow";
+import { redactRegistrationCredentials } from "./services/onboarding/registration-privacy";
 import { s3Client, uploadKbDocument } from "./agents/utils/s3-client";
 import { ListObjectsV2Command, GetObjectCommand, HeadObjectCommand, PutObjectCommand, DeleteObjectCommand } from "@aws-sdk/client-s3";
 import { inMemoryTenants, inMemoryAgents, provisionTenantResources } from "./scripts/create-tenants-table";
@@ -179,9 +180,21 @@ function normalizeRegistration(r: any) {
 }
 
 // GET /api/registrations (supports ?status=pending or ?status=approved)
+// LOCAL DEMO ONLY. No production authorization exists for listing registration PII.
 app.get("/api/registrations", (req, res) => {
+  const remote = req.socket.remoteAddress || "";
+  const loopback = ["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(remote);
+  const validOrigin = req.headers.origin === "http://localhost:8080" ||
+    req.headers.origin === "http://127.0.0.1:8080";
+  if (process.env.NODE_ENV === "production" || process.env.IS_LOCAL === "false" ||
+      process.env.ENABLE_LOCAL_REGISTRATION_LISTING !== "true" ||
+      !loopback || !validOrigin ||
+      req.headers["x-local-admin-demo"] !== "list-company-registrations") {
+    return res.status(404).json({ error: "Local company registration list unavailable" });
+  }
   const db = readDB();
-  const rawList = (db.registrations || []).map(normalizeRegistration);
+  const rawList = (db.registrations || []).map((r: any) =>
+    redactRegistrationCredentials(normalizeRegistration(r)));
   const statusParam = req.query.status as string;
 
   if (statusParam) {
@@ -234,7 +247,8 @@ app.post("/api/registrations", (req, res) => {
   db.registrations.push(newReg);
   writeDB(db);
 
-  res.status(201).json({ success: true, registration: newReg });
+  // Registration submission must never echo a supplied password back to the caller.
+  res.status(201).json({ success: true, registration: redactRegistrationCredentials(newReg) });
 });
 
 // LOCAL DEMO ONLY: platform registration review. This flag/header are NOT authentication.
