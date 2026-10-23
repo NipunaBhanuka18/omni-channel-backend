@@ -6,7 +6,7 @@ import { handleTenantRequest } from "./services/tenant-router/handler";
 import { handleHandoffApi } from "./services/handoff/handler";
 import { adjustActiveChats } from "./services/handoff/presence-manager";
 
-import { registerTenant, handleRegisterTenantRequest } from "./services/onboarding/register-tenant";
+import { provisionPendingCompanyApproval } from "./services/onboarding/approval-workflow";
 import { s3Client, uploadKbDocument } from "./agents/utils/s3-client";
 import { ListObjectsV2Command, GetObjectCommand, HeadObjectCommand, PutObjectCommand, DeleteObjectCommand } from "@aws-sdk/client-s3";
 import { inMemoryTenants, inMemoryAgents, provisionTenantResources } from "./scripts/create-tenants-table";
@@ -134,32 +134,10 @@ app.post("/api/auth/login", (req, res) => {
   return res.status(401).json({ success: false, error: "Invalid email or password" });
 });
 
-// POST /api/auth/register-admin
-app.post("/api/auth/register-admin", (req, res) => {
-  const { fullName, email, password } = req.body;
-  if (!email || !password) {
-    return res.status(400).json({ success: false, error: "Missing required fields" });
-  }
-
-  const db = readDB();
-  const existing = db.users.find((u: any) => u.email.toLowerCase() === email.toLowerCase());
-  if (existing) {
-    return res.status(400).json({ success: false, error: "Email already registered" });
-  }
-
-  const newUser = {
-    id: `user-${Date.now()}`,
-    fullName: fullName || email.split("@")[0],
-    email,
-    password,
-    role: "superadmin",
-    createdAt: new Date().toISOString(),
-  };
-
-  db.users.push(newUser);
-  writeDB(db);
-
-  return res.status(201).json({ success: true, user: newUser });
+// Prevent unauthenticated callers from creating platform superadmin identities.
+// Production provisioning must use a verified, privileged administration path.
+app.post("/api/auth/register-admin", (_req, res) => {
+  return res.status(404).json({ error: "Platform administrator self-registration unavailable" });
 });
 
 // ==========================================
@@ -259,43 +237,79 @@ app.post("/api/registrations", (req, res) => {
   res.status(201).json({ success: true, registration: newReg });
 });
 
-// Handler for approving or rejecting registration
+// LOCAL DEMO ONLY: platform registration review. This flag/header are NOT authentication.
+// Production must use verified platform-admin identity and authorize every mutation.
+// In particular, do not fall back to the old placeholder-credentials onboarding path.
+const registrationReviewsInFlight = new Set<string>();
 const handleUpdateRegistrationStatus = async (req: express.Request, res: express.Response) => {
+  const remote = req.socket.remoteAddress || "";
+  const loopback = ["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(remote);
+  const origin = req.headers.origin;
+  const validOrigin = origin === "http://localhost:8080" || origin === "http://127.0.0.1:8080";
+  if (process.env.NODE_ENV === "production" || process.env.IS_LOCAL === "false" ||
+      process.env.ENABLE_LOCAL_COMPANY_REVIEW !== "true" || !loopback || !validOrigin ||
+      req.headers["x-local-admin-demo"] !== "review-company-registration" ||
+      !req.is("application/json")) {
+    return res.status(404).json({ error: "Local company registration review unavailable" });
+  }
+
   const { id } = req.params;
-  const rawStatus = (req.body.status || "").toLowerCase();
-
-  const db = readDB();
-  const regIndex = db.registrations.findIndex((r: any) => String(r.id) === String(id));
-
-  if (regIndex === -1) {
-    return res.status(404).json({ success: false, error: "Registration not found" });
+  if (!/^reg-[A-Za-z0-9_-]{1,80}$/.test(id)) {
+    return res.status(400).json({ error: "Invalid registration ID" });
   }
-
-  const reg = db.registrations[regIndex];
-  const normalizedStatus = rawStatus === "approved" ? "Approved" : rawStatus === "rejected" ? "Rejected" : req.body.status || "Approved";
-  reg.status = normalizedStatus;
-
-  // Auto-Provision Tenant Partition when Approved
-  if (normalizedStatus === "Approved" && !reg.tenantId) {
-    try {
-      const onboardResult = await registerTenant({
-        companyName: reg.companyName,
-        companySlug: reg.companySlug || reg.companyName.toLowerCase().replace(/[^a-z0-9]/g, "-"),
-        adminEmail: reg.companyEmail || `admin@${reg.companyName.toLowerCase().replace(/[^a-z0-9]/g, "")}.com`,
-        planTier: reg.tier?.toLowerCase() === "enterprise" ? "enterprise" : "starter",
-      });
-      reg.tenantId = onboardResult.tenantId;
-      reg.onboardedAt = new Date().toISOString();
-      console.log(`✅ [Auto-Provisioning] Successfully provisioned tenant '${reg.tenantId}' for ${reg.companyName}`);
-    } catch (onboardErr: any) {
-      console.warn(`⚠️ [Auto-Provisioning Warning] ${onboardErr.message}`);
-      reg.tenantId = `tenant-${id}`;
+  const rawStatus = typeof req.body?.status === "string" ? req.body.status.trim().toLowerCase() : "";
+  if (rawStatus !== "approved" && rawStatus !== "rejected") {
+    return res.status(400).json({ error: "Status must be Approved or Rejected" });
+  }
+  if (registrationReviewsInFlight.has(id)) {
+    return res.status(409).json({ error: "Registration review already in progress" });
+  }
+  registrationReviewsInFlight.add(id);
+  try {
+    const db = readDB();
+    const regIndex = (db.registrations || []).findIndex((r: any) => String(r.id) === id);
+    if (regIndex === -1) return res.status(404).json({ error: "Registration not found" });
+    const reg = db.registrations[regIndex];
+    if (reg.status !== "Pending" || reg.tenantId) {
+      return res.status(409).json({ error: "Only unprovisioned pending registrations can be reviewed" });
     }
-  }
 
-  db.registrations[regIndex] = normalizeRegistration(reg);
-  writeDB(db);
-  return res.json({ success: true, registration: db.registrations[regIndex] });
+    if (rawStatus === "rejected") {
+      db.registrations[regIndex] = normalizeRegistration({ ...reg, status: "Rejected" });
+      writeDB(db);
+      const { password: _password, ...safeRegistration } = db.registrations[regIndex];
+      return res.json({ success: true, demoOnly: true, registration: safeRegistration });
+    }
+
+    const approval = await provisionPendingCompanyApproval({
+      id: reg.id, status: reg.status, tenantId: reg.tenantId,
+      companyName: reg.companyName, companySlug: reg.companySlug,
+      companyEmail: reg.companyEmail, adminEmail: reg.adminEmail,
+    });
+    if (!approval.success) {
+      const code = approval.error.code;
+      const status = code === "BAD_REQUEST" ? 400 :
+        ["INVALID_REGISTRATION_STATE", "TENANT_ALREADY_EXISTS", "COMPANY_NAME_ALREADY_EXISTS"].includes(code) ? 409 : 503;
+      return res.status(status).json({ success: false, error: approval.error });
+    }
+
+    // No Approved status is persisted until tenant, default agent and Cognito admin
+    // provisioning all succeed. Never persist one-time credentials in db.json.
+    db.registrations[regIndex] = normalizeRegistration({ ...reg, ...approval.approvedRegistration });
+    writeDB(db);
+    const { password: _password, ...safeRegistration } = db.registrations[regIndex];
+    return res.json({
+      success: true, demoOnly: true, registration: safeRegistration,
+      // Local demo only; a real platform-admin authorization boundary is required
+      // before disclosing any temporary credential in production.
+      credentials: approval.credentials,
+    });
+  } catch (error) {
+    console.error("[LocalCompanyReview] Registration review failed:", error);
+    return res.status(503).json({ error: "Company review unavailable; registration may require reconciliation" });
+  } finally {
+    registrationReviewsInFlight.delete(id);
+  }
 };
 
 // PATCH /api/registrations/:id (Super Admin Approves / Rejects)
@@ -356,13 +370,11 @@ app.get("/api/notifications", (req, res) => {
 // 3. MEMBER 2 DIRECT ONBOARDING API
 // ==========================================
 
-// POST /api/tenants/register
-app.post("/api/tenants/register", async (req, res) => {
-  const response = await handleRegisterTenantRequest({
-    httpMethod: "POST",
-    body: req.body,
-  });
-  return res.status(response.statusCode).json(JSON.parse(response.body));
+// Disable the legacy direct HTTP provisioning route. It had no platform-admin
+// authentication and generated placeholder (non-Cognito) admin credentials.
+// Company creation now requires the separately guarded approval workflow.
+app.post("/api/tenants/register", (_req, res) => {
+  return res.status(404).json({ error: "Direct tenant registration unavailable" });
 });
 
 // ==========================================
