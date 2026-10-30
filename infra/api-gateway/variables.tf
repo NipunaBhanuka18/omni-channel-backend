@@ -21,3 +21,8 @@ variable "tenant_router_lambda_invoke_arn" {
   default     = ""
 }
 
+variable "onboarding_lambda_invoke_arn" {
+  type        = string
+  description = "Invocation ARN of the Onboarding Lambda function"
+  default     = ""
+}

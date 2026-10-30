@@ -15,4 +15,8 @@ node_modules/
 .aws/
 .localstack/
 dist/
-build/
+build/
+
+# Deployment Archives
+*.zip
+infra/lambda/*.zip
