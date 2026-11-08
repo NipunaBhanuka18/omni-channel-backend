@@ -1,5 +1,10 @@
 import { setAgentPresence, getAgentPresence } from "./presence-manager";
-import { requestHumanHandoff, resolveChatSession, getSessionStatus } from "./escalation-engine";
+import {
+  HandoffOperationError,
+  requestHumanHandoff,
+  resolveChatSession,
+  getSessionStatus,
+} from "./escalation-engine";
 import { AgentActionResponse } from "../../shared/types/agent-action";
 
 export interface HandoffApiRequest {
@@ -84,7 +89,7 @@ export async function handleHandoffApi(request: HandoffApiRequest): Promise<Agen
         if (!request.sessionId) {
           return { success: false, error: { code: "BAD_REQUEST", message: "Missing sessionId", retryable: false } };
         }
-        const session = await getSessionStatus(request.sessionId);
+        const session = await getSessionStatus(request.sessionId, tenantId);
         return { success: true, data: session };
       }
 
@@ -99,6 +104,16 @@ export async function handleHandoffApi(request: HandoffApiRequest): Promise<Agen
         };
     }
   } catch (err: any) {
+    if (err instanceof HandoffOperationError) {
+      return {
+        success: false,
+        error: {
+          code: err.code,
+          message: err.message,
+          retryable: false,
+        },
+      };
+    }
     console.error("[HandoffHandler] Unhandled error:", err);
     return {
       success: false,

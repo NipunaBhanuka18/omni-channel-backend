@@ -1,12 +1,15 @@
 import { resolveTenantContext } from "../tenant-resolver/resolver";
 import { routeRequest, RoutingDecisionResult } from "./router";
 import { AgentActionResponse } from "../../shared/types/agent-action";
+import { TenantContext } from "../../shared/types/tenant-context";
 import { getRequiredPermissionForIntent } from "./permission-map";
 import { handler as mainAgentHandler } from "../../agents/main-agent/handler";
 
 export interface HttpRequestPayload {
   headers: Record<string, string | undefined>;
   body?: Record<string, any>;
+  /** Optional cryptographically verified TenantContext supplied by HTTP auth middleware. */
+  verifiedContext?: TenantContext;
 }
 
 /**
@@ -16,22 +19,26 @@ export interface HttpRequestPayload {
  * @returns AgentActionResponse shape
  */
 export async function handleTenantRequest(request: HttpRequestPayload): Promise<AgentActionResponse> {
-  // Step 1: Resolve Tenant Context from headers
-  const resolverResult = resolveTenantContext(request.headers);
+  let tenantContext = request.verifiedContext;
+  if (!tenantContext) {
+    // Step 1: Resolve Tenant Context from headers
+    const resolverResult = resolveTenantContext(request.headers);
 
-  if (!resolverResult.success || !resolverResult.context) {
-    return {
-      success: false,
-      error: resolverResult.error || {
-        code: "INTERNAL_ERROR",
-        message: "Tenant resolution failed without error details",
-        retryable: false,
-      },
-    };
+    if (!resolverResult.success || !resolverResult.context) {
+      return {
+        success: false,
+        error: resolverResult.error || {
+          code: "INTERNAL_ERROR",
+          message: "Tenant resolution failed without error details",
+          retryable: false,
+        },
+      };
+    }
+    tenantContext = resolverResult.context;
   }
 
   // Step 2: Route request using resolved TenantContext (DynamoDB, ADR-014)
-  const routerResult: RoutingDecisionResult = await routeRequest(resolverResult.context);
+  const routerResult: RoutingDecisionResult = await routeRequest(tenantContext);
 
   if (!routerResult.success || !routerResult.data) {
     return {

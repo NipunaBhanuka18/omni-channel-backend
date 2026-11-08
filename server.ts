@@ -12,28 +12,27 @@ import {
   createLocalAuthRouter,
   normalizeRegistration,
 } from "./services/auth/local-auth-router";
+import {
+  createRequireAuth,
+  requireRole,
+  requireTenantScope,
+  resolveAuthorizedAgentId,
+} from "./services/auth/local-auth-middleware";
+import { LocalLoginAttemptGuard } from "./services/auth/local-login-attempt-guard";
 import { LocalSessionTokenService } from "./services/auth/local-session-token";
+import { listConversationsForTenant } from "./services/workspace-portal/list-conversations";
 import { s3Client, uploadKbDocument } from "./agents/utils/s3-client";
 import { ListObjectsV2Command, GetObjectCommand, HeadObjectCommand, PutObjectCommand, DeleteObjectCommand } from "@aws-sdk/client-s3";
-import { inMemoryTenants, inMemoryAgents, provisionTenantResources } from "./scripts/create-tenants-table";
+import { inMemoryTenants, provisionTenantResources } from "./scripts/create-tenants-table";
 import { TenantContext } from "./shared/types/tenant-context";
 import { docClient } from "./agents/utils/dynamo-client";
 import { ScanCommand, QueryCommand, GetCommand, UpdateCommand, DeleteCommand } from "@aws-sdk/lib-dynamodb";
 import { randomUUID } from "crypto";
 
-// Enable mock authorization for local development environment
-if (process.env.NODE_ENV !== "production") {
-  process.env.ALLOW_MOCK_AUTH = "true";
-}
-
-const app = express();
 const PORT = process.env.PORT || 3001;
-
-app.use(cors());
-app.use(express.json());
-
 const DB_PATH = path.join(__dirname, "db.json");
-const dbStore = createJsonDbStore(DB_PATH);
+const TENANT_ID_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
+const SAFE_ID_PATTERN = /^[a-zA-Z0-9_-]{1,128}$/;
 
 let cachedLocalTokenService: LocalSessionTokenService | null = null;
 function getLocalSessionTokenService(): LocalSessionTokenService {
@@ -43,18 +42,78 @@ function getLocalSessionTokenService(): LocalSessionTokenService {
   return cachedLocalTokenService;
 }
 
-// Initialize baseline tenant DynamoDB/in-memory records
+// Initialize baseline tenant DynamoDB/in-memory records once per process
 provisionTenantResources().catch((err) => {
   console.warn(`[Server Init] Baseline tenant provisioning note: ${err.message}`);
 });
 
-function readDB() {
-  return dbStore.readDB();
+function asPlainBody(value: unknown): Record<string, any> | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null ? (value as Record<string, any>) : null;
 }
 
-function writeDB(data: { users: Array<Record<string, any>>; registrations: Array<Record<string, any>> }) {
-  dbStore.writeDB(data);
+function isLocalDevAllowed(): boolean {
+  return process.env.NODE_ENV !== "production" && process.env.IS_LOCAL !== "false";
 }
+
+function isLoopbackOriginAllowed(req: express.Request): boolean {
+  const remote = req.socket?.remoteAddress || "";
+  const loopback = ["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(remote);
+  const allowedOrigins = ["http://localhost:8080", "http://127.0.0.1:8080"];
+  const origin = req.headers.origin;
+  return loopback && (!origin || allowedOrigins.includes(origin));
+}
+
+function handoffErrorStatus(code?: string): number {
+  switch (code) {
+    case "FORBIDDEN":
+      return 403;
+    case "NOT_FOUND":
+      return 404;
+    case "CONFLICT":
+      return 409;
+    case "INTERNAL_ERROR":
+      return 503;
+    default:
+      return 400;
+  }
+}
+
+export interface CreateAppOptions {
+  dbPath?: string;
+  tokenService?: LocalSessionTokenService;
+  loginGuard?: LocalLoginAttemptGuard;
+  approvePendingRegistration?: typeof provisionPendingCompanyApproval;
+}
+
+export function createApp(options: CreateAppOptions = {}): express.Express {
+  const app = express();
+  app.use(cors());
+  app.use(express.json());
+
+  const dbStore = createJsonDbStore(options.dbPath || DB_PATH);
+  const resolveTokenService = (): LocalSessionTokenService =>
+    options.tokenService ?? getLocalSessionTokenService();
+  const approvePendingRegistration =
+    options.approvePendingRegistration ?? provisionPendingCompanyApproval;
+
+  const requireAuth = createRequireAuth(resolveTokenService);
+  const requireSuperAdmin = [requireAuth, requireRole("superadmin")] as const;
+  const requireCompanyAdmin = [requireAuth, requireRole("company"), requireTenantScope()] as const;
+  const requireAgentOrCompany = [
+    requireAuth,
+    requireRole("live_agent", "company"),
+    requireTenantScope(),
+  ] as const;
+
+  function readDB() {
+    return dbStore.readDB();
+  }
+
+  function writeDB(data: { users: Array<Record<string, any>>; registrations: Array<Record<string, any>> }) {
+    dbStore.writeDB(data);
+  }
 
 // ==========================================
 // 1. AUTHENTICATION & REGISTRATION ROUTES
@@ -62,7 +121,8 @@ function writeDB(data: { users: Array<Record<string, any>>; registrations: Array
 app.use(
   createLocalAuthRouter({
     store: dbStore,
-    getTokenService: getLocalSessionTokenService,
+    getTokenService: resolveTokenService,
+    loginGuard: options.loginGuard,
   }),
 );
 
@@ -71,22 +131,18 @@ app.use(
 // ==========================================
 
 // GET /api/registrations (supports ?status=pending or ?status=approved)
-// LOCAL DEMO ONLY. No production authorization exists for listing registration PII.
-app.get("/api/registrations", (req, res) => {
-  const remote = req.socket.remoteAddress || "";
-  const loopback = ["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(remote);
-  const validOrigin = req.headers.origin === "http://localhost:8080" ||
-    req.headers.origin === "http://127.0.0.1:8080";
-  if (process.env.NODE_ENV === "production" || process.env.IS_LOCAL === "false" ||
-      process.env.ENABLE_LOCAL_REGISTRATION_LISTING !== "true" ||
-      !loopback || !validOrigin ||
-      req.headers["x-local-admin-demo"] !== "list-company-registrations") {
+// Protected by verified superadmin session token; local demo DB only.
+app.get("/api/registrations", ...requireSuperAdmin, (req, res) => {
+  if (!isLocalDevAllowed()) {
     return res.status(404).json({ error: "Local company registration list unavailable" });
+  }
+  if (req.query.status !== undefined && typeof req.query.status !== "string") {
+    return res.status(400).json({ error: "Invalid status filter" });
   }
   const db = readDB();
   const rawList = (db.registrations || []).map((r: any) =>
     redactRegistrationCredentials(normalizeRegistration(r)));
-  const statusParam = req.query.status as string;
+  const statusParam = typeof req.query.status === "string" ? req.query.status.trim() : "";
 
   if (statusParam) {
     const filtered = rawList.filter(
@@ -100,27 +156,22 @@ app.get("/api/registrations", (req, res) => {
 
 // POST /api/registrations is registered above via createLocalAuthRouter.
 
-// LOCAL DEMO ONLY: platform registration review. This flag/header are NOT authentication.
-// Production must use verified platform-admin identity and authorize every mutation.
-// In particular, do not fall back to the old placeholder-credentials onboarding path.
+// Platform superadmin registration review (approved records provision via Cognito pipeline).
 const registrationReviewsInFlight = new Set<string>();
 const handleUpdateRegistrationStatus = async (req: express.Request, res: express.Response) => {
-  const remote = req.socket.remoteAddress || "";
-  const loopback = ["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(remote);
-  const origin = req.headers.origin;
-  const validOrigin = origin === "http://localhost:8080" || origin === "http://127.0.0.1:8080";
-  if (process.env.NODE_ENV === "production" || process.env.IS_LOCAL === "false" ||
-      process.env.ENABLE_LOCAL_COMPANY_REVIEW !== "true" || !loopback || !validOrigin ||
-      req.headers["x-local-admin-demo"] !== "review-company-registration" ||
-      !req.is("application/json")) {
+  if (!isLocalDevAllowed()) {
     return res.status(404).json({ error: "Local company registration review unavailable" });
+  }
+  if (!req.is("application/json")) {
+    return res.status(400).json({ error: "Content-Type application/json is required" });
   }
 
   const { id } = req.params;
   if (!/^reg-[A-Za-z0-9_-]{1,80}$/.test(id)) {
     return res.status(400).json({ error: "Invalid registration ID" });
   }
-  const rawStatus = typeof req.body?.status === "string" ? req.body.status.trim().toLowerCase() : "";
+  const body = asPlainBody(req.body);
+  const rawStatus = typeof body?.status === "string" ? body.status.trim().toLowerCase() : "";
   if (rawStatus !== "approved" && rawStatus !== "rejected") {
     return res.status(400).json({ error: "Status must be Approved or Rejected" });
   }
@@ -141,10 +192,10 @@ const handleUpdateRegistrationStatus = async (req: express.Request, res: express
       db.registrations[regIndex] = normalizeRegistration({ ...reg, status: "Rejected" });
       writeDB(db);
       const safeRegistration = redactRegistrationCredentials(db.registrations[regIndex]);
-      return res.json({ success: true, demoOnly: true, registration: safeRegistration });
+      return res.json({ success: true, registration: safeRegistration });
     }
 
-    const approval = await provisionPendingCompanyApproval({
+    const approval = await approvePendingRegistration({
       id: reg.id, status: reg.status, tenantId: reg.tenantId,
       companyName: reg.companyName, companySlug: reg.companySlug,
       companyEmail: reg.companyEmail, adminEmail: reg.adminEmail,
@@ -162,9 +213,8 @@ const handleUpdateRegistrationStatus = async (req: express.Request, res: express
     writeDB(db);
     const safeRegistration = redactRegistrationCredentials(db.registrations[regIndex]);
     return res.json({
-      success: true, demoOnly: true, registration: safeRegistration,
-      // Local demo only; a real platform-admin authorization boundary is required
-      // before disclosing any temporary credential in production.
+      success: true,
+      registration: safeRegistration,
       credentials: approval.credentials,
     });
   } catch (error) {
@@ -176,16 +226,16 @@ const handleUpdateRegistrationStatus = async (req: express.Request, res: express
 };
 
 // PATCH /api/registrations/:id (Super Admin Approves / Rejects)
-app.patch("/api/registrations/:id", handleUpdateRegistrationStatus);
+app.patch("/api/registrations/:id", ...requireSuperAdmin, handleUpdateRegistrationStatus);
 
 // PUT /api/registrations/:id
-app.put("/api/registrations/:id", handleUpdateRegistrationStatus);
+app.put("/api/registrations/:id", ...requireSuperAdmin, handleUpdateRegistrationStatus);
 
 // PUT /api/registrations/:id/status (Backwards compatibility)
-app.put("/api/registrations/:id/status", handleUpdateRegistrationStatus);
+app.put("/api/registrations/:id/status", ...requireSuperAdmin, handleUpdateRegistrationStatus);
 
 // GET /api/stats (Admin Console Dashboard Stats)
-app.get("/api/stats", (req, res) => {
+app.get("/api/stats", ...requireSuperAdmin, (_req, res) => {
   const db = readDB();
   const activeCount = db.registrations.filter((r: any) => (r.status || "").toLowerCase() === "approved").length;
   const pendingCount = db.registrations.filter((r: any) => (r.status || "").toLowerCase() === "pending").length;
@@ -201,7 +251,7 @@ app.get("/api/stats", (req, res) => {
 });
 
 // GET /api/notifications (Admin Notifications)
-app.get("/api/notifications", (req, res) => {
+app.get("/api/notifications", ...requireSuperAdmin, (_req, res) => {
   const db = readDB();
   const list = db.registrations || [];
   const pendingRegs = list.filter((r: any) => (r.status || "").toLowerCase() === "pending");
@@ -245,88 +295,142 @@ app.post("/api/tenants/register", (_req, res) => {
 // ==========================================
 
 // POST /api/agent/presence/online ("Go Online")
-app.post(["/api/agent/presence/online", "/agent/presence/online"], async (req, res) => {
-  const { tenantId, agentId, connectionId } = req.body;
+app.post(["/api/agent/presence/online", "/agent/presence/online"], ...requireAgentOrCompany, async (req, res) => {
+  const body = req.body === undefined ? {} : asPlainBody(req.body);
+  if (!body) {
+    return res.status(400).json({ success: false, error: "Invalid request payload" });
+  }
+  const resolvedAgent = resolveAuthorizedAgentId(req, body.agentId);
+  if (!resolvedAgent.ok) {
+    return res.status(resolvedAgent.status).json({ success: false, error: resolvedAgent.error });
+  }
+  if (body.connectionId !== undefined && (typeof body.connectionId !== "string" || body.connectionId.length > 128)) {
+    return res.status(400).json({ success: false, error: "Invalid connectionId" });
+  }
   const result = await handleHandoffApi({
     action: "presence_online",
-    tenantId: tenantId || "slt",
-    agentId: agentId || "admin1",
-    connectionId,
+    tenantId: req.authorizedTenantId!,
+    agentId: resolvedAgent.agentId,
+    connectionId: typeof body.connectionId === "string" ? body.connectionId.trim() : undefined,
   });
-  if (!result.success) return res.status(400).json(result);
+  if (!result.success) return res.status(handoffErrorStatus(result.error?.code)).json(result);
   return res.status(200).json({ success: true, ...result.data });
 });
 
 // POST /api/agent/presence/offline ("Go Offline")
-app.post(["/api/agent/presence/offline", "/agent/presence/offline"], async (req, res) => {
-  const { tenantId, agentId } = req.body;
+app.post(["/api/agent/presence/offline", "/agent/presence/offline"], ...requireAgentOrCompany, async (req, res) => {
+  const body = req.body === undefined ? {} : asPlainBody(req.body);
+  if (!body) {
+    return res.status(400).json({ success: false, error: "Invalid request payload" });
+  }
+  const resolvedAgent = resolveAuthorizedAgentId(req, body.agentId);
+  if (!resolvedAgent.ok) {
+    return res.status(resolvedAgent.status).json({ success: false, error: resolvedAgent.error });
+  }
   const result = await handleHandoffApi({
     action: "presence_offline",
-    tenantId: tenantId || "slt",
-    agentId: agentId || "admin1",
+    tenantId: req.authorizedTenantId!,
+    agentId: resolvedAgent.agentId,
   });
-  if (!result.success) return res.status(400).json(result);
+  if (!result.success) return res.status(handoffErrorStatus(result.error?.code)).json(result);
   return res.status(200).json({ success: true, ...result.data });
 });
 
 // GET /api/agent/presence/status
-app.get(["/api/agent/presence/status", "/agent/presence/status"], async (req, res) => {
-  const tenantId = (req.query.tenantId as string) || "slt";
-  const agentId = (req.query.agentId as string) || "admin1";
+app.get(["/api/agent/presence/status", "/agent/presence/status"], ...requireAgentOrCompany, async (req, res) => {
+  const resolvedAgent = resolveAuthorizedAgentId(req, req.query.agentId);
+  if (!resolvedAgent.ok) {
+    return res.status(resolvedAgent.status).json({ success: false, error: resolvedAgent.error });
+  }
   const result = await handleHandoffApi({
     action: "presence_status",
-    tenantId,
-    agentId,
+    tenantId: req.authorizedTenantId!,
+    agentId: resolvedAgent.agentId,
   });
-  if (!result.success) return res.status(400).json(result);
+  if (!result.success) return res.status(handoffErrorStatus(result.error?.code)).json(result);
   return res.status(200).json({ success: true, ...result.data });
 });
 
-// POST /api/chat/handoff/request (Escalation Trigger)
+// POST /api/chat/handoff/request (Public Customer Escalation Trigger)
 app.post(["/api/chat/handoff/request", "/chat/handoff/request"], async (req, res) => {
-  const { tenantId, sessionId, reason, customerInfo } = req.body;
+  const body = asPlainBody(req.body);
+  if (!body) {
+    return res.status(400).json({
+      success: false,
+      error: { code: "BAD_REQUEST", message: "Invalid handoff payload", retryable: false },
+    });
+  }
+  const tenantId = typeof body.tenantId === "string" ? body.tenantId.trim() : "";
+  if (!TENANT_ID_PATTERN.test(tenantId)) {
+    return res.status(400).json({
+      success: false,
+      error: { code: "BAD_REQUEST", message: "A valid 'tenantId' is required", retryable: false },
+    });
+  }
+  let sessionId = `sess-${randomUUID()}`;
+  if (body.sessionId !== undefined) {
+    if (typeof body.sessionId !== "string" || !SAFE_ID_PATTERN.test(body.sessionId.trim())) {
+      return res.status(400).json({
+        success: false,
+        error: { code: "BAD_REQUEST", message: "Invalid sessionId format", retryable: false },
+      });
+    }
+    sessionId = body.sessionId.trim();
+  }
+  const reason = typeof body.reason === "string" ? body.reason.trim().slice(0, 1000) : undefined;
+  const customerInfo = asPlainBody(body.customerInfo);
+  const customerName =
+    typeof customerInfo?.name === "string" ? customerInfo.name.trim().slice(0, 120) : undefined;
+
   const result = await handleHandoffApi({
     action: "request_handoff",
-    tenantId: tenantId || "slt",
-    sessionId: sessionId || `sess-${Date.now()}`,
-    customerName: customerInfo?.name,
+    tenantId,
+    sessionId,
+    customerName,
     issueSummary: reason,
   });
-  if (!result.success) return res.status(400).json(result);
+  if (!result.success) return res.status(handoffErrorStatus(result.error?.code)).json(result);
   return res.status(200).json({ success: true, ...result.data });
 });
 
 // POST /api/chat/handoff/resolve (Live Agent Resolves Session)
-app.post(["/api/chat/handoff/resolve", "/chat/handoff/resolve"], async (req, res) => {
-  const { tenantId, sessionId, agentId } = req.body;
+app.post(["/api/chat/handoff/resolve", "/chat/handoff/resolve"], ...requireAgentOrCompany, async (req, res) => {
+  const body = asPlainBody(req.body);
+  if (!body) {
+    return res.status(400).json({ success: false, error: "Invalid request payload" });
+  }
+  const sessionId = typeof body.sessionId === "string" ? body.sessionId.trim() : "";
+  if (!SAFE_ID_PATTERN.test(sessionId)) {
+    return res.status(400).json({ success: false, error: "A valid 'sessionId' is required" });
+  }
+  const resolvedAgent = resolveAuthorizedAgentId(req, body.agentId);
+  if (!resolvedAgent.ok) {
+    return res.status(resolvedAgent.status).json({ success: false, error: resolvedAgent.error });
+  }
   const result = await handleHandoffApi({
     action: "resolve_session",
-    tenantId: tenantId || "slt",
+    tenantId: req.authorizedTenantId!,
     sessionId,
-    agentId,
+    agentId: resolvedAgent.agentId,
   });
-  if (!result.success) return res.status(400).json(result);
+  if (!result.success) return res.status(handoffErrorStatus(result.error?.code)).json(result);
   return res.status(200).json({ success: true, ...result.data });
 });
 
 
-// Local-development-only queue preview for the unified MVP live-agent console.
-// This route is NOT production authentication. Replace it with Cognito-based
-// agent identity and tenant-scoped authorization before deployment.
-app.get("/api/dev/live/queue", async (req, res) => {
-  const remote = req.socket.remoteAddress || "";
-  const loopback = ["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(remote);
-  const allowedOrigins = ["http://localhost:8080", "http://127.0.0.1:8080"];
-  if (process.env.NODE_ENV === "production" || !loopback ||
-      (req.headers.origin && !allowedOrigins.includes(req.headers.origin))) {
+// Local-development-only queue preview for the live-agent console.
+// Protected by verified bearer auth, role, tenant scope, and agent identity.
+app.get("/api/dev/live/queue", ...requireAgentOrCompany, async (req, res) => {
+  if (!isLocalDevAllowed() || !isLoopbackOriginAllowed(req)) {
     return res.status(404).json({ error: "Not found" });
   }
 
-  const tenantId = String(req.query.tenantId || "");
-  const agentId = String(req.query.agentId || "");
-  if (tenantId !== "slt" || agentId !== "local-agent-01") {
-    return res.status(400).json({ error: "Only the local SLT test agent is supported" });
+  const tenantId = req.authorizedTenantId!;
+  const resolvedAgent = resolveAuthorizedAgentId(req, req.query.agentId);
+  if (!resolvedAgent.ok) {
+    return res.status(resolvedAgent.status).json({ error: resolvedAgent.error });
   }
+  const agentId = resolvedAgent.agentId;
 
   try {
     const sessions: Array<Record<string, any>> = [];
@@ -362,22 +466,13 @@ app.get("/api/dev/live/queue", async (req, res) => {
   }
 });
 
-// Read-only SLT dashboard counts from LocalStack. This is a local test adapter,
-// NOT an authenticated company-admin endpoint. Never deploy this route publicly.
-app.get("/api/dev/admin/overview", async (req, res) => {
-  const remote = req.socket.remoteAddress || "";
-  const loopback = ["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(remote);
-  const allowedOrigins = ["http://localhost:8080", "http://127.0.0.1:8080"];
-  if (process.env.NODE_ENV === "production" || !loopback ||
-      (req.headers.origin && !allowedOrigins.includes(req.headers.origin))) {
+// Tenant-scoped dashboard counts from LocalStack, protected by company admin auth.
+app.get("/api/dev/admin/overview", ...requireCompanyAdmin, async (req, res) => {
+  if (!isLocalDevAllowed() || !isLoopbackOriginAllowed(req)) {
     return res.status(404).json({ error: "Not found" });
   }
-  if (req.query.tenantId !== "slt") {
-    return res.status(400).json({ error: "Only the local SLT test tenant is supported" });
-  }
+  const tenantId = req.authorizedTenantId!;
 
-  // Query tenant-partitioned tables; scan session table only for this small local demo.
-  // Production needs authenticated role/tenant authorization and indexed queries.
   const readTenantRows = async (tableName: string, scan = false) => {
     const rows: Array<Record<string, any>> = [];
     let nextKey: Record<string, any> | undefined;
@@ -387,7 +482,7 @@ app.get("/api/dev/admin/overview", async (req, res) => {
         ...(scan ? { FilterExpression: "tenantId = :tenant" } : {
           KeyConditionExpression: "tenantId = :tenant",
         }),
-        ExpressionAttributeValues: { ":tenant": "slt" },
+        ExpressionAttributeValues: { ":tenant": tenantId },
         ExclusiveStartKey: nextKey,
       };
       const response = scan
@@ -407,7 +502,7 @@ app.get("/api/dev/admin/overview", async (req, res) => {
       readTenantRows("omni-channel-chat-sessions", true),
     ]);
     return res.json({
-      tenantId: "slt", source: "localstack", demoOnly: true,
+      tenantId, source: "localstack", demoOnly: true,
       dashboard: {
         agents: agents.length,
         publishedAgents: null, // No shared publication-status model yet.
@@ -425,20 +520,12 @@ app.get("/api/dev/admin/overview", async (req, res) => {
   }
 });
 
-// Read-only Chat Monitor for the fixed SLT local-development tenant.
-// No message contents are returned. This must NOT be deployed as an admin API:
-// proper Cognito authentication and tenant authorization are required first.
-app.get("/api/dev/admin/chats", async (req, res) => {
-  const remote = req.socket.remoteAddress || "";
-  const loopback = ["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(remote);
-  const allowedOrigins = ["http://localhost:8080", "http://127.0.0.1:8080"];
-  if (process.env.NODE_ENV === "production" || !loopback ||
-      (req.headers.origin && !allowedOrigins.includes(req.headers.origin))) {
+// Tenant-scoped Chat Monitor (no message contents returned).
+app.get("/api/dev/admin/chats", ...requireCompanyAdmin, async (req, res) => {
+  if (!isLocalDevAllowed() || !isLoopbackOriginAllowed(req)) {
     return res.status(404).json({ error: "Not found" });
   }
-  if (req.query.tenantId !== "slt") {
-    return res.status(400).json({ error: "Only the local SLT test tenant is supported" });
-  }
+  const tenantId = req.authorizedTenantId!;
 
   try {
     const sessions: Array<Record<string, any>> = [];
@@ -447,18 +534,17 @@ app.get("/api/dev/admin/chats", async (req, res) => {
       const response = await docClient.send(new ScanCommand({
         TableName: "omni-channel-chat-sessions",
         FilterExpression: "tenantId = :tenant",
-        ExpressionAttributeValues: { ":tenant": "slt" },
+        ExpressionAttributeValues: { ":tenant": tenantId },
         ExclusiveStartKey: nextKey,
       }));
       sessions.push(...((response.Items || []) as Array<Record<string, any>>));
       nextKey = response.LastEvaluatedKey;
     } while (nextKey);
 
-    // ISO timestamps sort chronologically; use createdAt if updatedAt is absent.
     sessions.sort((a, b) => String(b.updatedAt || b.createdAt || "")
       .localeCompare(String(a.updatedAt || a.createdAt || "")));
     return res.json({
-      tenantId: "slt", source: "localstack", demoOnly: true,
+      tenantId, source: "localstack", demoOnly: true,
       total: sessions.length,
       items: sessions.slice(0, 100).map(s => ({
         sessionId: s.sessionId,
@@ -474,19 +560,12 @@ app.get("/api/dev/admin/chats", async (req, res) => {
   }
 });
 
-// Local SLT agent list. This is only for the loopback-only admin preview.
-// Do not expose this endpoint in production; it has no Cognito authorization.
-app.get("/api/dev/admin/agents", async (req, res) => {
-  const remote = req.socket.remoteAddress || "";
-  const loopback = ["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(remote);
-  const allowedOrigins = ["http://localhost:8080", "http://127.0.0.1:8080"];
-  if (process.env.NODE_ENV === "production" || !loopback ||
-      (req.headers.origin && !allowedOrigins.includes(req.headers.origin))) {
+// Tenant-scoped agent list.
+app.get("/api/dev/admin/agents", ...requireCompanyAdmin, async (req, res) => {
+  if (!isLocalDevAllowed() || !isLoopbackOriginAllowed(req)) {
     return res.status(404).json({ error: "Not found" });
   }
-  if (req.query.tenantId !== "slt") {
-    return res.status(400).json({ error: "Only the local SLT test tenant is supported" });
-  }
+  const tenantId = req.authorizedTenantId!;
 
   try {
     const records: Array<Record<string, any>> = [];
@@ -495,7 +574,7 @@ app.get("/api/dev/admin/agents", async (req, res) => {
       const result = await docClient.send(new QueryCommand({
         TableName: "omni-channel-agents",
         KeyConditionExpression: "tenantId = :tenant",
-        ExpressionAttributeValues: { ":tenant": "slt" },
+        ExpressionAttributeValues: { ":tenant": tenantId },
         ExclusiveStartKey: lastKey,
       }));
       records.push(...((result.Items || []) as Array<Record<string, any>>));
@@ -504,7 +583,7 @@ app.get("/api/dev/admin/agents", async (req, res) => {
 
     records.sort((a, b) => String(a.agentId || "").localeCompare(String(b.agentId || "")));
     return res.json({
-      tenantId: "slt", source: "localstack", demoOnly: true,
+      tenantId, source: "localstack", demoOnly: true,
       total: records.length,
       items: records.map(a => ({
         agentId: String(a.agentId || ""),
@@ -512,7 +591,6 @@ app.get("/api/dev/admin/agents", async (req, res) => {
         modelId: typeof a.modelId === "string" ? a.modelId :
           (typeof a.defaultModel === "string" ? a.defaultModel : null),
         status: typeof a.status === "string" ? a.status.toUpperCase() : "UNKNOWN",
-        // Seeded agent records do not necessarily have a published chat URL.
         publicAgentKey: typeof a.publicAgentKey === "string" && a.publicAgentKey.trim()
           ? a.publicAgentKey : null,
       })),
@@ -523,26 +601,19 @@ app.get("/api/dev/admin/agents", async (req, res) => {
   }
 });
 
-// Explicitly opt-in to creating DRAFT agent records for the fixed SLT local demo.
-// SECURITY: This is intentionally NOT a production admin API. Localhost alone is
-// not authentication; remove/replace this route with Cognito authorization before deploy.
-app.post("/api/dev/admin/agents", async (req, res) => {
-  const remote = req.socket.remoteAddress || "";
-  const loopback = ["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(remote);
+// Create tenant-scoped DRAFT agent record (requires explicit opt-in flag + company admin token).
+app.post("/api/dev/admin/agents", ...requireCompanyAdmin, async (req, res) => {
   const origin = req.headers.origin;
   const validOrigin = origin === "http://localhost:8080" || origin === "http://127.0.0.1:8080";
-  if (process.env.NODE_ENV === "production" || process.env.IS_LOCAL === "false" ||
-      process.env.ENABLE_LOCAL_AGENT_CREATION !== "true" || !loopback || !validOrigin ||
+  if (!isLocalDevAllowed() ||
+      process.env.ENABLE_LOCAL_AGENT_CREATION !== "true" || !isLoopbackOriginAllowed(req) || !validOrigin ||
       req.headers["x-local-admin-demo"] !== "create-agent" ||
       !req.is("application/json")) {
     return res.status(404).json({ error: "Local agent record creation is disabled or request not allowed" });
   }
 
-  const body: Record<string, unknown> = req.body && typeof req.body === "object" && !Array.isArray(req.body)
-    ? req.body : {};
-  if (body.tenantId !== undefined && body.tenantId !== "slt") {
-    return res.status(400).json({ error: "Only tenant slt can be used in this local demo" });
-  }
+  const tenantId = req.authorizedTenantId!;
+  const body: Record<string, unknown> = asPlainBody(req.body) ?? {};
   const trimmed = (name: string) => typeof body[name] === "string" ? (body[name] as string).trim() : "";
   const displayName = trimmed("displayName");
   const brandName = trimmed("brandName");
@@ -573,12 +644,11 @@ app.post("/api/dev/admin/agents", async (req, res) => {
   const agentId = `agent-${randomUUID()}`;
   const createdAt = new Date().toISOString();
   const item = {
-    tenantId: "slt", agentId, name: displayName, displayName, brandName,
+    tenantId, agentId, name: displayName, displayName, brandName,
     modelId, defaultModel: modelId, publicAgentKey,
     status: "draft", createdAt, updatedAt: createdAt,
     welcomeMessage, systemPrompt, knowledgeBaseRef,
     suggestedPrompts, toolIds, enabledSubAgents,
-    // Configuration is metadata until the runtime/publishing integration is implemented.
     deploymentStatus: "NOT_DEPLOYED",
   };
   try {
@@ -588,36 +658,31 @@ app.post("/api/dev/admin/agents", async (req, res) => {
       Item: item,
       ConditionExpression: "attribute_not_exists(tenantId) AND attribute_not_exists(agentId)",
     }));
-    return res.status(201).json({ source: "localstack", tenantId: "slt", demoOnly: true, item });
+    return res.status(201).json({ source: "localstack", tenantId, demoOnly: true, item });
   } catch (error) {
     console.error("[LocalAdminAgents] Could not create DRAFT agent record:", error);
     return res.status(503).json({ error: "Could not save agent record to LocalStack DynamoDB" });
   }
 });
 
-// LOCAL DEMO ONLY: retrieve an agent's stored configuration for inspection/editing.
-// Never expose these local administration routes on a publicly reachable backend.
-app.get("/api/dev/admin/agents/:agentId", async (req, res) => {
-  const remote = req.socket.remoteAddress || "";
-  const loopback = ["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(remote);
-  const origin = req.headers.origin;
-  if (process.env.NODE_ENV === "production" || process.env.IS_LOCAL === "false" || !loopback ||
-      (origin && origin !== "http://localhost:8080" && origin !== "http://127.0.0.1:8080")) {
+// Retrieve an agent's stored configuration for the authenticated tenant.
+app.get("/api/dev/admin/agents/:agentId", ...requireCompanyAdmin, async (req, res) => {
+  if (!isLocalDevAllowed() || !isLoopbackOriginAllowed(req)) {
     return res.status(404).json({ error: "Not found" });
   }
-  if (req.query.tenantId !== "slt" ||
-      !/^(?:main-agent|agent-[a-zA-Z0-9-]{1,80})$/.test(req.params.agentId)) {
+  const tenantId = req.authorizedTenantId!;
+  if (!/^(?:main-agent|agent-[a-zA-Z0-9-]{1,80})$/.test(req.params.agentId)) {
     return res.status(400).json({ error: "Invalid local tenant or agent ID" });
   }
   try {
     const result = await docClient.send(new GetCommand({
       TableName: "omni-channel-agents",
-      Key: { tenantId: "slt", agentId: req.params.agentId },
+      Key: { tenantId, agentId: req.params.agentId },
     }));
     if (!result.Item) return res.status(404).json({ error: "Agent not found" });
     const agent = result.Item;
     return res.json({
-      source: "localstack", tenantId: "slt", demoOnly: true,
+      source: "localstack", tenantId, demoOnly: true,
       item: {
         agentId: agent.agentId,
         displayName: agent.displayName || agent.name || agent.agentId,
@@ -641,24 +706,21 @@ app.get("/api/dev/admin/agents/:agentId", async (req, res) => {
   }
 });
 
-// LOCAL DEMO ONLY: edit approved configuration fields on a DRAFT agent record.
-// A loopback/header gate is not authentication. Real admin writes require Cognito.
-app.patch("/api/dev/admin/agents/:agentId", async (req, res) => {
-  const remote = req.socket.remoteAddress || "";
-  const loopback = ["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(remote);
+// Edit approved configuration fields on a DRAFT agent record for the authenticated tenant.
+app.patch("/api/dev/admin/agents/:agentId", ...requireCompanyAdmin, async (req, res) => {
   const origin = req.headers.origin;
   const allowedOrigin = origin === "http://localhost:8080" || origin === "http://127.0.0.1:8080";
-  if (process.env.NODE_ENV === "production" || process.env.IS_LOCAL === "false" ||
-      process.env.ENABLE_LOCAL_AGENT_EDITING !== "true" || !loopback || !allowedOrigin ||
+  if (!isLocalDevAllowed() ||
+      process.env.ENABLE_LOCAL_AGENT_EDITING !== "true" || !isLoopbackOriginAllowed(req) || !allowedOrigin ||
       req.headers["x-local-admin-demo"] !== "edit-agent" || !req.is("application/json")) {
     return res.status(404).json({ error: "Local draft editing unavailable" });
   }
+  const tenantId = req.authorizedTenantId!;
   const agentId = req.params.agentId;
   if (!/^agent-[a-zA-Z0-9-]{1,80}$/.test(agentId)) {
     return res.status(400).json({ error: "Only local demo agent IDs can be edited" });
   }
-  const payload: Record<string, unknown> =
-    req.body && typeof req.body === "object" && !Array.isArray(req.body) ? req.body : {};
+  const payload: Record<string, unknown> = asPlainBody(req.body) ?? {};
   const allowedFields = new Set([
     "displayName", "brandName", "modelId", "publicAgentKey", "welcomeMessage",
     "systemPrompt", "knowledgeBaseRef", "suggestedPrompts", "toolIds", "enabledSubAgents",
@@ -703,7 +765,7 @@ app.patch("/api/dev/admin/agents/:agentId", async (req, res) => {
     }
   }
   try {
-    const key = { tenantId: "slt", agentId };
+    const key = { tenantId, agentId };
     const existing = await docClient.send(new GetCommand({ TableName: "omni-channel-agents", Key: key }));
     if (!existing.Item) return res.status(404).json({ error: "Agent not found" });
     if (String(existing.Item.status).toUpperCase() !== "DRAFT") {
@@ -715,7 +777,7 @@ app.patch("/api/dev/admin/agents/:agentId", async (req, res) => {
         const page = await docClient.send(new QueryCommand({
           TableName: "omni-channel-agents",
           KeyConditionExpression: "tenantId = :tenant",
-          ExpressionAttributeValues: { ":tenant": "slt" },
+          ExpressionAttributeValues: { ":tenant": tenantId },
           ExclusiveStartKey: lastKey,
         }));
         if ((page.Items || []).some(other =>
@@ -746,7 +808,7 @@ app.patch("/api/dev/admin/agents/:agentId", async (req, res) => {
     }));
     const updated = result.Attributes || {};
     return res.json({
-      source: "localstack", tenantId: "slt", demoOnly: true,
+      source: "localstack", tenantId, demoOnly: true,
       agentId, status: "DRAFT", updatedAt: updated.updatedAt,
       updatedFields: keys,
     });
@@ -759,32 +821,25 @@ app.patch("/api/dev/admin/agents/:agentId", async (req, res) => {
   }
 });
 
-// LOCAL DEMO ONLY: delete disposable DRAFT agent records, never published agents.
-// This is not authenticated administration. Keep disabled outside a loopback demo.
-// DELETE is irreversible: this action removes the stored configuration, not an AI deployment.
-app.delete("/api/dev/admin/agents/:agentId", async (req, res) => {
-  const remote = req.socket.remoteAddress || "";
-  const loopback = ["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(remote);
+// Delete disposable DRAFT agent records for the authenticated tenant.
+app.delete("/api/dev/admin/agents/:agentId", ...requireCompanyAdmin, async (req, res) => {
   const origin = req.headers.origin;
   const allowedOrigin = origin === "http://localhost:8080" || origin === "http://127.0.0.1:8080";
-  if (process.env.NODE_ENV === "production" || process.env.IS_LOCAL === "false" ||
-      process.env.ENABLE_LOCAL_AGENT_DELETION !== "true" || !loopback || !allowedOrigin ||
+  if (!isLocalDevAllowed() ||
+      process.env.ENABLE_LOCAL_AGENT_DELETION !== "true" || !isLoopbackOriginAllowed(req) || !allowedOrigin ||
       req.headers["x-local-admin-demo"] !== "delete-draft-agent") {
     return res.status(404).json({ error: "Local draft deletion unavailable" });
   }
-  if (req.query.tenantId !== "slt") {
-    return res.status(400).json({ error: "Only the SLT local test tenant is supported" });
-  }
+  const tenantId = req.authorizedTenantId!;
   const agentId = req.params.agentId;
   if (!/^agent-[a-zA-Z0-9-]{1,80}$/.test(agentId) || agentId === "main-agent") {
     return res.status(400).json({ error: "Only disposable local draft agent IDs can be deleted" });
   }
-  // Require an explicit matching confirmation header to reduce accidental deletes.
   if (req.headers["x-confirm-delete-agent"] !== agentId) {
     return res.status(400).json({ error: "Confirm the exact agent ID to delete" });
   }
 
-  const key = { tenantId: "slt", agentId };
+  const key = { tenantId, agentId };
   try {
     const existing = await docClient.send(new GetCommand({
       TableName: "omni-channel-agents", Key: key,
@@ -795,7 +850,6 @@ app.delete("/api/dev/admin/agents/:agentId", async (req, res) => {
       return res.status(409).json({ error: "Only non-deployed DRAFT agents can be deleted" });
     }
 
-    // Atomic status check protects against publication between the read and delete.
     await docClient.send(new DeleteCommand({
       TableName: "omni-channel-agents", Key: key,
       ConditionExpression:
@@ -808,7 +862,7 @@ app.delete("/api/dev/admin/agents/:agentId", async (req, res) => {
       },
     }));
     return res.json({
-      source: "localstack", tenantId: "slt", demoOnly: true,
+      source: "localstack", tenantId, demoOnly: true,
       deleted: true, agentId, previousStatus: "DRAFT",
     });
   } catch (error: any) {
@@ -820,26 +874,23 @@ app.delete("/api/dev/admin/agents/:agentId", async (req, res) => {
   }
 });
 
-// LOCAL DEMO ONLY: publishing here makes a stored configuration accessible via
-// the existing mock-backed chat UI. It does NOT deploy an AI agent or expose a
-// public internet URL. Production requires real admin authentication and hosting.
-app.post("/api/dev/admin/agents/:agentId/publish", async (req, res) => {
-  const remote = req.socket.remoteAddress || "";
-  const loopback = ["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(remote);
+// Publish a DRAFT agent configuration for the authenticated tenant.
+app.post("/api/dev/admin/agents/:agentId/publish", ...requireCompanyAdmin, async (req, res) => {
   const origin = req.headers.origin;
   const validOrigin = origin === "http://localhost:8080" || origin === "http://127.0.0.1:8080";
-  if (process.env.NODE_ENV === "production" || process.env.IS_LOCAL === "false" ||
-      process.env.ENABLE_LOCAL_AGENT_PUBLISHING !== "true" || !loopback || !validOrigin ||
+  if (!isLocalDevAllowed() ||
+      process.env.ENABLE_LOCAL_AGENT_PUBLISHING !== "true" || !isLoopbackOriginAllowed(req) || !validOrigin ||
       req.headers["x-local-admin-demo"] !== "publish-agent" || !req.is("application/json")) {
     return res.status(404).json({ error: "Local publishing is not enabled" });
   }
+  const tenantId = req.authorizedTenantId!;
   const agentId = req.params.agentId;
   if (!/^agent-[a-zA-Z0-9-]{1,80}$/.test(agentId)) {
     return res.status(400).json({ error: "Invalid draft agent ID" });
   }
   try {
     const record = await docClient.send(new GetCommand({
-      TableName: "omni-channel-agents", Key: { tenantId: "slt", agentId },
+      TableName: "omni-channel-agents", Key: { tenantId, agentId },
     }));
     const agent = record.Item;
     if (!agent) return res.status(404).json({ error: "Draft agent not found" });
@@ -851,14 +902,12 @@ app.post("/api/dev/admin/agents/:agentId/publish", async (req, res) => {
       return res.status(400).json({ error: "Set a valid unique public URL key (not 'support') before publishing" });
     }
 
-    // Reject duplicate slugs for this tenant. The production model should
-    // enforce slug uniqueness atomically with a separate slug-lock item.
     let lastKey: Record<string, any> | undefined;
     do {
       const page = await docClient.send(new QueryCommand({
         TableName: "omni-channel-agents",
         KeyConditionExpression: "tenantId = :tenant",
-        ExpressionAttributeValues: { ":tenant": "slt" },
+        ExpressionAttributeValues: { ":tenant": tenantId },
         ExclusiveStartKey: lastKey,
       }));
       if ((page.Items || []).some(other =>
@@ -870,7 +919,7 @@ app.post("/api/dev/admin/agents/:agentId/publish", async (req, res) => {
 
     const now = new Date().toISOString();
     await docClient.send(new UpdateCommand({
-      TableName: "omni-channel-agents", Key: { tenantId: "slt", agentId },
+      TableName: "omni-channel-agents", Key: { tenantId, agentId },
       UpdateExpression: "SET #status = :published, publishedAt = :now, updatedAt = :now",
       ConditionExpression: "attribute_exists(agentId) AND (#status = :draft OR #status = :draftUpper) AND publicAgentKey = :publicKey",
       ExpressionAttributeNames: { "#status": "status" },
@@ -880,8 +929,8 @@ app.post("/api/dev/admin/agents/:agentId/publish", async (req, res) => {
       },
     }));
     return res.json({
-      tenantId: "slt", agentId, status: "PUBLISHED", demoOnly: true,
-      publicPath: `/chat.html?company=slt&agent=${encodeURIComponent(publicKey)}`,
+      tenantId, agentId, status: "PUBLISHED", demoOnly: true,
+      publicPath: `/chat.html?company=${encodeURIComponent(tenantId)}&agent=${encodeURIComponent(publicKey)}`,
       deploymentStatus: "NOT_DEPLOYED",
     });
   } catch (error: any) {
@@ -893,28 +942,22 @@ app.post("/api/dev/admin/agents/:agentId/publish", async (req, res) => {
   }
 });
 
-// LOCAL DEMO ONLY: unpublish a NOT_DEPLOYED agent without deleting its record.
-// New chat links for this public URL key stop resolving once the status changes.
-// This does NOT revoke already-active sessions or perform Bedrock undeployment.
-app.post("/api/dev/admin/agents/:agentId/unpublish", async (req, res) => {
-  const remote = req.socket.remoteAddress || "";
-  const loopback = ["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(remote);
+// Unpublish a NOT_DEPLOYED agent for the authenticated tenant.
+app.post("/api/dev/admin/agents/:agentId/unpublish", ...requireCompanyAdmin, async (req, res) => {
   const origin = req.headers.origin;
   const allowedOrigin = origin === "http://localhost:8080" || origin === "http://127.0.0.1:8080";
-  if (process.env.NODE_ENV === "production" || process.env.IS_LOCAL === "false" ||
-      process.env.ENABLE_LOCAL_AGENT_UNPUBLISHING !== "true" || !loopback || !allowedOrigin ||
+  if (!isLocalDevAllowed() ||
+      process.env.ENABLE_LOCAL_AGENT_UNPUBLISHING !== "true" || !isLoopbackOriginAllowed(req) || !allowedOrigin ||
       req.headers["x-local-admin-demo"] !== "unpublish-agent" || !req.is("application/json")) {
     return res.status(404).json({ error: "Local unpublishing unavailable" });
   }
-  if (req.query.tenantId !== "slt") {
-    return res.status(400).json({ error: "Only the SLT local test tenant is supported" });
-  }
+  const tenantId = req.authorizedTenantId!;
   const agentId = req.params.agentId;
   if (!/^agent-[a-zA-Z0-9-]{1,80}$/.test(agentId) ||
       req.headers["x-confirm-unpublish-agent"] !== agentId) {
     return res.status(400).json({ error: "Confirm the exact local agent ID to unpublish" });
   }
-  const key = { tenantId: "slt", agentId };
+  const key = { tenantId, agentId };
   try {
     const result = await docClient.send(new GetCommand({ TableName: "omni-channel-agents", Key: key }));
     if (!result.Item) return res.status(404).json({ error: "Agent not found" });
@@ -936,7 +979,7 @@ app.post("/api/dev/admin/agents/:agentId/unpublish", async (req, res) => {
       },
     }));
     return res.json({
-      tenantId: "slt", agentId, status: "DRAFT", demoOnly: true,
+      tenantId, agentId, status: "DRAFT", demoOnly: true,
       deploymentStatus: "NOT_DEPLOYED", publicLinkActive: false, updatedAt: now,
     });
   } catch (error: any) {
@@ -948,26 +991,15 @@ app.post("/api/dev/admin/agents/:agentId/unpublish", async (req, res) => {
   }
 });
 
-// Read-only S3 source file inventory for the local SLT admin preview.
-// An S3 object is NOT proof of a Bedrock Knowledge Base registration or successful indexing.
-// This endpoint has no Cognito authorization and must not be deployed publicly.
-app.get("/api/dev/admin/knowledge-files", async (req, res) => {
-  const remote = req.socket.remoteAddress || "";
-  const loopback = ["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(remote);
-  const allowedOrigins = ["http://localhost:8080", "http://127.0.0.1:8080"];
-  if (process.env.NODE_ENV === "production" || process.env.IS_LOCAL === "false" || !loopback ||
-      (req.headers.origin && !allowedOrigins.includes(req.headers.origin))) {
+// Read-only S3 source file inventory for the authenticated tenant.
+app.get("/api/dev/admin/knowledge-files", ...requireCompanyAdmin, async (req, res) => {
+  if (!isLocalDevAllowed() || !isLoopbackOriginAllowed(req)) {
     return res.status(404).json({ error: "Not found" });
   }
-  if (req.query.tenantId !== "slt") {
-    return res.status(400).json({ error: "Only the local SLT test tenant is supported" });
-  }
-
+  const tenantId = req.authorizedTenantId!;
   const bucket = process.env.KB_BUCKET_NAME || "omni-channel-kb-docs";
-  const prefix = "tenants/slt/";
+  const prefix = `tenants/${tenantId}/`;
   try {
-    // A bounded listing keeps this local debugging endpoint inexpensive.
-    // If more than 100 objects exist, show that the inventory is incomplete.
     const result = await s3Client.send(new ListObjectsV2Command({
       Bucket: bucket, Prefix: prefix, MaxKeys: 100,
     }));
@@ -983,7 +1015,7 @@ app.get("/api/dev/admin/knowledge-files", async (req, res) => {
       }))
       .sort((a, b) => a.name.localeCompare(b.name));
     return res.json({
-      tenantId: "slt", source: "localstack-s3", demoOnly: true,
+      tenantId, source: "localstack-s3", demoOnly: true,
       bucket, prefix, bucketStatus: "available",
       totalShown: items.length, truncated: !!result.IsTruncated, items,
       bedrockKnowledgeBasesTracked: false,
@@ -991,7 +1023,7 @@ app.get("/api/dev/admin/knowledge-files", async (req, res) => {
   } catch (error: any) {
     if (["NoSuchBucket", "NotFound"].includes(error?.name)) {
       return res.json({
-        tenantId: "slt", source: "localstack-s3", demoOnly: true,
+        tenantId, source: "localstack-s3", demoOnly: true,
         bucket, prefix, bucketStatus: "missing",
         totalShown: 0, truncated: false, items: [],
         bedrockKnowledgeBasesTracked: false,
@@ -1002,29 +1034,23 @@ app.get("/api/dev/admin/knowledge-files", async (req, res) => {
   }
 });
 
-// LOCAL DEMO ONLY: read a single small text document from the fixed SLT tenant.
-// Viewing source S3 content does not mean Bedrock indexing. Production requires
-// real Cognito authorization; localhost, Origin and demo headers are NOT auth.
-app.get("/api/dev/admin/knowledge-files/:documentName", async (req, res) => {
-  const remote = req.socket.remoteAddress || "";
-  const loopback = ["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(remote);
+// Read a single small text document from the authenticated tenant's S3 prefix.
+app.get("/api/dev/admin/knowledge-files/:documentName", ...requireCompanyAdmin, async (req, res) => {
   const origin = req.headers.origin;
   const validOrigin = origin === "http://localhost:8080" || origin === "http://127.0.0.1:8080";
-  if (process.env.NODE_ENV === "production" || process.env.IS_LOCAL === "false" ||
-      process.env.ENABLE_LOCAL_KB_VIEWING !== "true" || !loopback || !validOrigin ||
+  if (!isLocalDevAllowed() ||
+      process.env.ENABLE_LOCAL_KB_VIEWING !== "true" || !isLoopbackOriginAllowed(req) || !validOrigin ||
       req.headers["x-local-admin-demo"] !== "view-kb-document") {
     return res.status(404).json({ error: "Local KB document viewing unavailable" });
   }
-  if (req.query.tenantId !== "slt") {
-    return res.status(400).json({ error: "Only local demo tenant slt is supported" });
-  }
+  const tenantId = req.authorizedTenantId!;
   const documentName = req.params.documentName;
   if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,79}\.(?:txt|md)$/.test(documentName)) {
     return res.status(400).json({ error: "Invalid knowledge document filename" });
   }
 
   const bucket = process.env.KB_BUCKET_NAME || "omni-channel-kb-docs";
-  const key = `tenants/slt/${documentName}`;
+  const key = `tenants/${tenantId}/${documentName}`;
   const maxBytes = 32 * 1024;
   try {
     const object = await s3Client.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
@@ -1033,8 +1059,6 @@ app.get("/api/dev/admin/knowledge-files/:documentName", async (req, res) => {
     }
     const chunks: Buffer[] = [];
     let bytes = 0;
-    // Limit bytes while streaming; don't trust S3 ContentLength or download
-    // an unbounded object into memory simply to display a preview.
     const stream = object.Body as import("stream").Readable;
     for await (const part of stream) {
       const chunk = Buffer.isBuffer(part) ? part : Buffer.from(part);
@@ -1046,7 +1070,7 @@ app.get("/api/dev/admin/knowledge-files/:documentName", async (req, res) => {
     }
     const content = Buffer.concat(chunks).toString("utf8");
     return res.json({
-      tenantId: "slt", source: "localstack-s3", demoOnly: true,
+      tenantId, source: "localstack-s3", demoOnly: true,
       name: documentName, key, bytes, content, etag: object.ETag || null,
       storageStatus: "STORED_IN_S3", indexedInBedrock: null,
     });
@@ -1060,25 +1084,18 @@ app.get("/api/dev/admin/knowledge-files/:documentName", async (req, res) => {
   }
 });
 
-// LOCAL DEMO ONLY: intentionally replace an existing small SLT text document.
-// Requires a client-supplied ETag and exact filename confirmation. Do not expose
-// publicly: localhost, Origin, and demo headers are NOT authentication.
-// Bedrock indexing/deployment is NOT performed by this endpoint.
+// Replace an existing small text document in the authenticated tenant's S3 prefix.
 const localKbUpdatesInFlight = new Set<string>();
-app.patch("/api/dev/admin/knowledge-files/:documentName", async (req, res) => {
-  const remote = req.socket.remoteAddress || "";
-  const loopback = ["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(remote);
+app.patch("/api/dev/admin/knowledge-files/:documentName", ...requireCompanyAdmin, async (req, res) => {
   const origin = req.headers.origin;
   const validOrigin = origin === "http://localhost:8080" || origin === "http://127.0.0.1:8080";
-  if (process.env.NODE_ENV === "production" || process.env.IS_LOCAL === "false" ||
-      process.env.ENABLE_LOCAL_KB_UPDATING !== "true" || !loopback || !validOrigin ||
+  if (!isLocalDevAllowed() ||
+      process.env.ENABLE_LOCAL_KB_UPDATING !== "true" || !isLoopbackOriginAllowed(req) || !validOrigin ||
       req.headers["x-local-admin-demo"] !== "update-kb-document" ||
       !req.is("application/json")) {
     return res.status(404).json({ error: "Local KB document updating unavailable" });
   }
-  if (req.query.tenantId !== "slt") {
-    return res.status(400).json({ error: "Only local demo tenant slt is supported" });
-  }
+  const tenantId = req.authorizedTenantId!;
   const documentName = req.params.documentName;
   if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,79}\.(?:txt|md)$/.test(documentName)) {
     return res.status(400).json({ error: "Invalid knowledge document filename" });
@@ -1086,25 +1103,21 @@ app.patch("/api/dev/admin/knowledge-files/:documentName", async (req, res) => {
   if (req.headers["x-confirm-update-document"] !== documentName) {
     return res.status(400).json({ error: "Confirm the exact document name to update" });
   }
-  const body: Record<string, unknown> =
-    req.body && typeof req.body === "object" && !Array.isArray(req.body) ? req.body : {};
-  if (Object.keys(body).some(k => !["tenantId", "content", "expectedEtag"].includes(k)) ||
-      body.tenantId !== "slt") {
-    return res.status(400).json({ error: "Invalid local tenant or update fields" });
+  const body: Record<string, unknown> = asPlainBody(req.body) ?? {};
+  if (Object.keys(body).some(k => !["tenantId", "content", "expectedEtag"].includes(k))) {
+    return res.status(400).json({ error: "Invalid update fields" });
   }
   const content = body.content;
   if (typeof content !== "string" || !content.trim() || Buffer.byteLength(content, "utf8") > 32768) {
     return res.status(400).json({ error: "Document must contain 1-32768 bytes of UTF-8 text" });
   }
-  // The current ETag is returned by GET /api/dev/admin/knowledge-files/:documentName.
   const expectedEtag = body.expectedEtag;
   if (typeof expectedEtag !== "string" || !/^"[^"\r\n]{1,160}"$/.test(expectedEtag)) {
     return res.status(428).json({ error: "Provide the current document ETag before updating" });
   }
 
   const bucket = process.env.KB_BUCKET_NAME || "omni-channel-kb-docs";
-  const key = `tenants/slt/${documentName}`;
-  // This lock only prevents competing updates in this one local Node process.
+  const key = `tenants/${tenantId}/${documentName}`;
   if (localKbUpdatesInFlight.has(key)) {
     return res.status(409).json({ error: "An update to this document is already in progress" });
   }
@@ -1119,17 +1132,15 @@ app.patch("/api/dev/admin/knowledge-files/:documentName", async (req, res) => {
       return res.status(413).json({ error: "Existing document exceeds local update limit" });
     }
     const documentBody = Buffer.from(content, "utf8");
-    // AWS S3 enforces IfMatch atomically. LocalStack 3.0 may not, so the
-    // HEAD comparison and same-process lock also protect this local demo.
     const result = await s3Client.send(new PutObjectCommand({
       Bucket: bucket, Key: key, Body: documentBody,
       ContentLength: documentBody.length,
       ContentType: "text/plain; charset=utf-8",
       IfMatch: expectedEtag,
-      Metadata: { ...(head.Metadata || {}), "tenant-id": "slt", "updated-by": "local-kb-admin-demo" },
+      Metadata: { ...(head.Metadata || {}), "tenant-id": tenantId, "updated-by": req.localAuth!.sub },
     }));
     return res.json({
-      success: true, demoOnly: true, tenantId: "slt", name: documentName, key,
+      success: true, demoOnly: true, tenantId, name: documentName, key,
       updated: true, bytes: documentBody.length,
       previousEtag: expectedEtag, etag: result.ETag || null,
       storageStatus: "STORED_IN_S3", indexedInBedrock: null,
@@ -1150,22 +1161,16 @@ app.patch("/api/dev/admin/knowledge-files/:documentName", async (req, res) => {
   }
 });
 
-// LOCAL DEMO ONLY: permanently delete disposable KB test documents.
-// Do not expose this route publicly. It has no authenticated administrator identity.
-// Only kb-upload-test-* files are deletable; real support guides are intentionally protected.
-app.delete("/api/dev/admin/knowledge-files/:documentName", async (req, res) => {
-  const remote = req.socket.remoteAddress || "";
-  const loopback = ["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(remote);
+// Delete disposable kb-upload-test-* documents in the authenticated tenant's S3 prefix.
+app.delete("/api/dev/admin/knowledge-files/:documentName", ...requireCompanyAdmin, async (req, res) => {
   const origin = req.headers.origin;
   const validOrigin = origin === "http://localhost:8080" || origin === "http://127.0.0.1:8080";
-  if (process.env.NODE_ENV === "production" || process.env.IS_LOCAL === "false" ||
-      process.env.ENABLE_LOCAL_KB_DELETING !== "true" || !loopback || !validOrigin ||
+  if (!isLocalDevAllowed() ||
+      process.env.ENABLE_LOCAL_KB_DELETING !== "true" || !isLoopbackOriginAllowed(req) || !validOrigin ||
       req.headers["x-local-admin-demo"] !== "delete-kb-document") {
     return res.status(404).json({ error: "Local KB document deletion unavailable" });
   }
-  if (req.query.tenantId !== "slt") {
-    return res.status(400).json({ error: "Only local demo tenant slt is supported" });
-  }
+  const tenantId = req.authorizedTenantId!;
   const documentName = req.params.documentName;
   if (!/^kb-upload-test-[A-Za-z0-9_-]{1,60}\.(?:txt|md)$/.test(documentName)) {
     return res.status(400).json({ error: "Only disposable kb-upload-test-* text documents can be deleted" });
@@ -1179,8 +1184,7 @@ app.delete("/api/dev/admin/knowledge-files/:documentName", async (req, res) => {
   }
 
   const bucket = process.env.KB_BUCKET_NAME || "omni-channel-kb-docs";
-  const key = `tenants/slt/${documentName}`;
-  // This lock coordinates with the local update route in this Node process only.
+  const key = `tenants/${tenantId}/${documentName}`;
   if (localKbUpdatesInFlight.has(key)) {
     return res.status(409).json({ error: "A change to this document is already in progress" });
   }
@@ -1191,11 +1195,9 @@ app.delete("/api/dev/admin/knowledge-files/:documentName", async (req, res) => {
     if (head.ETag !== expectedEtag) {
       return res.status(409).json({ error: "Document changed; reload it before deleting" });
     }
-    // AWS S3 checks IfMatch on DELETE. The HEAD check also protects normal
-    // sequential local testing when LocalStack does not enforce conditional headers.
     await s3Client.send(new DeleteObjectCommand({ Bucket: bucket, Key: key, IfMatch: expectedEtag }));
     return res.json({
-      success: true, demoOnly: true, tenantId: "slt", name: documentName, key,
+      success: true, demoOnly: true, tenantId, name: documentName, key,
       deleted: true, previousEtag: expectedEtag, indexedInBedrock: null,
     });
   } catch (error: any) {
@@ -1214,30 +1216,24 @@ app.delete("/api/dev/admin/knowledge-files/:documentName", async (req, res) => {
   }
 });
 
-// TEMPORARY LOCAL MESSAGE API — NOT SUITABLE FOR PRODUCTION.
-// The agent ID is fixed for the SLT demo and there is no Cognito identity here.
-// Keep these endpoints loopback-only until proper customer/agent authorization exists.
-function allowLocalMessageRequest(req: express.Request): boolean {
-  const remote = req.socket.remoteAddress || "";
-  const loopback = ["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(remote);
-  const origins = ["http://localhost:8080", "http://127.0.0.1:8080"];
-  return process.env.NODE_ENV !== "production" && loopback &&
-    (!req.headers.origin || origins.includes(req.headers.origin)) &&
-    req.query.tenantId === "slt" && req.query.agentId === "local-agent-01";
-}
-
 const LOCAL_SESSION_TABLE = "omni-channel-chat-sessions";
 const LOCAL_MAX_MESSAGES = 100; // Demo limit: each session is one DynamoDB item.
 
-// Local-only resolution endpoint: the conditional write is the source of truth.
-// Unlike the legacy resolve endpoint, it does not report success if the session
-// was absent, assigned to someone else, or already resolved.
-app.post("/api/dev/live/conversations/:sessionId/close", async (req, res) => {
-  if (!allowLocalMessageRequest(req)) return res.status(404).json({ error: "Not found" });
+app.post("/api/dev/live/conversations/:sessionId/close", ...requireAgentOrCompany, async (req, res) => {
+  if (!isLocalDevAllowed() || !isLoopbackOriginAllowed(req)) {
+    return res.status(404).json({ error: "Not found" });
+  }
   const sessionId = req.params.sessionId;
-  if (!/^[a-zA-Z0-9_-]{1,128}$/.test(sessionId)) {
+  if (!SAFE_ID_PATTERN.test(sessionId)) {
     return res.status(400).json({ error: "Invalid sessionId" });
   }
+  const tenantId = req.authorizedTenantId!;
+  const resolvedAgent = resolveAuthorizedAgentId(req, req.query.agentId);
+  if (!resolvedAgent.ok) {
+    return res.status(resolvedAgent.status).json({ error: resolvedAgent.error });
+  }
+  const agentId = resolvedAgent.agentId;
+
   try {
     await docClient.send(new UpdateCommand({
       TableName: LOCAL_SESSION_TABLE,
@@ -1246,34 +1242,42 @@ app.post("/api/dev/live/conversations/:sessionId/close", async (req, res) => {
       ConditionExpression: "attribute_exists(sessionId) AND tenantId = :tenant AND assignedAgentId = :agent AND #st = :active",
       ExpressionAttributeNames: { "#st": "status" },
       ExpressionAttributeValues: {
-        ":tenant": "slt", ":agent": "local-agent-01",
+        ":tenant": tenantId, ":agent": agentId,
         ":active": "HUMAN_ACTIVE", ":resolved": "RESOLVED", ":now": new Date().toISOString(),
       },
     }));
-    // Decrement only after the first successful transition, not on repeat clicks.
-    await adjustActiveChats("slt", "local-agent-01", -1);
+    await adjustActiveChats(tenantId, agentId, -1);
     return res.json({ sessionId, status: "RESOLVED", demoOnly: true });
   } catch (error: any) {
     if (error?.name === "ConditionalCheckFailedException") {
-      return res.status(409).json({ error: "Conversation is missing, already resolved, or not assigned to this local agent" });
+      return res.status(409).json({ error: "Conversation is missing, already resolved, or not assigned to this agent" });
     }
     console.error("[LocalMessages] Resolution error:", error);
     return res.status(503).json({ error: "Conversation resolution unavailable" });
   }
 });
 
-app.get("/api/dev/live/conversations/:sessionId/messages", async (req, res) => {
-  if (!allowLocalMessageRequest(req)) return res.status(404).json({ error: "Not found" });
+app.get("/api/dev/live/conversations/:sessionId/messages", ...requireAgentOrCompany, async (req, res) => {
+  if (!isLocalDevAllowed() || !isLoopbackOriginAllowed(req)) {
+    return res.status(404).json({ error: "Not found" });
+  }
   const sessionId = req.params.sessionId;
-  if (!/^[a-zA-Z0-9_-]{1,128}$/.test(sessionId)) {
+  if (!SAFE_ID_PATTERN.test(sessionId)) {
     return res.status(400).json({ error: "Invalid sessionId" });
   }
+  const tenantId = req.authorizedTenantId!;
+  const resolvedAgent = resolveAuthorizedAgentId(req, req.query.agentId);
+  if (!resolvedAgent.ok) {
+    return res.status(resolvedAgent.status).json({ error: resolvedAgent.error });
+  }
+  const agentId = resolvedAgent.agentId;
+
   try {
     const result = await docClient.send(new GetCommand({
       TableName: LOCAL_SESSION_TABLE, Key: { sessionId },
     }));
     const session = result.Item;
-    if (!session || session.tenantId !== "slt" || session.assignedAgentId !== "local-agent-01") {
+    if (!session || session.tenantId !== tenantId || session.assignedAgentId !== agentId) {
       return res.status(404).json({ error: "Conversation not found" });
     }
     if (session.status !== "HUMAN_ACTIVE" && session.status !== "RESOLVED") {
@@ -1289,14 +1293,24 @@ app.get("/api/dev/live/conversations/:sessionId/messages", async (req, res) => {
   }
 });
 
-app.post("/api/dev/live/conversations/:sessionId/messages", async (req, res) => {
-  if (!allowLocalMessageRequest(req)) return res.status(404).json({ error: "Not found" });
+app.post("/api/dev/live/conversations/:sessionId/messages", ...requireAgentOrCompany, async (req, res) => {
+  if (!isLocalDevAllowed() || !isLoopbackOriginAllowed(req)) {
+    return res.status(404).json({ error: "Not found" });
+  }
   const sessionId = req.params.sessionId;
-  if (!/^[a-zA-Z0-9_-]{1,128}$/.test(sessionId)) {
+  if (!SAFE_ID_PATTERN.test(sessionId)) {
     return res.status(400).json({ error: "Invalid sessionId" });
   }
-  const role = req.body?.role;
-  const message = req.body?.message;
+  const tenantId = req.authorizedTenantId!;
+  const resolvedAgent = resolveAuthorizedAgentId(req, req.query.agentId);
+  if (!resolvedAgent.ok) {
+    return res.status(resolvedAgent.status).json({ error: resolvedAgent.error });
+  }
+  const agentId = resolvedAgent.agentId;
+
+  const body = asPlainBody(req.body);
+  const role = body?.role;
+  const message = body?.message;
   if ((role !== "user" && role !== "live_agent") ||
       typeof message !== "string" || !message.trim() || message.length > 1600) {
     return res.status(400).json({ error: "Role must be user or live_agent, and message must contain 1–1600 characters" });
@@ -1305,8 +1319,6 @@ app.post("/api/dev/live/conversations/:sessionId/messages", async (req, res) => 
     messageId: randomUUID(), role, text: message.trim(), createdAt: new Date().toISOString(),
   };
   try {
-    // Conditional append: do not create a missing session, cross tenants/agents,
-    // reopen a resolved session, or exceed the demo per-session message cap.
     await docClient.send(new UpdateCommand({
       TableName: LOCAL_SESSION_TABLE,
       Key: { sessionId },
@@ -1315,7 +1327,7 @@ app.post("/api/dev/live/conversations/:sessionId/messages", async (req, res) => 
       ExpressionAttributeNames: { "#msgs": "messages", "#st": "status" },
       ExpressionAttributeValues: {
         ":empty": [], ":new": [chatMessage], ":now": chatMessage.createdAt,
-        ":tenant": "slt", ":agent": "local-agent-01", ":active": "HUMAN_ACTIVE",
+        ":tenant": tenantId, ":agent": agentId, ":active": "HUMAN_ACTIVE",
         ":limit": LOCAL_MAX_MESSAGES,
       },
     }));
@@ -1333,32 +1345,19 @@ app.post("/api/dev/live/conversations/:sessionId/messages", async (req, res) => 
 // 5. WORKSPACE PORTAL & KB DOCUMENT UPLOAD
 // ==========================================
 
-// LOCAL DEMO ONLY: create a small .txt/.md source document in tenant slt's S3 prefix.
-// This legacy route previously accepted unauthenticated tenant IDs and fabricated admin
-// context. It is disabled by default and MUST be replaced with Cognito authorization
-// before any production deployment. S3 storage does not mean Bedrock KB indexing.
-app.post("/api/workspace/upload-doc", async (req, res) => {
-  const remote = req.socket.remoteAddress || "";
-  const loopback = ["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(remote);
-  const origin = req.headers.origin;
-  const validOrigin = origin === "http://localhost:8080" || origin === "http://127.0.0.1:8080";
-  if (process.env.NODE_ENV === "production" || process.env.IS_LOCAL === "false" ||
-      process.env.ENABLE_LOCAL_KB_UPLOADING !== "true" || !loopback || !validOrigin ||
-      req.headers["x-local-admin-demo"] !== "upload-kb-document" ||
-      !req.is("application/json")) {
+// Protected by verified company admin token; derives tenantId strictly from verified claims.
+app.post("/api/workspace/upload-doc", ...requireCompanyAdmin, async (req, res) => {
+  if (!isLocalDevAllowed()) {
     return res.status(404).json({ success: false, error: "Local KB document uploading unavailable" });
   }
-
-  const body: Record<string, unknown> = req.body && typeof req.body === "object" && !Array.isArray(req.body)
-    ? req.body : {};
-  // Never accept a user-controlled tenant identity or privileged user ID.
-  if (body.tenantId !== "slt") {
-    return res.status(400).json({ success: false, error: "Only local demo tenant slt is supported" });
+  if (!req.is("application/json")) {
+    return res.status(400).json({ success: false, error: "Content-Type application/json is required" });
   }
+
+  const tenantId = req.authorizedTenantId!;
+  const body: Record<string, unknown> = asPlainBody(req.body) ?? {};
   const documentName = typeof body.documentName === "string" ? body.documentName.trim() : "";
   const content = body.content;
-  // Flat, explicitly named text files only; reject separators, traversal, and
-  // reserved/hidden names instead of trusting the broader S3 key helper.
   if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,79}\.(?:txt|md)$/.test(documentName)) {
     return res.status(400).json({ success: false, error: "Use a simple .txt or .md filename (letters, digits, dash, underscore)" });
   }
@@ -1367,19 +1366,23 @@ app.post("/api/workspace/upload-doc", async (req, res) => {
   }
 
   const context: TenantContext = {
-    tenantId: "slt", userId: "local-kb-admin-demo", role: "admin",
+    tenantId,
+    userId: req.localAuth!.sub,
+    role: "admin",
     permissions: ["faults:read", "billing:read", "usage:read"],
-    channel: "web", sessionId: `sess-${Date.now()}`,
-    conversationId: `conv-${Date.now()}`,
+    channel: "web",
+    sessionId: `sess-${randomUUID()}`,
+    conversationId: `conv-${randomUUID()}`,
   };
 
   try {
-    // A conditional S3 PUT prevents an existing document from being overwritten.
     const uploadedKey = await uploadKbDocument(context, documentName, content, { createOnly: true });
     return res.status(201).json({
-      success: true, demoOnly: true,
-      s3Key: uploadedKey, tenantId: "slt",
-      storageStatus: "STORED_IN_S3", indexedInBedrock: null,
+      success: true,
+      s3Key: uploadedKey,
+      tenantId,
+      storageStatus: "STORED_IN_S3",
+      indexedInBedrock: null,
       message: `Document '${documentName}' stored in local S3.`,
     });
   } catch (err: any) {
@@ -1392,45 +1395,54 @@ app.post("/api/workspace/upload-doc", async (req, res) => {
   }
 });
 
-// GET /api/workspace/conversations (Conversation Transcripts)
-app.get("/api/workspace/conversations", (req, res) => {
-  res.json({
-    success: true,
-    conversations: [
-      {
-        conversationId: "conv-101",
-        customerName: "Kasun Perera",
-        lastMessage: "My router has a red LOS light",
-        status: "RESOLVED",
-        assignedAgent: "admin1",
-        updatedAt: new Date().toISOString(),
-      },
-      {
-        conversationId: "conv-102",
-        customerName: "Nimali Fernando",
-        lastMessage: "Can I check my current 4G data usage?",
-        status: "BOT_HANDLED",
-        assignedAgent: "AI Bot",
-        updatedAt: new Date().toISOString(),
-      },
-    ],
-  });
+// GET /api/workspace/conversations (Tenant-Scoped Conversation Transcripts)
+app.get("/api/workspace/conversations", ...requireCompanyAdmin, async (req, res) => {
+  if (!isLocalDevAllowed()) {
+    return res.status(404).json({ success: false, error: "Local workspace conversations unavailable" });
+  }
+
+  let limit = 50;
+  if (req.query.limit !== undefined) {
+    if (typeof req.query.limit !== "string" || !/^\d+$/.test(req.query.limit.trim())) {
+      return res.status(400).json({ success: false, error: "Invalid limit parameter" });
+    }
+    limit = Number(req.query.limit.trim());
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+      return res.status(400).json({ success: false, error: "limit must be between 1 and 100" });
+    }
+  }
+
+  const tenantId = req.authorizedTenantId!;
+  try {
+    const conversations = await listConversationsForTenant(tenantId, limit);
+    return res.status(200).json({
+      success: true,
+      tenantId,
+      conversations,
+    });
+  } catch (error) {
+    console.error("[WorkspaceConversations] Failed to query tenant conversations:", error);
+    return res.status(503).json({
+      success: false,
+      error: "Conversations unavailable; check DynamoDB",
+    });
+  }
 });
 
 // ==========================================
 // 6. HOSTED CHAT URL RESOLVER
 // ==========================================
 
-// GET /api/resolve-chat-url?company={slug}&agent={agent}
+// GET /api/resolve-chat-url?company={slug}&agent={agent} (Public customer chat widget bootstrap)
 app.get(["/api/resolve-chat-url", "/resolve-chat-url"], async (req, res) => {
   const remote = req.socket.remoteAddress || "";
   const loopback = ["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(remote);
-  if (process.env.NODE_ENV === "production" || process.env.IS_LOCAL === "false" || !loopback) {
+  if (!isLocalDevAllowed() || !loopback) {
     return res.status(404).json({ error: "Local chat resolver is unavailable" });
   }
   const companySlug = typeof req.query.company === "string" ? req.query.company : "slt";
   const agentSlug = typeof req.query.agent === "string" ? req.query.agent : "support";
-  if (companySlug !== "slt" || !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(agentSlug)) {
+  if (companySlug !== "slt" || !TENANT_ID_PATTERN.test(agentSlug)) {
     return res.status(404).json({ error: "Chatbot not found" });
   }
 
@@ -1484,14 +1496,77 @@ app.get(["/api/resolve-chat-url", "/resolve-chat-url"], async (req, res) => {
 // 7. AGENT CHAT DISPATCH PIPELINE
 // ==========================================
 
+const ALLOWED_CHANNELS = new Set<TenantContext["channel"]>([
+  "web",
+  "whatsapp",
+  "sms",
+  "messenger",
+]);
+
 // POST /api/tenant/route or POST /api/agent
-app.post(["/api/tenant/route", "/api/agent"], async (req, res) => {
+app.post(["/api/tenant/route", "/api/agent"], ...requireAgentOrCompany, async (req, res) => {
   try {
+    const auth = req.localAuth!;
+    const rawChannel = typeof req.headers["x-channel"] === "string"
+      ? req.headers["x-channel"].trim().toLowerCase()
+      : "";
+    const channel: TenantContext["channel"] = ALLOWED_CHANNELS.has(rawChannel as TenantContext["channel"])
+      ? (rawChannel as TenantContext["channel"])
+      : "web";
+
+    const rawSessionId = typeof req.headers["x-session-id"] === "string"
+      ? req.headers["x-session-id"].trim()
+      : "";
+    const sessionId = SAFE_ID_PATTERN.test(rawSessionId) ? rawSessionId : `sess-${randomUUID()}`;
+
+    const rawConvId = typeof req.headers["x-conversation-id"] === "string"
+      ? req.headers["x-conversation-id"].trim()
+      : "";
+    const conversationId = SAFE_ID_PATTERN.test(rawConvId) ? rawConvId : `conv-${randomUUID()}`;
+
+    const verifiedContext: TenantContext = {
+      tenantId: req.authorizedTenantId!,
+      userId: auth.sub,
+      role: auth.role === "company" ? "admin" : "live_agent",
+      permissions:
+        auth.role === "company"
+          ? ["billing:read", "billing:purchase", "usage:read", "faults:read", "faults:create"]
+          : ["billing:read", "usage:read", "faults:read", "faults:create"],
+      channel,
+      sessionId,
+      conversationId,
+    };
+
+    const body = asPlainBody(req.body);
+    if (req.body !== undefined && !body) {
+      return res.status(400).json({
+        success: false,
+        error: { code: "BAD_REQUEST", message: "Invalid JSON object payload", retryable: false },
+      });
+    }
+
     const response = await handleTenantRequest({
       headers: (req.headers as Record<string, string>) || {},
-      body: req.body,
+      body: body || {},
+      verifiedContext,
     });
-    return res.json(response);
+
+    if (!response.success) {
+      const code = response.error?.code;
+      const status =
+        code === "UNAUTHORIZED"
+          ? 401
+          : code === "FORBIDDEN" || code === "TENANT_INACTIVE"
+            ? 403
+            : code === "TENANT_NOT_FOUND"
+              ? 404
+              : code === "BAD_REQUEST"
+                ? 400
+                : 500;
+      return res.status(status).json(response);
+    }
+
+    return res.status(200).json(response);
   } catch (err: any) {
     return res.status(500).json({
       success: false,
@@ -1503,6 +1578,11 @@ app.post(["/api/tenant/route", "/api/agent"], async (req, res) => {
     });
   }
 });
+
+  return app;
+}
+
+const app = createApp();
 
 let server: any = null;
 if (require.main === module) {

@@ -3,7 +3,7 @@ import { TenantContext } from "../shared/types/tenant-context";
 import { PERMISSIONS } from "../shared/constants/permissions";
 
 const mockContext: TenantContext = {
-  tenantId: "tenant-001",
+  tenantId: "slt",
   userId: "user-123",
   role: "staff",
   permissions: [
@@ -48,6 +48,10 @@ async function runAllTests() {
   console.log(
     `Test 3 (Support - troubleshoot_router): ${supportRes.success ? "✅ PASS" : "❌ FAIL"}\n`,
   );
+
+  if (!balanceRes.success || !usageRes.success || !supportRes.success) {
+    process.exitCode = 1;
+  }
 
   console.log("--- Combined Tests Complete ---");
 }
