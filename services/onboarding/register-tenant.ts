@@ -1,23 +1,13 @@
-import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
-import { DynamoDBDocumentClient, PutCommand, GetCommand } from "@aws-sdk/lib-dynamodb";
 import { uploadKbDocument } from "../../agents/utils/s3-client";
 import { TenantContext } from "../../shared/types/tenant-context";
 import {
-  TenantRecord,
-  TenantAgentRecord,
   inMemoryTenants,
   inMemoryAgents,
+  TenantRecord,
+  TenantAgentRecord,
 } from "../../scripts/create-tenants-table";
-
-const rawClient = new DynamoDBClient({
-  region: "us-east-1",
-  endpoint: "http://127.0.0.1:4566",
-  credentials: {
-    accessKeyId: "mock_access_key",
-    secretAccessKey: "mock_secret_key",
-  },
-});
-const docClient = DynamoDBDocumentClient.from(rawClient);
+import { onboardCompany, OnboardingDeps } from "./onboarding";
+import { deriveTenantId, normalizeCompanySlug } from "../../shared/utils/tenant-name";
 
 export interface RegisterTenantInput {
   companyName: string;
@@ -55,13 +45,13 @@ export interface RegisterTenantResult {
 }
 
 /**
- * Onboards a new company onto the Multi-Tenant Platform.
- * Enforces strict tenant partitioning across DynamoDB, S3, and Cognito credentials.
+ * Onboards a new company onto the Multi-Tenant Platform by delegating to the
+ * single durable onboarding pipeline (onboardCompany).
  */
 export async function registerTenant(
-  input: RegisterTenantInput
+  input: RegisterTenantInput,
+  deps?: OnboardingDeps
 ): Promise<RegisterTenantResult> {
-  // 1. Validation
   if (!input.companyName || !input.companyName.trim()) {
     throw new Error("Validation Failed: 'companyName' is required.");
   }
@@ -72,32 +62,38 @@ export async function registerTenant(
     throw new Error("Validation Failed: Valid 'adminEmail' is required.");
   }
 
-  const cleanSlug = input.companySlug.toLowerCase().trim().replace(/[^a-z0-9-]/g, "-");
-  const tenantId = cleanSlug === "slt" ? "slt" : `tenant-${cleanSlug}`;
+  const cleanSlug = normalizeCompanySlug(input.companySlug);
+  const tenantId = deriveTenantId(cleanSlug, input.companyName);
   const planTier = input.planTier || "starter";
-  const now = new Date().toISOString();
 
-  // 2. Check for Duplicate Tenant
-  let existingTenant = inMemoryTenants.get(tenantId);
-  if (!existingTenant) {
-    try {
-      const resp = await docClient.send(
-        new GetCommand({
-          TableName: "omni-channel-tenants",
-          Key: { tenantId },
-        })
-      );
-      if (resp.Item) existingTenant = resp.Item as TenantRecord;
-    } catch {
-      // LocalStack offline fallback
+  const outcome = await onboardCompany(
+    {
+      companyName: input.companyName.trim(),
+      tenantId,
+      adminEmail: input.adminEmail.trim().toLowerCase(),
+      companySlug: cleanSlug,
+      tier: planTier,
+      themeColor: input.themeColor || "#005EB8",
+      allowedChannels: ["web", "whatsapp", "sms", "messenger"],
+    },
+    deps
+  );
+
+  if (!outcome.success || !outcome.data) {
+    const errCode = outcome.error?.code;
+    if (errCode === "TENANT_ALREADY_EXISTS" || errCode === "COMPANY_NAME_ALREADY_EXISTS") {
+      throw new Error(`Conflict: Tenant with ID '${tenantId}' already exists.`);
     }
+    if (errCode === "BAD_REQUEST") {
+      throw new Error(`Validation Failed: ${outcome.error?.message || "Invalid input"}`);
+    }
+    throw new Error(outcome.error?.message || "Failed to onboard tenant");
   }
 
-  if (existingTenant) {
-    throw new Error(`Conflict: Tenant with ID '${tenantId}' already exists.`);
-  }
+  const now = outcome.data.createdAt;
+  const defaultAgentId = `agent-${cleanSlug}-support-01`;
 
-  // 3. Create Tenant Record in DynamoDB
+  // Maintain local fallback maps for offline/dev compatibility
   const tenantRecord: TenantRecord = {
     tenantId,
     companyName: input.companyName.trim(),
@@ -112,21 +108,8 @@ export async function registerTenant(
       allowedOrigins: input.allowedOrigins || ["*"],
     },
   };
-
   inMemoryTenants.set(tenantId, tenantRecord);
-  try {
-    await docClient.send(
-      new PutCommand({
-        TableName: "omni-channel-tenants",
-        Item: tenantRecord,
-      })
-    );
-  } catch {
-    // LocalStack fallback handled via inMemoryTenants
-  }
 
-  // 4. Provision Default Agent in DynamoDB
-  const defaultAgentId = `agent-${cleanSlug}-support-01`;
   const defaultAgent: TenantAgentRecord = {
     tenantId,
     agentId: defaultAgentId,
@@ -136,48 +119,32 @@ export async function registerTenant(
     welcomeMessage: `Hello! Welcome to ${input.companyName} AI Support. How can we assist you today?`,
     createdAt: now,
   };
-
   inMemoryAgents.set(`${tenantId}#${defaultAgentId}`, defaultAgent);
+
+  // Best-effort optional welcome doc in isolated S3 prefix
+  let welcomeDocKey = `${outcome.data.kbPrefix}welcome.txt`;
   try {
-    await docClient.send(
-      new PutCommand({
-        TableName: "omni-channel-agents",
-        Item: defaultAgent,
-      })
-    );
-  } catch {
-    // LocalStack fallback handled via inMemoryAgents
-  }
-
-  // 5. Provision Isolated S3 Folder Prefix
-  const tenantContext: TenantContext = {
-    tenantId,
-    userId: "system-onboarding",
-    role: "admin",
-    permissions: ["faults:read", "billing:read", "usage:read"],
-    channel: "web",
-    sessionId: `sess-onboard-${Date.now()}`,
-    conversationId: `conv-onboard-${Date.now()}`,
-  };
-
-  const welcomeDocContent = `
-# Welcome to ${input.companyName} Knowledge Base
-This is your tenant-isolated Knowledge Base repository.
-Only AI agents and users authorized for ${tenantId} can access these documents.
-`.trim();
-
-  let welcomeDocKey = `tenants/${tenantId}/welcome.txt`;
-  try {
+    const tenantContext: TenantContext = {
+      tenantId,
+      userId: "system-onboarding",
+      role: "admin",
+      permissions: ["faults:read", "billing:read", "usage:read"],
+      channel: "web",
+      sessionId: `sess-onboard-${Date.now()}`,
+      conversationId: `conv-onboard-${Date.now()}`,
+    };
     welcomeDocKey = await uploadKbDocument(
       tenantContext,
       "welcome.txt",
-      welcomeDocContent
+      `# Welcome to ${input.companyName} Knowledge Base\nTenant: ${tenantId}`
     );
-  } catch (err: any) {
-    console.warn(`[Onboarding Warning] S3 welcome upload note: ${err.message}`);
+  } catch {
+    // Non-fatal optional welcome document
   }
 
-  // 6. Return Structured Result
+  const userPoolId =
+    deps?.userPoolId || process.env.COGNITO_USER_POOL_ID || "omni-channel-user-pool-dev";
+
   return {
     success: true,
     tenantId,
@@ -192,13 +159,13 @@ Only AI agents and users authorized for ${tenantId} can access these documents.
       specialist: defaultAgent.specialist,
     },
     credentials: {
-      username: input.adminEmail,
-      temporaryPassword: "TempPassword#2026!",
-      userPoolId: "omni-channel-user-pool-dev",
+      username: outcome.data.adminUsername,
+      temporaryPassword: outcome.data.temporaryPassword,
+      userPoolId,
       loginUrl: `https://console.platform.com/login?tenant=${tenantId}`,
     },
     storage: {
-      s3Prefix: `tenants/${tenantId}/`,
+      s3Prefix: outcome.data.kbPrefix,
       welcomeDocKey,
     },
     message: `Tenant '${input.companyName}' (${tenantId}) successfully onboarded with isolated partition, S3 folder, and Admin credentials.`,
@@ -208,10 +175,13 @@ Only AI agents and users authorized for ${tenantId} can access these documents.
 /**
  * Lambda / HTTP Gateway handler for POST /tenants/register
  */
-export async function handleRegisterTenantRequest(event: {
-  httpMethod?: string;
-  body?: string | Record<string, any>;
-}): Promise<{ statusCode: number; headers: Record<string, string>; body: string }> {
+export async function handleRegisterTenantRequest(
+  event: {
+    httpMethod?: string;
+    body?: string | Record<string, any>;
+  },
+  deps?: OnboardingDeps
+): Promise<{ statusCode: number; headers: Record<string, string>; body: string }> {
   const headers = {
     "Content-Type": "application/json",
     "Access-Control-Allow-Origin": "*",
@@ -235,14 +205,14 @@ export async function handleRegisterTenantRequest(event: {
       };
     }
 
-    const result = await registerTenant(payload);
+    const result = await registerTenant(payload, deps);
     return {
       statusCode: 201,
       headers,
       body: JSON.stringify(result),
     };
   } catch (error: any) {
-    const isConflict = error.message?.includes("already exists");
+    const isConflict = error.message?.includes("already exists") || error.message?.includes("Conflict");
     const statusCode = isConflict ? 409 : 400;
 
     return {

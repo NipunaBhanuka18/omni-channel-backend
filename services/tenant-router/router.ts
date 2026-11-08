@@ -53,7 +53,14 @@ export async function routeRequest(
     tenantConfig = result.Item as TenantConfig | undefined;
   } catch (err: any) {
     // If running in local standalone mode without LocalStack, fall back to in-memory store
-    if (!deps && (err?.code === "ECONNREFUSED" || err?.message?.includes("ECONNREFUSED") || err?.message?.includes("connect"))) {
+    const nodeEnv = (process.env.NODE_ENV || "").trim().toLowerCase();
+    const isLocalAllowed =
+      nodeEnv !== "production" && nodeEnv !== "prod" && process.env.IS_LOCAL !== "false";
+    if (
+      !deps &&
+      isLocalAllowed &&
+      (err?.code === "ECONNREFUSED" || err?.message?.includes("ECONNREFUSED") || err?.message?.includes("connect"))
+    ) {
       console.warn(`[TenantRouter] LocalStack offline. Using in-memory store fallback for tenant '${context.tenantId}'.`);
       const fallback = inMemoryTenants.get(context.tenantId);
       if (fallback) {

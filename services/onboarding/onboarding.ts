@@ -11,7 +11,7 @@ import { cognitoClient } from "../../agents/utils/cognito-client";
 import { s3Client, buildTenantS3Key } from "../../agents/utils/s3-client";
 import { AgentActionResponse } from "../../shared/types/agent-action";
 import { OnboardingRequest, OnboardingResult } from "../../shared/types/onboarding";
-import { normalizeCompanyName } from "../../shared/utils/tenant-name";
+import { deriveTenantId, normalizeCompanyName, normalizeCompanySlug } from "../../shared/utils/tenant-name";
 
 const TENANT_ID_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -222,6 +222,11 @@ export async function onboardCompany(
   }
 
   const createdAt = new Date().toISOString();
+  const cleanCompanyName = input.companyName.trim();
+  const cleanAdminEmail = input.adminEmail.trim().toLowerCase();
+  const companySlug = normalizeCompanySlug(
+    input.companySlug || input.tenantId.replace(/^tenant-/, "") || cleanCompanyName
+  );
   const allowedChannels = input.allowedChannels && input.allowedChannels.length > 0
     ? input.allowedChannels
     : ["web", "whatsapp", "sms", "messenger"];
@@ -235,11 +240,18 @@ export async function onboardCompany(
         TableName: "omni-channel-tenants",
         Item: {
           tenantId: input.tenantId,
-          name: input.companyName,
+          name: cleanCompanyName,
           normalizedName,
+          companySlug,
+          adminEmail: cleanAdminEmail,
           status: "active",
           allowedChannels,
           defaultAgent: "main-agent",
+          tier: input.tier || "Standard",
+          allocatedAgents: typeof input.allocatedAgents === "number" ? input.allocatedAgents : 5,
+          themeColor: input.themeColor || "#005EB8",
+          createdAt,
+          updatedAt: createdAt,
         },
         // Belt-and-braces against a race between the check in step 2 and this write.
         ConditionExpression: "attribute_not_exists(tenantId)",
@@ -269,16 +281,25 @@ export async function onboardCompany(
 
   // 4. Write default agent record
   try {
+    const defaultAgentDisplayName = `${cleanCompanyName} Assistant`;
     await dynamo.send(
       new PutCommand({
         TableName: "omni-channel-agents",
         Item: {
           tenantId: input.tenantId,
           agentId: "main-agent",
-          name: "Main Agent",
+          name: defaultAgentDisplayName,
+          displayName: defaultAgentDisplayName,
+          brandName: cleanCompanyName,
+          publicAgentKey: "support",
           status: "active",
           defaultModel: "claude-sonnet-4-6",
+          modelId: "claude-sonnet-4-6",
+          welcomeMessage: `Welcome to ${cleanCompanyName}! How can we assist you today?`,
+          suggestedPrompts: ["How can you help me?", "Talk to a person"],
+          deploymentStatus: "NOT_DEPLOYED",
           createdAt,
+          updatedAt: createdAt,
         },
       })
     );

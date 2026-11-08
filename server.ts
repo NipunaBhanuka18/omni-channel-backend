@@ -8,6 +8,14 @@ import { adjustActiveChats } from "./services/handoff/presence-manager";
 import { provisionPendingCompanyApproval } from "./services/onboarding/approval-workflow";
 import { redactRegistrationCredentials } from "./services/onboarding/registration-privacy";
 import {
+  RegistrationRepository,
+  DynamoRegistrationRepository,
+  JsonRegistrationRepository,
+  RegistrationConflictError,
+  RegistrationStorageUnavailableError,
+} from "./services/onboarding/registration-repository";
+import { resolveHostedChatConfig } from "./services/onboarding/chat-url-resolver";
+import {
   createJsonDbStore,
   createLocalAuthRouter,
   normalizeRegistration,
@@ -112,6 +120,7 @@ function handoffErrorStatus(code?: string): number {
 
 export interface CreateAppOptions {
   dbPath?: string;
+  registrationRepo?: RegistrationRepository;
   tokenService?: LocalSessionTokenService;
   loginGuard?: LocalLoginAttemptGuard;
   cognitoVerifier?: CognitoJwtVerifier | null;
@@ -128,7 +137,12 @@ export function createApp(options: CreateAppOptions = {}): express.Express {
   app.use(cors(resolveCorsOptions()));
   app.use(express.json({ limit: "128kb" }));
 
-  const dbStore = createJsonDbStore(options.dbPath || DB_PATH);
+  const dbStore = options.dbPath ? createJsonDbStore(options.dbPath) : (isLocalDevAllowed() ? createJsonDbStore(DB_PATH) : null);
+  const registrationRepo: RegistrationRepository =
+    options.registrationRepo ??
+    (options.dbPath && isLocalDevAllowed() && dbStore
+      ? new JsonRegistrationRepository(dbStore)
+      : new DynamoRegistrationRepository());
   const resolveTokenService = (): LocalSessionTokenService =>
     options.tokenService ?? getLocalSessionTokenService();
   const resolveCognitoVerifier = (): CognitoJwtVerifier | null =>
@@ -168,11 +182,12 @@ export function createApp(options: CreateAppOptions = {}): express.Express {
   ] as const;
 
   function readDB() {
+    if (!dbStore) return { users: [], registrations: [] };
     return dbStore.readDB();
   }
 
   function writeDB(data: { users: Array<Record<string, any>>; registrations: Array<Record<string, any>> }) {
-    dbStore.writeDB(data);
+    if (dbStore) dbStore.writeDB(data);
   }
 
 // ==========================================
@@ -180,7 +195,8 @@ export function createApp(options: CreateAppOptions = {}): express.Express {
 // ==========================================
 app.use(
   createLocalAuthRouter({
-    store: dbStore,
+    store: dbStore ?? undefined,
+    registrationRepo,
     getTokenService: resolveTokenService,
     loginGuard: options.loginGuard,
     registrationLimiter: options.publicRegistrationLimiter,
@@ -192,27 +208,25 @@ app.use(
 // ==========================================
 
 // GET /api/registrations (supports ?status=pending or ?status=approved)
-// Protected by verified superadmin session token; local demo DB only.
-app.get("/api/registrations", ...requireSuperAdmin, (req, res) => {
-  if (!isLocalDevAllowed()) {
-    return res.status(404).json({ error: "Local company registration list unavailable" });
-  }
+// Protected by verified superadmin session token (Cognito in prod, or local token in dev).
+app.get("/api/registrations", ...requireSuperAdmin, async (req, res) => {
   if (req.query.status !== undefined && typeof req.query.status !== "string") {
     return res.status(400).json({ error: "Invalid status filter" });
   }
-  const db = readDB();
-  const rawList = (db.registrations || []).map((r: any) =>
-    redactRegistrationCredentials(normalizeRegistration(r)));
   const statusParam = typeof req.query.status === "string" ? req.query.status.trim() : "";
-
-  if (statusParam) {
-    const filtered = rawList.filter(
-      (r: any) => (r.status || "").toLowerCase() === statusParam.toLowerCase()
-    );
-    return res.json(filtered);
+  try {
+    const list = await registrationRepo.list(statusParam || undefined);
+    if (statusParam) {
+      return res.json(list);
+    }
+    return res.json({ success: true, registrations: list });
+  } catch (error: any) {
+    if (error instanceof RegistrationStorageUnavailableError) {
+      return res.status(503).json({ error: "Company registration repository unavailable" });
+    }
+    console.error("[RegistrationsList] Error:", error);
+    return res.status(500).json({ error: "Internal server error" });
   }
-
-  return res.json({ success: true, registrations: rawList });
 });
 
 // POST /api/registrations is registered above via createLocalAuthRouter.
@@ -220,9 +234,6 @@ app.get("/api/registrations", ...requireSuperAdmin, (req, res) => {
 // Platform superadmin registration review (approved records provision via Cognito pipeline).
 const registrationReviewsInFlight = new Set<string>();
 const handleUpdateRegistrationStatus = async (req: express.Request, res: express.Response) => {
-  if (!isLocalDevAllowed()) {
-    return res.status(404).json({ error: "Local company registration review unavailable" });
-  }
   if (!req.is("application/json")) {
     return res.status(400).json({ error: "Content-Type application/json is required" });
   }
@@ -241,45 +252,78 @@ const handleUpdateRegistrationStatus = async (req: express.Request, res: express
   }
   registrationReviewsInFlight.add(id);
   try {
-    const db = readDB();
-    const regIndex = (db.registrations || []).findIndex((r: any) => String(r.id) === id);
-    if (regIndex === -1) return res.status(404).json({ error: "Registration not found" });
-    const reg = db.registrations[regIndex];
-    if (reg.status !== "Pending" || reg.tenantId) {
-      return res.status(409).json({ error: "Only unprovisioned pending registrations can be reviewed" });
-    }
-
     if (rawStatus === "rejected") {
-      db.registrations[regIndex] = normalizeRegistration({ ...reg, status: "Rejected" });
-      writeDB(db);
-      const safeRegistration = redactRegistrationCredentials(db.registrations[regIndex]);
-      return res.json({ success: true, registration: safeRegistration });
+      const rejected = await registrationRepo.markRejected(id, req.localAuth?.sub);
+      if (!rejected) {
+        return res.status(404).json({ error: "Registration not found" });
+      }
+      return res.json({ success: true, registration: rejected });
     }
 
-    const approval = await approvePendingRegistration({
-      id: reg.id, status: reg.status, tenantId: reg.tenantId,
-      companyName: reg.companyName, companySlug: reg.companySlug,
-      companyEmail: reg.companyEmail, adminEmail: reg.adminEmail,
-    });
+    // Atomic claim: Pending -> Provisioning
+    const claim = await registrationRepo.claimForReview(id);
+    if (claim.outcome === "not_found") {
+      return res.status(404).json({ error: "Registration not found" });
+    }
+    if (claim.outcome === "conflict") {
+      return res.status(409).json({ error: claim.reason });
+    }
+
+    const reg = claim.registration;
+    let approval;
+    try {
+      approval = await approvePendingRegistration({
+        id: reg.id,
+        status: reg.status,
+        tenantId: reg.tenantId,
+        companyName: reg.companyName,
+        companySlug: reg.companySlug,
+        companyEmail: reg.companyEmail,
+        adminEmail: reg.adminEmail,
+        adminName: reg.adminName,
+        channels: Array.isArray(reg.channels) ? (reg.channels as string[]) : undefined,
+        tier: typeof reg.tier === "string" ? reg.tier : undefined,
+        allocatedAgents: typeof reg.allocatedAgents === "number" ? reg.allocatedAgents : undefined,
+        themeColor: typeof reg.themeColor === "string" ? reg.themeColor : undefined,
+      });
+    } catch (provisionErr) {
+      await registrationRepo.releaseReviewClaim(id);
+      throw provisionErr;
+    }
+
     if (!approval.success) {
+      await registrationRepo.releaseReviewClaim(id);
       const code = approval.error.code;
-      const status = code === "BAD_REQUEST" ? 400 :
-        ["INVALID_REGISTRATION_STATE", "TENANT_ALREADY_EXISTS", "COMPANY_NAME_ALREADY_EXISTS"].includes(code) ? 409 : 503;
+      const status =
+        code === "BAD_REQUEST"
+          ? 400
+          : ["INVALID_REGISTRATION_STATE", "TENANT_ALREADY_EXISTS", "COMPANY_NAME_ALREADY_EXISTS"].includes(code)
+            ? 409
+            : 503;
       return res.status(status).json({ success: false, error: approval.error });
     }
 
-    // No Approved status is persisted until tenant, default agent and Cognito admin
-    // provisioning all succeed. Never persist one-time credentials in db.json.
-    db.registrations[regIndex] = normalizeRegistration({ ...reg, ...approval.approvedRegistration });
-    writeDB(db);
-    const safeRegistration = redactRegistrationCredentials(db.registrations[regIndex]);
+    // Commit Approved state conditionally. One-time credentials returned ONLY in this response.
+    const safeRegistration = await registrationRepo.markApproved(id, {
+      tenantId: approval.approvedRegistration.tenantId,
+      companySlug: approval.approvedRegistration.companySlug,
+      onboardedAt: approval.approvedRegistration.onboardedAt,
+      reviewedBy: req.localAuth?.sub,
+    });
+
     return res.json({
       success: true,
       registration: safeRegistration,
       credentials: approval.credentials,
     });
-  } catch (error) {
-    console.error("[LocalCompanyReview] Registration review failed:", error);
+  } catch (error: any) {
+    if (error instanceof RegistrationConflictError) {
+      return res.status(409).json({ error: error.message });
+    }
+    if (error instanceof RegistrationStorageUnavailableError) {
+      return res.status(503).json({ error: error.message });
+    }
+    console.error("[CompanyReview] Registration review failed:", error);
     return res.status(503).json({ error: "Company review unavailable; registration may require reconciliation" });
   } finally {
     registrationReviewsInFlight.delete(id);
@@ -296,48 +340,51 @@ app.put("/api/registrations/:id", ...requireSuperAdmin, handleUpdateRegistration
 app.put("/api/registrations/:id/status", ...requireSuperAdmin, handleUpdateRegistrationStatus);
 
 // GET /api/stats (Admin Console Dashboard Stats)
-app.get("/api/stats", ...requireSuperAdmin, (_req, res) => {
-  const db = readDB();
-  const activeCount = db.registrations.filter((r: any) => (r.status || "").toLowerCase() === "approved").length;
-  const pendingCount = db.registrations.filter((r: any) => (r.status || "").toLowerCase() === "pending").length;
-
-  res.json({
-    totalAvailability: activeCount,
-    activeConnections: activeCount,
-    pendingRequests: pendingCount,
-    activeAgentsCount: 12,
-    monthlyConversations: 14820,
-    systemLatencyMs: 42,
-  });
+app.get("/api/stats", ...requireSuperAdmin, async (_req, res) => {
+  try {
+    const stats = await registrationRepo.getPlatformStats();
+    return res.json(stats);
+  } catch (error: any) {
+    if (error instanceof RegistrationStorageUnavailableError) {
+      return res.status(503).json({ error: error.message });
+    }
+    console.error("[PlatformStats] Failed to retrieve platform stats:", error);
+    return res.status(503).json({ error: "Platform statistics unavailable" });
+  }
 });
 
 // GET /api/notifications (Admin Notifications)
-app.get("/api/notifications", ...requireSuperAdmin, (_req, res) => {
-  const db = readDB();
-  const list = db.registrations || [];
-  const pendingRegs = list.filter((r: any) => (r.status || "").toLowerCase() === "pending");
+app.get("/api/notifications", ...requireSuperAdmin, async (_req, res) => {
+  try {
+    const pendingRegs = await registrationRepo.list("pending");
+    const notifications = [
+      ...pendingRegs.map((r: any) => ({
+        id: `notif-reg-${r.id}`,
+        title: `Registration Request: ${r.companyName || r.name}`,
+        message: `${r.companyName || r.name} (${r.companyEmail || r.email || r.adminEmail || "Admin"}) submitted a registration request for approval.`,
+        type: "pending",
+        timestamp: r.submissionDate || r.date || new Date().toISOString().split("T")[0],
+        read: false,
+        companyId: r.id,
+      })),
+      {
+        id: "notif-system-1",
+        title: "Gateway Health Normal",
+        message: "SLT Global Node 01 health status verified 100%.",
+        type: "system",
+        timestamp: new Date().toISOString().split("T")[0],
+        read: true,
+      },
+    ];
 
-  const notifications = [
-    ...pendingRegs.map((r: any) => ({
-      id: `notif-reg-${r.id}`,
-      title: `Registration Request: ${r.companyName || r.name}`,
-      message: `${r.companyName || r.name} (${r.companyEmail || r.email || r.adminEmail || "Admin"}) submitted a registration request for approval.`,
-      type: "pending",
-      timestamp: r.submissionDate || r.date || new Date().toISOString().split("T")[0],
-      read: false,
-      companyId: r.id,
-    })),
-    {
-      id: "notif-system-1",
-      title: "Gateway Health Normal",
-      message: "SLT Global Node 01 health status verified 100%.",
-      type: "system",
-      timestamp: new Date().toISOString().split("T")[0],
-      read: true,
-    },
-  ];
-
-  res.json({ success: true, notifications });
+    return res.json({ success: true, notifications });
+  } catch (error: any) {
+    if (error instanceof RegistrationStorageUnavailableError) {
+      return res.status(503).json({ error: error.message });
+    }
+    console.error("[Notifications] Failed to retrieve notifications:", error);
+    return res.status(503).json({ error: "Notifications unavailable" });
+  }
 });
 
 // ==========================================
@@ -1499,61 +1546,11 @@ app.get("/api/workspace/conversations", ...requireCompanyAdmin, async (req, res)
 
 // GET /api/resolve-chat-url?company={slug}&agent={agent} (Public customer chat widget bootstrap)
 app.get(["/api/resolve-chat-url", "/resolve-chat-url"], limitChatResolver, async (req, res) => {
-  const remote = req.socket.remoteAddress || "";
-  const loopback = ["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(remote);
-  if (!isLocalDevAllowed() || !loopback) {
-    return res.status(404).json({ error: "Local chat resolver is unavailable" });
+  const result = await resolveHostedChatConfig(req.query.company, req.query.agent);
+  if (!result.ok) {
+    return res.status(result.status).json({ error: result.error });
   }
-  const companySlug = typeof req.query.company === "string" ? req.query.company : "slt";
-  const agentSlug = typeof req.query.agent === "string" ? req.query.agent : "support";
-  if (companySlug !== "slt" || !TENANT_ID_PATTERN.test(agentSlug)) {
-    return res.status(404).json({ error: "Chatbot not found" });
-  }
-
-  // Preserve the original SLT support chatbot for the existing demonstration.
-  if (agentSlug === "support") {
-    const tenant = inMemoryTenants.get("slt");
-    const companyName = tenant?.companyName || "Sri Lanka Telecom";
-    return res.json({
-      success: true, demoOnly: true, tenantId: "slt", companyName,
-      agentId: "agent-slt-support-01", agentName: `${companyName} Assistant`,
-      welcomeMessage: `Welcome to ${companyName}! How can we assist you today?`,
-      themeColor: tenant?.config?.themeColor || "#005EB8",
-      suggestedPrompts: ["Check my bill", "Check my usage", "Slow internet", "Talk to a person"],
-    });
-  }
-
-  try {
-    const records: Array<Record<string, any>> = [];
-    let nextKey: Record<string, any> | undefined;
-    do {
-      const page = await docClient.send(new QueryCommand({
-        TableName: "omni-channel-agents",
-        KeyConditionExpression: "tenantId = :tenant",
-        ExpressionAttributeValues: { ":tenant": "slt" },
-        ExclusiveStartKey: nextKey,
-      }));
-      records.push(...((page.Items || []) as Array<Record<string, any>>));
-      nextKey = page.LastEvaluatedKey;
-    } while (nextKey);
-    const matches = records.filter(agent =>
-      agent.publicAgentKey === agentSlug && String(agent.status).toUpperCase() === "PUBLISHED");
-    if (matches.length !== 1) return res.status(404).json({ error: "This chatbot has not been published" });
-    const agent = matches[0];
-    return res.json({
-      success: true, demoOnly: true, tenantId: "slt",
-      companyName: String(agent.brandName || "Sri Lanka Telecom"),
-      agentId: String(agent.agentId),
-      agentName: String(agent.displayName || agent.name || "Customer Assistant"),
-      welcomeMessage: String(agent.welcomeMessage || "Hello! How can I help you?"),
-      suggestedPrompts: Array.isArray(agent.suggestedPrompts) ? agent.suggestedPrompts : [],
-      themeColor: "#005EB8",
-      deploymentStatus: "NOT_DEPLOYED",
-    });
-  } catch (error) {
-    console.error("[LocalChatResolver] DynamoDB error:", error);
-    return res.status(503).json({ error: "Chatbot configuration unavailable" });
-  }
+  return res.status(200).json(result.config);
 });
 
 // ==========================================

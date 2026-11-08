@@ -333,10 +333,20 @@ async function main(): Promise<void> {
     });
     assert.equal(disallowedCors.headers.get("access-control-allow-origin"), null);
 
-    // Local demo routes MUST return 404 or reject v1 tokens in production
+    // In production, local demo password login MUST return 404
     assert.equal((await reqJson(prodUrl, "/api/auth/login", { method: "POST", body: { email: "a@b.c", password: "x" } })).status, 404);
-    assert.equal((await reqJson(prodUrl, "/api/registrations", { token: superToken })).status, 404);
+    assert.equal((await reqJson(prodUrl, "/api/auth/register-admin", { method: "POST", body: {} })).status, 404);
     assert.equal((await reqJson(prodUrl, "/api/stats", { token: demoSuperV1 })).status, 401);
+
+    // Registrations endpoint in production enforces superadmin authorization
+    assert.equal((await reqJson(prodUrl, "/api/registrations")).status, 401);
+    assert.equal((await reqJson(prodUrl, "/api/registrations", { token: companyAdminToken })).status, 403);
+    assert.equal((await reqJson(prodUrl, "/api/registrations", { token: agentToken })).status, 403);
+    const prodRegsRes = await reqJson(prodUrl, "/api/registrations", { token: superToken });
+    assert.ok(
+      prodRegsRes.status === 200 || prodRegsRes.status === 503,
+      `Superadmin in production must receive 200 or 503 unavailable, got ${prodRegsRes.status}`
+    );
 
     // Oversized body (>128kb) returns structured JSON 413; malformed JSON returns 400
     const hugeRes = await reqJson(prodUrl, "/api/agent", {

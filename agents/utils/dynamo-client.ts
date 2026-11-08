@@ -11,10 +11,14 @@ import {
 import { TenantContext } from "../../shared/types/tenant-context";
 
 // Environment-aware LocalStack vs AWS Cloud configuration
-const isLocal = process.env.IS_LOCAL !== "false";
-const localstackEndpoint = process.env.LOCALSTACK_HOSTNAME
-  ? `http://${process.env.LOCALSTACK_HOSTNAME}:4566`
-  : "http://127.0.0.1:4566";
+const nodeEnv = (process.env.NODE_ENV || "").trim().toLowerCase();
+const isLocal =
+  process.env.IS_LOCAL !== "false" && nodeEnv !== "production" && nodeEnv !== "prod";
+const localstackEndpoint =
+  process.env.DYNAMODB_ENDPOINT ||
+  (process.env.LOCALSTACK_HOSTNAME
+    ? `http://${process.env.LOCALSTACK_HOSTNAME}:4566`
+    : "http://127.0.0.1:4566");
 
 const client = new DynamoDBClient({
   region: process.env.AWS_REGION || "us-east-1",

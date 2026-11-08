@@ -1,8 +1,9 @@
 /**
- * LOCAL-DEMO-ONLY authentication & company registration route handlers.
- * Enforces scrypt-v2 hashing on registration, fail-closed hashed credential
- * verification + bounded attempt rate/concurrency limiting on login, and
- * HMAC-SHA256 signed local bearer tokens.
+ * Authentication & company registration route handlers.
+ * Supports both durable DynamoDB registration storage and isolated local JSON storage,
+ * scrypt-v2 hashing on registration (in local-dev mode), fail-closed hashed credential
+ * verification + bounded attempt rate/concurrency limiting on login, and HMAC-SHA256
+ * signed local bearer tokens.
  */
 import express from "express";
 import fs from "node:fs";
@@ -13,6 +14,16 @@ import { verifyLocalCredentialRecord } from "./local-credential-verifier";
 import { LocalLoginAttemptGuard } from "./local-login-attempt-guard";
 import { LocalAuthRole, LocalSessionTokenService } from "./local-session-token";
 import { redactRegistrationCredentials } from "../onboarding/registration-privacy";
+import {
+  RegistrationRepository,
+  DynamoRegistrationRepository,
+  JsonRegistrationRepository,
+  RegistrationConflictError,
+  RegistrationStorageUnavailableError,
+} from "../onboarding/registration-repository";
+import { normalizeRegistration } from "../onboarding/registration-normalizer";
+
+export { normalizeRegistration };
 
 export interface LocalDbShape {
   users: Array<Record<string, any>>;
@@ -25,7 +36,8 @@ export interface LocalDbStore {
 }
 
 export interface LocalAuthRouterOptions {
-  store: LocalDbStore;
+  store?: LocalDbStore;
+  registrationRepo?: RegistrationRepository;
   tokenService?: LocalSessionTokenService;
   getTokenService?: () => LocalSessionTokenService;
   loginGuard?: LocalLoginAttemptGuard;
@@ -74,41 +86,6 @@ export function createJsonDbStore(dbPath: string): LocalDbStore {
   return { readDB, writeDB };
 }
 
-export function normalizeRegistration(r: Record<string, any>): Record<string, any> {
-  const companyName = r.companyName || r.name || "Unnamed Company";
-  const email = r.companyEmail || r.email || r.adminEmail || "";
-  const submissionDate =
-    r.submissionDate || r.date || r.requestedDate || new Date().toISOString().split("T")[0];
-  const industry = r.industry || r.companyType || "Technology";
-
-  return {
-    ...r,
-    companyName,
-    name: companyName,
-    companyEmail: email,
-    email,
-    adminName: r.adminName || "Admin",
-    adminEmail: r.adminEmail || email,
-    phone: r.phone || r.adminPhone || "-",
-    adminPhone: r.adminPhone || r.phone || "-",
-    website: r.website || "-",
-    industry,
-    companyType: industry,
-    country: r.country || "Sri Lanka",
-    city: r.city || "",
-    address: r.address || "",
-    employeeCount: r.employeeCount || "",
-    about: r.about || "",
-    status: r.status || "Pending",
-    submissionDate,
-    date: submissionDate,
-    requestedDate: submissionDate,
-    tier: r.tier || "Standard",
-    allocatedAgents: r.allocatedAgents || 5,
-    channels: r.channels || ["Web"],
-  };
-}
-
 function isLocalAuthEnabled(): boolean {
   const nodeEnv = (process.env.NODE_ENV || "").trim().toLowerCase();
   return nodeEnv !== "production" && nodeEnv !== "prod" && process.env.IS_LOCAL !== "false";
@@ -127,6 +104,13 @@ export function createLocalAuthRouter(options: LocalAuthRouterOptions): express.
     if (options.tokenService) return options.tokenService;
     throw new Error("LocalSessionTokenService is not configured");
   };
+
+  const registrationRepo: RegistrationRepository =
+    options.registrationRepo ??
+    (options.store
+      ? new JsonRegistrationRepository(options.store)
+      : new DynamoRegistrationRepository());
+
   const loginGuard =
     options.loginGuard ??
     new LocalLoginAttemptGuard({
@@ -145,12 +129,7 @@ export function createLocalAuthRouter(options: LocalAuthRouterOptions): express.
   const limitRegistrations = createRateLimitMiddleware(registrationLimiter, {
     errorMessage: "Too many registration attempts. Please wait and try again.",
   });
-  const requireLocalAuthRoute: express.RequestHandler = (_req, res, next) => {
-    if (!isLocalAuthEnabled()) {
-      return res.status(404).json({ success: false, error: "Local registration unavailable" });
-    }
-    return next();
-  };
+
   const hashFn = options.hashFn ?? hashPassword;
   const maxConcurrentRegistrations = options.maxConcurrentRegistrations ?? 2;
   let registrationsInFlight = 0;
@@ -177,22 +156,27 @@ export function createLocalAuthRouter(options: LocalAuthRouterOptions): express.
     const guardKey = `ip:${remoteAddress}`;
     const normalizedEmail = email.toLowerCase();
 
-    const db = options.store.readDB();
+    const db = options.store ? options.store.readDB() : { users: [], registrations: [] };
     const matchedUser = db.users.find(
       (u) => typeof u?.email === "string" && u.email.trim().toLowerCase() === normalizedEmail,
     );
 
-    const matchingRegistrations = matchedUser
-      ? []
-      : db.registrations.filter(
-        (r) =>
-          typeof r?.companyEmail === "string" &&
-          r.companyEmail.trim().toLowerCase() === normalizedEmail,
-      );
-    const matchedRegistration = matchedUser
-      ? undefined
-      : matchingRegistrations.find((r) => r.status === "Approved") ||
-      matchingRegistrations[matchingRegistrations.length - 1];
+    let matchedRegistration: Record<string, any> | undefined;
+    if (!matchedUser) {
+      if (options.store) {
+        const matchingRegistrations = db.registrations.filter(
+          (r) =>
+            typeof r?.companyEmail === "string" &&
+            r.companyEmail.trim().toLowerCase() === normalizedEmail,
+        );
+        matchedRegistration =
+          matchingRegistrations.find((r) => r.status === "Approved") ||
+          matchingRegistrations[matchingRegistrations.length - 1];
+      } else {
+        matchedRegistration =
+          (await registrationRepo.findLatestByEmailForLocalLogin(normalizedEmail)) ?? undefined;
+      }
+    }
 
     const candidateRecord = matchedUser ?? matchedRegistration ?? null;
 
@@ -313,165 +297,201 @@ export function createLocalAuthRouter(options: LocalAuthRouterOptions): express.
 
   router.post(
     "/api/registrations",
-    requireLocalAuthRoute,
     limitRegistrations,
     async (req, res) => {
       const body = asPlainObject(req.body);
-    if (!body) {
-      return res.status(400).json({ success: false, error: "Invalid registration payload" });
-    }
+      if (!body) {
+        return res.status(400).json({ success: false, error: "Invalid registration payload" });
+      }
 
-    const rawCompanyName =
-      typeof body.companyName === "string"
-        ? body.companyName.trim()
-        : typeof body.name === "string"
-          ? body.name.trim()
-          : "";
-    if (!rawCompanyName || rawCompanyName.length > 120) {
-      return res.status(400).json({ success: false, error: "Company name is required" });
-    }
-
-    const rawEmail =
-      typeof body.companyEmail === "string"
-        ? body.companyEmail.trim()
-        : typeof body.email === "string"
-          ? body.email.trim()
-          : typeof body.adminEmail === "string"
-            ? body.adminEmail.trim()
+      const rawCompanyName =
+        typeof body.companyName === "string"
+          ? body.companyName.trim()
+          : typeof body.name === "string"
+            ? body.name.trim()
             : "";
-    if (!rawEmail || rawEmail.length > 254 || !EMAIL_PATTERN.test(rawEmail)) {
-      return res.status(400).json({ success: false, error: "A valid company email is required" });
-    }
+      if (!rawCompanyName || rawCompanyName.length > 120) {
+        return res.status(400).json({ success: false, error: "Company name is required" });
+      }
 
-    const password = body.password;
-    if (
-      typeof password !== "string" ||
-      password.trim().length === 0 ||
-      password.length < MIN_PASSWORD_LENGTH ||
-      Buffer.byteLength(password, "utf8") > MAX_PASSWORD_BYTES
-    ) {
-      return res.status(400).json({
-        success: false,
-        error: `Password is required and must be ${MIN_PASSWORD_LENGTH}-${MAX_PASSWORD_BYTES} bytes`,
-      });
-    }
+      const rawEmail =
+        typeof body.companyEmail === "string"
+          ? body.companyEmail.trim()
+          : typeof body.email === "string"
+            ? body.email.trim()
+            : typeof body.adminEmail === "string"
+              ? body.adminEmail.trim()
+              : "";
+      if (!rawEmail || rawEmail.length > 254 || !EMAIL_PATTERN.test(rawEmail)) {
+        return res.status(400).json({ success: false, error: "A valid company email is required" });
+      }
 
-    if (registrationsInFlight >= maxConcurrentRegistrations) {
-      return res.status(503).json({
-        success: false,
-        error: "Registration service is busy. Please retry shortly.",
-      });
-    }
+      let passwordHash: string | undefined;
+      if (isLocalAuthEnabled()) {
+        const password = body.password;
+        if (
+          typeof password !== "string" ||
+          password.trim().length === 0 ||
+          password.length < MIN_PASSWORD_LENGTH ||
+          Buffer.byteLength(password, "utf8") > MAX_PASSWORD_BYTES
+        ) {
+          return res.status(400).json({
+            success: false,
+            error: `Password is required and must be ${MIN_PASSWORD_LENGTH}-${MAX_PASSWORD_BYTES} bytes`,
+          });
+        }
 
-    registrationsInFlight++;
-    let passwordHash: string;
-    try {
-      passwordHash = await hashFn(password);
-    } catch {
-      return res.status(500).json({
-        success: false,
-        error: "Unable to process registration credentials",
-      });
-    } finally {
-      registrationsInFlight--;
-    }
+        if (registrationsInFlight >= maxConcurrentRegistrations) {
+          return res.status(503).json({
+            success: false,
+            error: "Registration service is busy. Please retry shortly.",
+          });
+        }
 
-    const cleanSlug = rawCompanyName
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, "-")
-      .replace(/^-+|-+$/g, "") || "company";
-    const requestedSlug =
-      typeof body.companySlug === "string" && body.companySlug.trim()
-        ? body.companySlug
+        registrationsInFlight++;
+        try {
+          passwordHash = await hashFn(password);
+        } catch {
+          return res.status(500).json({
+            success: false,
+            error: "Unable to process registration credentials",
+          });
+        } finally {
+          registrationsInFlight--;
+        }
+      }
+
+      const cleanSlug =
+        rawCompanyName
           .toLowerCase()
-          .trim()
-          .replace(/[^a-z0-9-]+/g, "-")
-          .replace(/^-+|-+$/g, "")
-        : cleanSlug;
-    const dateStr = new Date().toISOString().split("T")[0];
-    const adminEmail =
-      typeof body.adminEmail === "string" && EMAIL_PATTERN.test(body.adminEmail.trim())
-        ? body.adminEmail.trim()
-        : rawEmail;
-    const allocatedAgents =
-      typeof body.allocatedAgents === "number" &&
+          .replace(/[^a-z0-9]+/g, "-")
+          .replace(/^-+|-+$/g, "") || "company";
+      const requestedSlug =
+        typeof body.companySlug === "string" && body.companySlug.trim()
+          ? body.companySlug
+              .toLowerCase()
+              .trim()
+              .replace(/[^a-z0-9-]+/g, "-")
+              .replace(/^-+|-+$/g, "")
+          : cleanSlug;
+      const dateStr = new Date().toISOString().split("T")[0];
+      const adminEmail =
+        typeof body.adminEmail === "string" && EMAIL_PATTERN.test(body.adminEmail.trim())
+          ? body.adminEmail.trim()
+          : rawEmail;
+      const allocatedAgents =
+        typeof body.allocatedAgents === "number" &&
         Number.isInteger(body.allocatedAgents) &&
         body.allocatedAgents >= 1 &&
         body.allocatedAgents <= 500
-        ? body.allocatedAgents
-        : 5;
-    const channels = Array.isArray(body.channels) &&
-      body.channels.every((c: unknown) => typeof c === "string" && c.trim().length > 0 && c.length <= 32)
-      ? body.channels.slice(0, 10)
-      : ["Web"];
+          ? body.allocatedAgents
+          : 5;
+      const channels =
+        Array.isArray(body.channels) &&
+        body.channels.every(
+          (c: unknown) => typeof c === "string" && c.trim().length > 0 && c.length <= 32
+        )
+          ? body.channels.slice(0, 10)
+          : ["Web"];
 
-    const newReg = normalizeRegistration({
-      id: `reg-${Date.now()}-${randomBytes(3).toString("hex")}`,
-      companyName: rawCompanyName,
-      name: rawCompanyName,
-      companySlug: requestedSlug || cleanSlug,
-      businessRegNumber:
-        typeof body.businessRegNumber === "string" && body.businessRegNumber.trim()
-          ? body.businessRegNumber.trim().slice(0, 64)
-          : "BR-PENDING",
-      companyEmail: rawEmail,
-      email: rawEmail,
-      adminName:
-        typeof body.adminName === "string" && body.adminName.trim()
-          ? body.adminName.trim().slice(0, 120)
-          : "Admin",
-      adminEmail,
-      adminPhone:
-        typeof body.adminPhone === "string" && body.adminPhone.trim()
-          ? body.adminPhone.trim().slice(0, 40)
-          : typeof body.phone === "string" && body.phone.trim()
-            ? body.phone.trim().slice(0, 40)
-            : "-",
-      phone:
-        typeof body.phone === "string" && body.phone.trim()
-          ? body.phone.trim().slice(0, 40)
-          : typeof body.adminPhone === "string" && body.adminPhone.trim()
+      const newRegPayload: Record<string, any> = {
+        id: `reg-${Date.now()}-${randomBytes(3).toString("hex")}`,
+        companyName: rawCompanyName,
+        name: rawCompanyName,
+        companySlug: requestedSlug || cleanSlug,
+        businessRegNumber:
+          typeof body.businessRegNumber === "string" && body.businessRegNumber.trim()
+            ? body.businessRegNumber.trim().slice(0, 64)
+            : "BR-PENDING",
+        companyEmail: rawEmail,
+        email: rawEmail,
+        adminName:
+          typeof body.adminName === "string" && body.adminName.trim()
+            ? body.adminName.trim().slice(0, 120)
+            : "Admin",
+        adminEmail,
+        adminPhone:
+          typeof body.adminPhone === "string" && body.adminPhone.trim()
             ? body.adminPhone.trim().slice(0, 40)
+            : typeof body.phone === "string" && body.phone.trim()
+              ? body.phone.trim().slice(0, 40)
+              : "-",
+        phone:
+          typeof body.phone === "string" && body.phone.trim()
+            ? body.phone.trim().slice(0, 40)
+            : typeof body.adminPhone === "string" && body.adminPhone.trim()
+              ? body.adminPhone.trim().slice(0, 40)
+              : "-",
+        website:
+          typeof body.website === "string" && body.website.trim()
+            ? body.website.trim().slice(0, 200)
             : "-",
-      website: typeof body.website === "string" && body.website.trim() ? body.website.trim().slice(0, 200) : "-",
-      industry:
-        typeof body.industry === "string" && body.industry.trim()
-          ? body.industry.trim().slice(0, 80)
-          : typeof body.companyType === "string" && body.companyType.trim()
-            ? body.companyType.trim().slice(0, 80)
-            : "Technology",
-      companyType:
-        typeof body.companyType === "string" && body.companyType.trim()
-          ? body.companyType.trim().slice(0, 80)
-          : typeof body.industry === "string" && body.industry.trim()
+        industry:
+          typeof body.industry === "string" && body.industry.trim()
             ? body.industry.trim().slice(0, 80)
-            : "Technology",
-      country: typeof body.country === "string" && body.country.trim() ? body.country.trim().slice(0, 80) : "Sri Lanka",
-      city: typeof body.city === "string" ? body.city.trim().slice(0, 80) : "",
-      address: typeof body.address === "string" ? body.address.trim().slice(0, 240) : "",
-      employeeCount: typeof body.employeeCount === "string" ? body.employeeCount.trim().slice(0, 40) : "",
-      about: typeof body.about === "string" ? body.about.trim().slice(0, 1000) : "",
-      passwordHash,
-      status: "Pending",
-      submissionDate: dateStr,
-      date: dateStr,
-      requestedDate: dateStr,
-      tier: typeof body.tier === "string" && body.tier.trim() ? body.tier.trim().slice(0, 40) : "Standard",
-      allocatedAgents,
-      channels,
-    });
+            : typeof body.companyType === "string" && body.companyType.trim()
+              ? body.companyType.trim().slice(0, 80)
+              : "Technology",
+        companyType:
+          typeof body.companyType === "string" && body.companyType.trim()
+            ? body.companyType.trim().slice(0, 80)
+            : typeof body.industry === "string" && body.industry.trim()
+              ? body.industry.trim().slice(0, 80)
+              : "Technology",
+        country:
+          typeof body.country === "string" && body.country.trim()
+            ? body.country.trim().slice(0, 80)
+            : "Sri Lanka",
+        city: typeof body.city === "string" ? body.city.trim().slice(0, 80) : "",
+        address: typeof body.address === "string" ? body.address.trim().slice(0, 240) : "",
+        employeeCount:
+          typeof body.employeeCount === "string" ? body.employeeCount.trim().slice(0, 40) : "",
+        about: typeof body.about === "string" ? body.about.trim().slice(0, 1000) : "",
+        status: "Pending",
+        submissionDate: dateStr,
+        date: dateStr,
+        requestedDate: dateStr,
+        tier:
+          typeof body.tier === "string" && body.tier.trim()
+            ? body.tier.trim().slice(0, 40)
+            : "Standard",
+        themeColor:
+          typeof body.themeColor === "string" && body.themeColor.trim()
+            ? body.themeColor.trim().slice(0, 30)
+            : "#005EB8",
+        allocatedAgents,
+        channels,
+        ...(passwordHash ? { passwordHash } : {}),
+      };
 
-    // Read-modify-write happens synchronously after awaiting hashPassword so
-    // concurrent registration submissions cannot overwrite one another.
-    const db = options.store.readDB();
-    db.registrations.push(newReg);
-    options.store.writeDB(db);
-
-    return res.status(201).json({
-      success: true,
-      registration: redactRegistrationCredentials(newReg),
-    });
-  });
+      try {
+        const created = await registrationRepo.createPending(newRegPayload);
+        return res.status(201).json({
+          success: true,
+          registration: redactRegistrationCredentials(created),
+        });
+      } catch (err: any) {
+        if (err instanceof RegistrationConflictError) {
+          return res.status(409).json({
+            success: false,
+            error: err.message,
+            code: err.code,
+          });
+        }
+        if (err instanceof RegistrationStorageUnavailableError) {
+          return res.status(503).json({
+            success: false,
+            error: err.message,
+          });
+        }
+        console.error("[LocalAuthRouter] Registration error:", err);
+        return res.status(500).json({
+          success: false,
+          error: "Unable to process registration",
+        });
+      }
+    }
+  );
 
   return router;
 }

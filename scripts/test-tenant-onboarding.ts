@@ -1,8 +1,15 @@
 process.env.ALLOW_MOCK_AUTH = "true";
 import {
+  AdminCreateUserCommand,
+  AdminAddUserToGroupCommand,
+} from "@aws-sdk/client-cognito-identity-provider";
+import {
   registerTenant,
   handleRegisterTenantRequest,
 } from "../services/onboarding/register-tenant";
+import { OnboardingDeps } from "../services/onboarding/onboarding";
+import { docClient } from "../agents/utils/dynamo-client";
+import { s3Client } from "../agents/utils/s3-client";
 
 import {
   inMemoryTenants,
@@ -15,6 +22,26 @@ import {
   queryTenantItems,
 } from "../agents/utils/dynamo-client";
 import { TenantContext } from "../shared/types/tenant-context";
+
+function makeLocalTestDeps(): OnboardingDeps {
+  const cognito = {
+    send: async (command: any) => {
+      if (
+        command instanceof AdminCreateUserCommand ||
+        command instanceof AdminAddUserToGroupCommand
+      ) {
+        return {};
+      }
+      return {};
+    },
+  };
+  return {
+    dynamo: docClient,
+    cognito: cognito as any,
+    s3: s3Client,
+    userPoolId: "test-localstack-pool-id",
+  };
+}
 
 async function runTenantOnboardingTests() {
   console.log("================================================================");
@@ -40,14 +67,18 @@ async function runTenantOnboardingTests() {
 
   // TEST 1: Register New Company (Dialog Axiata)
   console.log("\n--- Test 1: Successful Company Registration ---");
+  const testDeps = makeLocalTestDeps();
   const testSlug = `dialog-test-${Date.now().toString().slice(-4)}`;
-  const onboardResult = await registerTenant({
-    companyName: "Dialog Axiata PLC",
-    companySlug: testSlug,
-    adminEmail: `cloud-admin-${testSlug}@dialog.lk`,
-    planTier: "enterprise",
-    themeColor: "#ED1C24",
-  });
+  const onboardResult = await registerTenant(
+    {
+      companyName: "Dialog Axiata PLC",
+      companySlug: testSlug,
+      adminEmail: `cloud-admin-${testSlug}@dialog.lk`,
+      planTier: "enterprise",
+      themeColor: "#ED1C24",
+    },
+    testDeps
+  );
 
   assert(
     `Onboarding generates clean tenantId 'tenant-${testSlug}'`,
@@ -71,13 +102,16 @@ async function runTenantOnboardingTests() {
   console.log("\n--- Test 2: Duplicate Registration Rejection ---");
   let duplicateFailed = false;
   try {
-    await registerTenant({
-      companyName: "Dialog Axiata Clone",
-      companySlug: testSlug,
-      adminEmail: "different-admin@dialog.lk",
-    });
+    await registerTenant(
+      {
+        companyName: "Dialog Axiata Clone",
+        companySlug: testSlug,
+        adminEmail: "different-admin@dialog.lk",
+      },
+      testDeps
+    );
   } catch (err: any) {
-    duplicateFailed = err.message.includes("already exists");
+    duplicateFailed = err.message.includes("already exists") || err.message.includes("Conflict");
   }
 
   assert(
@@ -88,15 +122,18 @@ async function runTenantOnboardingTests() {
   // TEST 3: HTTP API Gateway Handler (POST /tenants/register)
   console.log("\n--- Test 3: HTTP API Gateway Request Handler ---");
   const fintechSlug = `fintech-${Date.now().toString().slice(-4)}`;
-  const httpResponse = await handleRegisterTenantRequest({
-    httpMethod: "POST",
-    body: JSON.stringify({
-      companyName: "Fintech Lanka",
-      companySlug: fintechSlug,
-      adminEmail: `dev@${fintechSlug}.lk`,
-      planTier: "pro",
-    }),
-  });
+  const httpResponse = await handleRegisterTenantRequest(
+    {
+      httpMethod: "POST",
+      body: JSON.stringify({
+        companyName: "Fintech Lanka",
+        companySlug: fintechSlug,
+        adminEmail: `dev@${fintechSlug}.lk`,
+        planTier: "pro",
+      }),
+    },
+    testDeps
+  );
 
   const parsedHttpBody = JSON.parse(httpResponse.body);
   assert(
