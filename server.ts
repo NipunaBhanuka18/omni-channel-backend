@@ -1,6 +1,5 @@
 import express from "express";
 import cors from "cors";
-import fs from "fs";
 import path from "path";
 import { handleTenantRequest } from "./services/tenant-router/handler";
 import { handleHandoffApi } from "./services/handoff/handler";
@@ -8,6 +7,12 @@ import { adjustActiveChats } from "./services/handoff/presence-manager";
 
 import { provisionPendingCompanyApproval } from "./services/onboarding/approval-workflow";
 import { redactRegistrationCredentials } from "./services/onboarding/registration-privacy";
+import {
+  createJsonDbStore,
+  createLocalAuthRouter,
+  normalizeRegistration,
+} from "./services/auth/local-auth-router";
+import { LocalSessionTokenService } from "./services/auth/local-session-token";
 import { s3Client, uploadKbDocument } from "./agents/utils/s3-client";
 import { ListObjectsV2Command, GetObjectCommand, HeadObjectCommand, PutObjectCommand, DeleteObjectCommand } from "@aws-sdk/client-s3";
 import { inMemoryTenants, inMemoryAgents, provisionTenantResources } from "./scripts/create-tenants-table";
@@ -28,156 +33,42 @@ app.use(cors());
 app.use(express.json());
 
 const DB_PATH = path.join(__dirname, "db.json");
+const dbStore = createJsonDbStore(DB_PATH);
+
+let cachedLocalTokenService: LocalSessionTokenService | null = null;
+function getLocalSessionTokenService(): LocalSessionTokenService {
+  if (!cachedLocalTokenService) {
+    cachedLocalTokenService = new LocalSessionTokenService();
+  }
+  return cachedLocalTokenService;
+}
 
 // Initialize baseline tenant DynamoDB/in-memory records
 provisionTenantResources().catch((err) => {
   console.warn(`[Server Init] Baseline tenant provisioning note: ${err.message}`);
 });
 
-// Helper to read database
 function readDB() {
-  if (!fs.existsSync(DB_PATH)) {
-    const initial = {
-      users: [
-        {
-          id: "user-1",
-          fullName: "System Super Admin",
-          email: "superadmin@slt.lk",
-          password: "admin123",
-          role: "superadmin",
-          createdAt: new Date().toISOString(),
-        },
-      ],
-      registrations: [],
-    };
-    fs.writeFileSync(DB_PATH, JSON.stringify(initial, null, 2));
-    return initial;
-  }
-  try {
-    const raw = fs.readFileSync(DB_PATH, "utf-8");
-    const data = JSON.parse(raw);
-    if (!data.users) {
-      data.users = [
-        {
-          id: "user-1",
-          fullName: "System Super Admin",
-          email: "superadmin@slt.lk",
-          password: "admin123",
-          role: "superadmin",
-          createdAt: new Date().toISOString(),
-        },
-      ];
-      fs.writeFileSync(DB_PATH, JSON.stringify(data, null, 2));
-    }
-    return data;
-  } catch {
-    return { users: [], registrations: [] };
-  }
+  return dbStore.readDB();
 }
 
-// Helper to write database
-function writeDB(data: any) {
-  fs.writeFileSync(DB_PATH, JSON.stringify(data, null, 2));
+function writeDB(data: { users: Array<Record<string, any>>; registrations: Array<Record<string, any>> }) {
+  dbStore.writeDB(data);
 }
 
-// Ensure DB exists on startup
-readDB();
-
 // ==========================================
-// 1. AUTHENTICATION ROUTES
+// 1. AUTHENTICATION & REGISTRATION ROUTES
 // ==========================================
-
-// POST /api/auth/login
-app.post("/api/auth/login", (req, res) => {
-  const { email, password } = req.body;
-  if (!email || !password) {
-    return res.status(400).json({ success: false, error: "Email and password are required" });
-  }
-
-  const db = readDB();
-  const user = db.users.find(
-    (u: any) => u.email.toLowerCase() === email.toLowerCase() && u.password === password
-  );
-
-  if (user) {
-    return res.json({
-      success: true,
-      user: { id: user.id, name: user.fullName || user.email, email: user.email, role: user.role },
-      token: `token-${user.id}-${Date.now()}`,
-    });
-  }
-
-  const registration = db.registrations.find(
-    (r: any) => r.companyEmail && r.companyEmail.toLowerCase() === email.toLowerCase() && r.password === password
-  );
-
-  if (registration) {
-    if (registration.status !== "Approved") {
-      return res.status(403).json({
-        success: false,
-        error: `Your registration is currently ${registration.status.toLowerCase()}. Please await Super Admin approval.`,
-      });
-    }
-
-    return res.json({
-      success: true,
-      user: {
-        id: registration.id,
-        name: registration.adminName || registration.companyName,
-        email: registration.companyEmail,
-        role: "company",
-        tenantId: registration.tenantId || `tenant-${registration.id}`,
-      },
-      token: `token-org-${registration.id}-${Date.now()}`,
-    });
-  }
-
-  return res.status(401).json({ success: false, error: "Invalid email or password" });
-});
-
-// Prevent unauthenticated callers from creating platform superadmin identities.
-// Production provisioning must use a verified, privileged administration path.
-app.post("/api/auth/register-admin", (_req, res) => {
-  return res.status(404).json({ error: "Platform administrator self-registration unavailable" });
-});
+app.use(
+  createLocalAuthRouter({
+    store: dbStore,
+    getTokenService: getLocalSessionTokenService,
+  }),
+);
 
 // ==========================================
 // 2. COMPANY REGISTRATION & APPROVAL ROUTES
 // ==========================================
-
-function normalizeRegistration(r: any) {
-  const companyName = r.companyName || r.name || "Unnamed Company";
-  const email = r.companyEmail || r.email || r.adminEmail || "";
-  const submissionDate = r.submissionDate || r.date || r.requestedDate || new Date().toISOString().split("T")[0];
-  const industry = r.industry || r.companyType || "Technology";
-
-  return {
-    ...r,
-    companyName,
-    name: companyName,
-    companyEmail: email,
-    email: email,
-    adminName: r.adminName || "Admin",
-    adminEmail: r.adminEmail || email,
-    phone: r.phone || r.adminPhone || "-",
-    adminPhone: r.adminPhone || r.phone || "-",
-    website: r.website || "-",
-    industry,
-    companyType: industry,
-    country: r.country || "Sri Lanka",
-    city: r.city || "",
-    address: r.address || "",
-    employeeCount: r.employeeCount || "",
-    about: r.about || "",
-    status: r.status || "Pending",
-    submissionDate,
-    date: submissionDate,
-    requestedDate: submissionDate,
-    tier: r.tier || "Standard",
-    allocatedAgents: r.allocatedAgents || 5,
-    channels: r.channels || ["Web"],
-  };
-}
 
 // GET /api/registrations (supports ?status=pending or ?status=approved)
 // LOCAL DEMO ONLY. No production authorization exists for listing registration PII.
@@ -207,49 +98,7 @@ app.get("/api/registrations", (req, res) => {
   return res.json({ success: true, registrations: rawList });
 });
 
-// POST /api/registrations
-app.post("/api/registrations", (req, res) => {
-  const body = req.body;
-  const db = readDB();
-
-  const cleanSlug = (body.companyName || body.name || "company").toLowerCase().replace(/[^a-z0-9]/g, "-");
-  const dateStr = new Date().toISOString().split("T")[0];
-  const newReg = normalizeRegistration({
-    id: `reg-${Date.now()}`,
-    companyName: body.companyName || body.name || "Unnamed Company",
-    name: body.companyName || body.name || "Unnamed Company",
-    companySlug: body.companySlug || cleanSlug,
-    businessRegNumber: body.businessRegNumber || "BR-PENDING",
-    companyEmail: body.companyEmail || body.email || "",
-    email: body.companyEmail || body.email || body.adminEmail || "",
-    adminName: body.adminName || "Admin",
-    adminEmail: body.adminEmail || body.companyEmail || body.email || "",
-    adminPhone: body.adminPhone || body.phone || "-",
-    phone: body.phone || body.adminPhone || "-",
-    website: body.website || "-",
-    industry: body.industry || body.companyType || "Technology",
-    companyType: body.companyType || body.industry || "Technology",
-    country: body.country || "Sri Lanka",
-    city: body.city || "",
-    address: body.address || "",
-    employeeCount: body.employeeCount || "",
-    about: body.about || "",
-    password: body.password || "company123",
-    status: "Pending",
-    submissionDate: dateStr,
-    date: dateStr,
-    requestedDate: dateStr,
-    tier: body.tier || "Standard",
-    allocatedAgents: body.allocatedAgents || 5,
-    channels: body.channels || ["Web"],
-  });
-
-  db.registrations.push(newReg);
-  writeDB(db);
-
-  // Registration submission must never echo a supplied password back to the caller.
-  res.status(201).json({ success: true, registration: redactRegistrationCredentials(newReg) });
-});
+// POST /api/registrations is registered above via createLocalAuthRouter.
 
 // LOCAL DEMO ONLY: platform registration review. This flag/header are NOT authentication.
 // Production must use verified platform-admin identity and authorize every mutation.
@@ -291,7 +140,7 @@ const handleUpdateRegistrationStatus = async (req: express.Request, res: express
     if (rawStatus === "rejected") {
       db.registrations[regIndex] = normalizeRegistration({ ...reg, status: "Rejected" });
       writeDB(db);
-      const { password: _password, ...safeRegistration } = db.registrations[regIndex];
+      const safeRegistration = redactRegistrationCredentials(db.registrations[regIndex]);
       return res.json({ success: true, demoOnly: true, registration: safeRegistration });
     }
 
@@ -311,7 +160,7 @@ const handleUpdateRegistrationStatus = async (req: express.Request, res: express
     // provisioning all succeed. Never persist one-time credentials in db.json.
     db.registrations[regIndex] = normalizeRegistration({ ...reg, ...approval.approvedRegistration });
     writeDB(db);
-    const { password: _password, ...safeRegistration } = db.registrations[regIndex];
+    const safeRegistration = redactRegistrationCredentials(db.registrations[regIndex]);
     return res.json({
       success: true, demoOnly: true, registration: safeRegistration,
       // Local demo only; a real platform-admin authorization boundary is required
@@ -1662,6 +1511,6 @@ if (require.main === module) {
   });
 }
 
-export { app, server };
+export { app, server, getLocalSessionTokenService };
 export default app;
 
