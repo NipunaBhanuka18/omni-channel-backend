@@ -1665,8 +1665,12 @@ app.post(["/api/tenant/route", "/api/agent"], ...requireAgentOrCompany, async (r
 
 const app = createApp();
 
+const isDirectExecution =
+  (typeof require !== "undefined" && require.main === module) ||
+  Boolean(process.argv[1] && /(?:^|[\\/])server\.(?:ts|js)$/i.test(process.argv[1]));
+
 let server: any = null;
-if (require.main === module) {
+if (isDirectExecution) {
   server = app.listen(Number(PORT), "127.0.0.1", () => {
     console.log(`🚀 omni-channel-backend API Server running at http://localhost:${PORT}`);
   });
