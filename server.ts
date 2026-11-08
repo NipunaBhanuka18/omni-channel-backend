@@ -18,6 +18,8 @@ import {
   requireTenantScope,
   resolveAuthorizedAgentId,
 } from "./services/auth/local-auth-middleware";
+import { BoundedRateLimiter, createRateLimitMiddleware } from "./services/auth/bounded-rate-limiter";
+import { CognitoJwtVerifier, createCognitoJwtVerifierFromEnv } from "./services/auth/cognito-jwt-verifier";
 import { LocalLoginAttemptGuard } from "./services/auth/local-login-attempt-guard";
 import { LocalSessionTokenService } from "./services/auth/local-session-token";
 import { listConversationsForTenant } from "./services/workspace-portal/list-conversations";
@@ -42,10 +44,12 @@ function getLocalSessionTokenService(): LocalSessionTokenService {
   return cachedLocalTokenService;
 }
 
-// Initialize baseline tenant DynamoDB/in-memory records once per process
-provisionTenantResources().catch((err) => {
-  console.warn(`[Server Init] Baseline tenant provisioning note: ${err.message}`);
-});
+// Initialize baseline tenant DynamoDB/in-memory records once per process in local dev/test mode
+if (isLocalDevAllowed()) {
+  provisionTenantResources().catch((err) => {
+    console.warn(`[Server Init] Baseline tenant provisioning note: ${err.message}`);
+  });
+}
 
 function asPlainBody(value: unknown): Record<string, any> | null {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
@@ -54,7 +58,33 @@ function asPlainBody(value: unknown): Record<string, any> | null {
 }
 
 function isLocalDevAllowed(): boolean {
-  return process.env.NODE_ENV !== "production" && process.env.IS_LOCAL !== "false";
+  const nodeEnv = (process.env.NODE_ENV || "").trim().toLowerCase();
+  return nodeEnv !== "production" && nodeEnv !== "prod" && process.env.IS_LOCAL !== "false";
+}
+
+function resolveCorsOptions(): cors.CorsOptions {
+  const rawOrigins = (process.env.CORS_ALLOWED_ORIGINS || "").trim();
+  if (rawOrigins) {
+    const allowed = new Set(
+      rawOrigins
+        .split(",")
+        .map((origin) => origin.trim())
+        .filter(Boolean),
+    );
+    return {
+      origin: (origin, callback) => {
+        if (!origin || allowed.has(origin)) {
+          callback(null, true);
+          return;
+        }
+        callback(null, false);
+      },
+    };
+  }
+  if (!isLocalDevAllowed()) {
+    return { origin: false };
+  }
+  return {};
 }
 
 function isLoopbackOriginAllowed(req: express.Request): boolean {
@@ -84,21 +114,51 @@ export interface CreateAppOptions {
   dbPath?: string;
   tokenService?: LocalSessionTokenService;
   loginGuard?: LocalLoginAttemptGuard;
+  cognitoVerifier?: CognitoJwtVerifier | null;
+  acceptLocalTokens?: boolean;
   approvePendingRegistration?: typeof provisionPendingCompanyApproval;
+  publicRegistrationLimiter?: BoundedRateLimiter;
+  publicHandoffLimiter?: BoundedRateLimiter;
+  publicChatResolverLimiter?: BoundedRateLimiter;
 }
 
 export function createApp(options: CreateAppOptions = {}): express.Express {
   const app = express();
-  app.use(cors());
-  app.use(express.json());
+  app.disable("x-powered-by");
+  app.use(cors(resolveCorsOptions()));
+  app.use(express.json({ limit: "128kb" }));
 
   const dbStore = createJsonDbStore(options.dbPath || DB_PATH);
   const resolveTokenService = (): LocalSessionTokenService =>
     options.tokenService ?? getLocalSessionTokenService();
+  const resolveCognitoVerifier = (): CognitoJwtVerifier | null =>
+    options.cognitoVerifier !== undefined
+      ? options.cognitoVerifier
+      : createCognitoJwtVerifierFromEnv();
+  const isLocalTokensAllowed = (): boolean =>
+    isLocalDevAllowed() && (options.acceptLocalTokens ?? true);
   const approvePendingRegistration =
     options.approvePendingRegistration ?? provisionPendingCompanyApproval;
 
-  const requireAuth = createRequireAuth(resolveTokenService);
+  const publicHandoffLimiter =
+    options.publicHandoffLimiter ??
+    new BoundedRateLimiter({ maxRequests: 25, windowMs: 60_000, maxTrackedKeys: 2048 });
+  const limitHandoffRequests = createRateLimitMiddleware(publicHandoffLimiter, {
+    errorMessage: "Too many handoff requests. Please wait and try again.",
+  });
+
+  const publicChatResolverLimiter =
+    options.publicChatResolverLimiter ??
+    new BoundedRateLimiter({ maxRequests: 60, windowMs: 60_000, maxTrackedKeys: 2048 });
+  const limitChatResolver = createRateLimitMiddleware(publicChatResolverLimiter, {
+    errorMessage: "Too many configuration lookups. Please wait and try again.",
+  });
+
+  const requireAuth = createRequireAuth({
+    getTokenService: resolveTokenService,
+    getCognitoVerifier: resolveCognitoVerifier,
+    isLocalTokensAllowed,
+  });
   const requireSuperAdmin = [requireAuth, requireRole("superadmin")] as const;
   const requireCompanyAdmin = [requireAuth, requireRole("company"), requireTenantScope()] as const;
   const requireAgentOrCompany = [
@@ -123,6 +183,7 @@ app.use(
     store: dbStore,
     getTokenService: resolveTokenService,
     loginGuard: options.loginGuard,
+    registrationLimiter: options.publicRegistrationLimiter,
   }),
 );
 
@@ -352,7 +413,10 @@ app.get(["/api/agent/presence/status", "/agent/presence/status"], ...requireAgen
 });
 
 // POST /api/chat/handoff/request (Public Customer Escalation Trigger)
-app.post(["/api/chat/handoff/request", "/chat/handoff/request"], async (req, res) => {
+app.post(
+  ["/api/chat/handoff/request", "/chat/handoff/request"],
+  limitHandoffRequests,
+  async (req, res) => {
   const body = asPlainBody(req.body);
   if (!body) {
     return res.status(400).json({
@@ -1434,7 +1498,7 @@ app.get("/api/workspace/conversations", ...requireCompanyAdmin, async (req, res)
 // ==========================================
 
 // GET /api/resolve-chat-url?company={slug}&agent={agent} (Public customer chat widget bootstrap)
-app.get(["/api/resolve-chat-url", "/resolve-chat-url"], async (req, res) => {
+app.get(["/api/resolve-chat-url", "/resolve-chat-url"], limitChatResolver, async (req, res) => {
   const remote = req.socket.remoteAddress || "";
   const loopback = ["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(remote);
   if (!isLocalDevAllowed() || !loopback) {
@@ -1578,6 +1642,26 @@ app.post(["/api/tenant/route", "/api/agent"], ...requireAgentOrCompany, async (r
     });
   }
 });
+
+  app.use((err: any, _req: express.Request, res: express.Response, next: express.NextFunction) => {
+    if (!err) return next();
+    if (err.type === "entity.too.large" || err.status === 413) {
+      return res.status(413).json({
+        success: false,
+        error: "Request payload too large",
+      });
+    }
+    if (err instanceof SyntaxError || err.type === "entity.parse.failed" || err.status === 400) {
+      return res.status(400).json({
+        success: false,
+        error: "Malformed JSON request body",
+      });
+    }
+    return res.status(500).json({
+      success: false,
+      error: "Internal server error",
+    });
+  });
 
   return app;
 }

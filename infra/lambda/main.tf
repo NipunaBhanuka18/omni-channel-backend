@@ -36,6 +36,11 @@ resource "aws_iam_role_policy_attachment" "lambda_basic_execution" {
   policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
 }
 
+locals {
+  effective_allow_mock_auth = (var.allow_mock_auth && !contains(["prod", "production"], lower(var.environment))) ? "true" : "false"
+  effective_is_local        = (var.use_localstack && !contains(["prod", "production"], lower(var.environment))) ? "true" : "false"
+}
+
 resource "aws_iam_role_policy" "lambda_permissions" {
   name = "omni-channel-lambda-permissions-${var.environment}"
   role = aws_iam_role.lambda_exec.id
@@ -50,6 +55,17 @@ resource "aws_iam_role_policy" "lambda_permissions" {
           "dynamodb:GetItem",
           "dynamodb:PutItem",
           "dynamodb:DeleteItem",
+          "dynamodb:Query",
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "TenantKnowledgeBucketAccess"
+        Effect = "Allow"
+        Action = [
+          "s3:GetObject",
+          "s3:PutObject",
+          "s3:DeleteObject",
         ]
         Resource = "*"
       },
@@ -76,8 +92,12 @@ resource "aws_lambda_function" "tenant_router" {
 
   environment {
     variables = {
-      NODE_ENV        = var.environment
-      ALLOW_MOCK_AUTH = "true"
+      NODE_ENV             = var.environment
+      IS_LOCAL             = local.effective_is_local
+      ALLOW_MOCK_AUTH      = local.effective_allow_mock_auth
+      COGNITO_USER_POOL_ID = var.cognito_user_pool_id
+      COGNITO_CLIENT_ID    = var.cognito_client_id
+      COGNITO_REGION       = var.aws_region
     }
   }
 }
@@ -108,8 +128,11 @@ resource "aws_lambda_function" "onboarding" {
   environment {
     variables = {
       NODE_ENV             = var.environment
-      ALLOW_MOCK_AUTH       = "true"
-      COGNITO_USER_POOL_ID  = var.cognito_user_pool_id
+      IS_LOCAL             = local.effective_is_local
+      ALLOW_MOCK_AUTH      = local.effective_allow_mock_auth
+      COGNITO_USER_POOL_ID = var.cognito_user_pool_id
+      COGNITO_CLIENT_ID    = var.cognito_client_id
+      COGNITO_REGION       = var.aws_region
     }
   }
 }

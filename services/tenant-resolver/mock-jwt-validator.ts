@@ -21,9 +21,10 @@ import { TenantContext } from "../../shared/types/tenant-context";
  * Throws a fatal error if executed in production mode or if ALLOW_MOCK_AUTH is not explicitly enabled.
  */
 function assertMockAuthPermitted(): void {
-  if (process.env.NODE_ENV === "production") {
+  const nodeEnv = (process.env.NODE_ENV || "").trim().toLowerCase();
+  if (nodeEnv === "production" || nodeEnv === "prod" || process.env.IS_LOCAL === "false") {
     throw new Error(
-      "[SECURITY FATAL] MockJWTValidator invoked while NODE_ENV=production! " +
+      "[SECURITY FATAL] MockJWTValidator invoked while NODE_ENV=production or IS_LOCAL=false! " +
         "Mock token validation MUST NOT be used in production. Deploy real Cognito JWKS verification."
     );
   }

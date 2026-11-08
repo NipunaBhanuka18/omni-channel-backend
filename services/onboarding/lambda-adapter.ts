@@ -58,6 +58,7 @@ export const handler = async (event: any): Promise<any> => {
           statusCode = 403;
           break;
         case "TENANT_ALREADY_EXISTS":
+        case "COMPANY_NAME_ALREADY_EXISTS":
           statusCode = 409;
           break;
         case "BAD_REQUEST":

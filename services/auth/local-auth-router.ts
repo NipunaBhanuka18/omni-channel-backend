@@ -7,6 +7,7 @@
 import express from "express";
 import fs from "node:fs";
 import { randomBytes } from "node:crypto";
+import { BoundedRateLimiter, createRateLimitMiddleware } from "./bounded-rate-limiter";
 import { hashPassword } from "./password-hashing";
 import { verifyLocalCredentialRecord } from "./local-credential-verifier";
 import { LocalLoginAttemptGuard } from "./local-login-attempt-guard";
@@ -28,6 +29,7 @@ export interface LocalAuthRouterOptions {
   tokenService?: LocalSessionTokenService;
   getTokenService?: () => LocalSessionTokenService;
   loginGuard?: LocalLoginAttemptGuard;
+  registrationLimiter?: BoundedRateLimiter;
   hashFn?: (password: string) => Promise<string>;
   maxConcurrentRegistrations?: number;
 }
@@ -108,7 +110,8 @@ export function normalizeRegistration(r: Record<string, any>): Record<string, an
 }
 
 function isLocalAuthEnabled(): boolean {
-  return process.env.NODE_ENV !== "production" && process.env.IS_LOCAL !== "false";
+  const nodeEnv = (process.env.NODE_ENV || "").trim().toLowerCase();
+  return nodeEnv !== "production" && nodeEnv !== "prod" && process.env.IS_LOCAL !== "false";
 }
 
 function asPlainObject(value: unknown): Record<string, any> | null {
@@ -132,6 +135,22 @@ export function createLocalAuthRouter(options: LocalAuthRouterOptions): express.
       maxConcurrent: 2,
       maxTrackedKeys: 1024,
     });
+  const registrationLimiter =
+    options.registrationLimiter ??
+    new BoundedRateLimiter({
+      maxRequests: 15,
+      windowMs: 60_000,
+      maxTrackedKeys: 2048,
+    });
+  const limitRegistrations = createRateLimitMiddleware(registrationLimiter, {
+    errorMessage: "Too many registration attempts. Please wait and try again.",
+  });
+  const requireLocalAuthRoute: express.RequestHandler = (_req, res, next) => {
+    if (!isLocalAuthEnabled()) {
+      return res.status(404).json({ success: false, error: "Local registration unavailable" });
+    }
+    return next();
+  };
   const hashFn = options.hashFn ?? hashPassword;
   const maxConcurrentRegistrations = options.maxConcurrentRegistrations ?? 2;
   let registrationsInFlight = 0;
@@ -292,11 +311,12 @@ export function createLocalAuthRouter(options: LocalAuthRouterOptions): express.
     return res.status(404).json({ error: "Platform administrator self-registration unavailable" });
   });
 
-  router.post("/api/registrations", async (req, res) => {
-    if (!isLocalAuthEnabled()) {
-      return res.status(404).json({ success: false, error: "Local registration unavailable" });
-    }
-    const body = asPlainObject(req.body);
+  router.post(
+    "/api/registrations",
+    requireLocalAuthRoute,
+    limitRegistrations,
+    async (req, res) => {
+      const body = asPlainObject(req.body);
     if (!body) {
       return res.status(400).json({ success: false, error: "Invalid registration payload" });
     }

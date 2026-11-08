@@ -71,14 +71,25 @@ export const handler = async (event: any): Promise<any> => {
 
     let statusCode = 200;
     if (!response.success) {
-      if (response.error?.code === "UNAUTHORIZED") {
-        statusCode = 401;
-      } else if (response.error?.code === "FORBIDDEN") {
-        statusCode = 403;
-      } else if (response.error?.code === "BAD_REQUEST") {
-        statusCode = 400;
-      } else {
-        statusCode = 400;
+      switch (response.error?.code) {
+        case "UNAUTHORIZED":
+          statusCode = 401;
+          break;
+        case "FORBIDDEN":
+        case "TENANT_INACTIVE":
+          statusCode = 403;
+          break;
+        case "TENANT_NOT_FOUND":
+          statusCode = 404;
+          break;
+        case "BAD_REQUEST":
+          statusCode = 400;
+          break;
+        case "INTERNAL_ERROR":
+          statusCode = response.error?.retryable ? 503 : 500;
+          break;
+        default:
+          statusCode = 400;
       }
     }
 

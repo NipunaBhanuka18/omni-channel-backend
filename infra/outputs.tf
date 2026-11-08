@@ -14,25 +14,27 @@ output "api_gateway_route_invoke_url" {
 }
 
 # ------------------------------------------------------------------------------
-# DEPRECATED: Cognito Identity Outputs (Commented out per Azure AD transition)
+# Cognito Identity Outputs (Restored per ADR-010)
 # ------------------------------------------------------------------------------
-# output "cognito_user_pool_id" {
-#   description = "Cognito User Pool ID"
-#   value       = module.cognito.user_pool_id
-# }
-# 
-# output "cognito_app_client_id" {
-#   description = "Cognito App Client ID"
-#   value       = module.cognito.client_id
-# }
-# 
-# output "cognito_groups" {
-#   description = "Cognito internal pilot groups"
-#   value = {
-#     staff = module.cognito.staff_group_name
-#     admin = module.cognito.admin_group_name
-#   }
-# }
+output "cognito_user_pool_id" {
+  description = "Cognito User Pool ID"
+  value       = module.cognito.user_pool_id
+}
+
+output "cognito_app_client_id" {
+  description = "Cognito App Client ID"
+  value       = module.cognito.client_id
+}
+
+output "cognito_groups" {
+  description = "Cognito platform & tenant user groups"
+  value = {
+    superadmin = module.cognito.superadmin_group_name
+    staff      = module.cognito.staff_group_name
+    admin      = module.cognito.admin_group_name
+    live_agent = module.cognito.live_agent_group_name
+  }
+}
 
 output "secrets_tenant_template_arn" {
   description = "Secrets Manager template secret ARN"

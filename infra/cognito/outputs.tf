@@ -13,6 +13,11 @@ output "client_id" {
   value       = aws_cognito_user_pool_client.client.id
 }
 
+output "superadmin_group_name" {
+  description = "Name of the platform superadmin user group"
+  value       = aws_cognito_user_group.superadmin.name
+}
+
 output "staff_group_name" {
   description = "Name of the staff user group"
   value       = aws_cognito_user_group.staff.name

@@ -4,3 +4,5 @@ use_localstack = true
 localstack_url = "http://localhost:4566"
 # Set enable_waf = true when deploying to AWS or LocalStack Pro
 enable_waf     = false
+# Keep false unless explicitly running local unsigned mock JWT tests
+allow_mock_auth = false

@@ -1,18 +1,14 @@
 # ==============================================================================
-# DEPRECATED MODULE: Cognito Identity Module
-# ==============================================================================
-# Deprecated as of 2026-08-07 — replaced by Azure AD per supervisor + BRD confirmation.
-# Retained for reference only, not included in root module wiring.
+# AWS Cognito Identity Module (Active per ADR-010)
 # ==============================================================================
 # ARCHITECTURAL NOTE ON TENANT ISOLATION IN AUTHENTICATION:
-# In Phase 1 (internal pilot), user groups ('staff', 'admin') are global/generic.
-# When expanding to external tenants or multi-tenant user isolation, tenant context must
-# be enforced either via custom user pool attributes (e.g. 'custom:tenant_id'), tenant-scoped
-# user pool groups, or separate Cognito User Pools per tenant tier.
+# - `superadmin` (precedence 0): Platform super administrators (must NOT carry custom:tenant_id).
+# - `admin` (precedence 1): Company tenant administrators (bound via custom:tenant_id).
+# - `live_agent` (precedence 5): Live human support agents (bound via custom:tenant_id).
+# - `staff` (precedence 10): Internal platform onboarding staff (unscoped).
 #
 # FUTURE CAPABILITY NOTICE:
-# Enterprise SSO federation (SAML 2.0 / OIDC) is planned for a future phase and is not
-# configured in Phase 1.
+# Enterprise SSO federation (SAML 2.0 / OIDC) is planned for a future phase.
 # ==============================================================================
 
 resource "aws_cognito_user_pool" "pool" {
@@ -82,18 +78,26 @@ resource "aws_cognito_user_pool_client" "client" {
 
 }
 
-# Internal pilot user groups (Global context for Phase 1)
+# Platform super administrators (global, unscoped — never carry custom:tenant_id)
+resource "aws_cognito_user_group" "superadmin" {
+  name         = "superadmin"
+  user_pool_id = aws_cognito_user_pool.pool.id
+  description  = "Platform super administrators without tenant scoping"
+  precedence   = 0
+}
+
+# Internal pilot user groups
 resource "aws_cognito_user_group" "staff" {
   name         = "staff"
   user_pool_id = aws_cognito_user_pool.pool.id
-  description  = "Internal pilot staff users"
+  description  = "Internal platform staff users"
   precedence   = 10
 }
 
 resource "aws_cognito_user_group" "admin" {
   name         = "admin"
   user_pool_id = aws_cognito_user_pool.pool.id
-  description  = "Internal pilot platform administrators"
+  description  = "Company tenant administrators (scoped via custom:tenant_id)"
   precedence   = 1
 }
 

@@ -8,8 +8,12 @@
 module "lambda" {
   source                    = "./lambda"
   environment               = var.environment
+  aws_region                = var.aws_region
+  use_localstack            = var.use_localstack
+  allow_mock_auth           = var.allow_mock_auth
   api_gateway_execution_arn = module.api_gateway.execution_arn
   cognito_user_pool_id      = module.cognito.user_pool_id
+  cognito_client_id         = module.cognito.client_id
 }
 
 module "api_gateway" {
@@ -38,9 +42,7 @@ module "waf" {
 }
 
 # ------------------------------------------------------------------------------
-# DEPRECATED: Cognito Identity Module
-# Deprecated as of 2026-08-07 — replaced by Azure AD per supervisor + BRD confirmation.
-# Retained for reference only in ./cognito/, not included in active root module.
+# Cognito Identity Module (Active per ADR-010)
 # ------------------------------------------------------------------------------
 module "cognito" {
   source      = "./cognito"

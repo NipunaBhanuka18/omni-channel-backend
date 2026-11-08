@@ -27,3 +27,9 @@ variable "enable_waf" {
   description = "Toggle WAF deployment (set to false if using LocalStack Community tier without WAFv2 emulation support)"
   default     = false
 }
+
+variable "allow_mock_auth" {
+  type        = bool
+  description = "Allow dev-only unsigned JWT fallback in non-production environments (always disabled in prod)"
+  default     = false
+}

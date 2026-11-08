@@ -1,9 +1,17 @@
 /**
- * LOCAL-DEMO-ONLY Express authentication and tenant/role authorization middleware.
- * Validates HMAC-SHA256 signed local session bearer tokens and enforces fail-closed
- * RBAC and zero-trust tenant scoping.
+ * Express authentication and tenant/role authorization middleware.
+ * Supports:
+ * - Cognito RS256 JWKS verification (required outside local development).
+ * - Local HMAC-SHA256 signed `v1.` session tokens strictly in local demo/test mode.
+ * Enforces fail-closed RBAC and zero-trust tenant scoping.
  */
 import express from "express";
+import {
+  CognitoJwksUnavailableError,
+  CognitoJwtVerifier,
+  CognitoTokenValidationError,
+  mapCognitoClaimsToSessionClaims,
+} from "./cognito-jwt-verifier";
 import {
   extractBearerToken,
   LocalAuthRole,
@@ -20,8 +28,19 @@ declare global {
   }
 }
 
+export interface RequireAuthOptions {
+  getTokenService?: () => LocalSessionTokenService;
+  getCognitoVerifier?: () => CognitoJwtVerifier | null;
+  isLocalTokensAllowed?: () => boolean;
+}
+
 const TENANT_ID_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 const AGENT_ID_PATTERN = /^[a-zA-Z0-9._:@-]{1,128}$/;
+
+function isProductionEnv(): boolean {
+  const nodeEnv = (process.env.NODE_ENV || "").trim().toLowerCase();
+  return nodeEnv === "production" || nodeEnv === "prod" || process.env.IS_LOCAL === "false";
+}
 
 function asPlainObject(value: unknown): Record<string, unknown> | null {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
@@ -30,9 +49,14 @@ function asPlainObject(value: unknown): Record<string, unknown> | null {
 }
 
 export function createRequireAuth(
-  getTokenService: () => LocalSessionTokenService,
+  optionsOrGetTokenService: RequireAuthOptions | (() => LocalSessionTokenService),
 ): express.RequestHandler {
-  return (req, res, next) => {
+  const options: RequireAuthOptions =
+    typeof optionsOrGetTokenService === "function"
+      ? { getTokenService: optionsOrGetTokenService }
+      : optionsOrGetTokenService;
+
+  return async (req, res, next) => {
     const token = extractBearerToken(req.headers.authorization);
     if (!token) {
       return res.status(401).json({
@@ -41,9 +65,73 @@ export function createRequireAuth(
       });
     }
 
-    let claims: LocalSessionClaims | null = null;
+    const envIsProd = isProductionEnv();
+    const localTokensAllowed =
+      !envIsProd &&
+      (options.isLocalTokensAllowed ? Boolean(options.isLocalTokensAllowed()) : true);
+
+    let verifiedClaims: LocalSessionClaims | null = null;
     try {
-      claims = getTokenService().verifyToken(token);
+      if (token.startsWith("v1.")) {
+        if (!localTokensAllowed || !options.getTokenService) {
+          return res.status(401).json({
+            success: false,
+            error: "Invalid or expired authentication token",
+          });
+        }
+        verifiedClaims = options.getTokenService().verifyToken(token);
+        if (!verifiedClaims) {
+          return res.status(401).json({
+            success: false,
+            error: "Invalid or expired authentication token",
+          });
+        }
+      } else {
+        const verifier = options.getCognitoVerifier ? options.getCognitoVerifier() : null;
+        if (!verifier) {
+          if (envIsProd) {
+            return res.status(503).json({
+              success: false,
+              error: "Authentication service unavailable",
+            });
+          }
+          return res.status(401).json({
+            success: false,
+            error: "Invalid or expired authentication token",
+          });
+        }
+
+        let cognitoClaims;
+        try {
+          cognitoClaims = await verifier.verifyToken(token);
+        } catch (err) {
+          if (err instanceof CognitoJwksUnavailableError) {
+            return res.status(503).json({
+              success: false,
+              error: "Authentication service unavailable",
+            });
+          }
+          if (err instanceof CognitoTokenValidationError) {
+            return res.status(401).json({
+              success: false,
+              error: "Invalid or expired authentication token",
+            });
+          }
+          return res.status(401).json({
+            success: false,
+            error: "Invalid or expired authentication token",
+          });
+        }
+
+        const mapped = mapCognitoClaimsToSessionClaims(cognitoClaims);
+        if (!mapped) {
+          return res.status(403).json({
+            success: false,
+            error: "Authenticated token lacks valid platform role or tenant scope",
+          });
+        }
+        verifiedClaims = mapped;
+      }
     } catch {
       return res.status(503).json({
         success: false,
@@ -51,15 +139,8 @@ export function createRequireAuth(
       });
     }
 
-    if (!claims) {
-      return res.status(401).json({
-        success: false,
-        error: "Invalid or expired authentication token",
-      });
-    }
-
-    req.localAuth = claims;
-    req.authorizedTenantId = claims.tenantId;
+    req.localAuth = verifiedClaims;
+    req.authorizedTenantId = verifiedClaims.tenantId;
     return next();
   };
 }
@@ -115,7 +196,8 @@ export function requireTenantScope(): express.RequestHandler {
     const queryTenant = req.query?.tenantId;
     const bodyObj = asPlainObject(req.body);
     const hasBodyTenant =
-      bodyObj !== null && Object.prototype.hasOwnProperty.call(bodyObj, "tenantId") &&
+      bodyObj !== null &&
+      Object.prototype.hasOwnProperty.call(bodyObj, "tenantId") &&
       bodyObj.tenantId !== undefined;
     const bodyTenant = hasBodyTenant ? bodyObj!.tenantId : undefined;
 
@@ -182,4 +264,3 @@ export function resolveAuthorizedAgentId(
 
   return { ok: true, agentId: supplied || auth.sub };
 }
-

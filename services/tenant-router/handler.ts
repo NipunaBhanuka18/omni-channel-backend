@@ -1,4 +1,7 @@
-import { resolveTenantContext } from "../tenant-resolver/resolver";
+import {
+  resolveTenantContextVerified,
+  TenantResolverDeps,
+} from "../tenant-resolver/resolver";
 import { routeRequest, RoutingDecisionResult } from "./router";
 import { AgentActionResponse } from "../../shared/types/agent-action";
 import { TenantContext } from "../../shared/types/tenant-context";
@@ -10,6 +13,8 @@ export interface HttpRequestPayload {
   body?: Record<string, any>;
   /** Optional cryptographically verified TenantContext supplied by HTTP auth middleware. */
   verifiedContext?: TenantContext;
+  /** Optional resolver dependencies (e.g. injected CognitoJwtVerifier in tests). */
+  resolverDeps?: TenantResolverDeps;
 }
 
 /**
@@ -21,8 +26,11 @@ export interface HttpRequestPayload {
 export async function handleTenantRequest(request: HttpRequestPayload): Promise<AgentActionResponse> {
   let tenantContext = request.verifiedContext;
   if (!tenantContext) {
-    // Step 1: Resolve Tenant Context from headers
-    const resolverResult = resolveTenantContext(request.headers);
+    // Step 1: Resolve Tenant Context from headers using verified Cognito JWTs in production
+    const resolverResult = await resolveTenantContextVerified(
+      request.headers,
+      request.resolverDeps,
+    );
 
     if (!resolverResult.success || !resolverResult.context) {
       return {
