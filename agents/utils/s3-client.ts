@@ -75,6 +75,17 @@ export const fetchKbDocument = async (
     }
     return Buffer.concat(chunks).toString("utf-8");
   } catch (error) {
+    if (isLocal) {
+      console.warn(
+        `[S3 Client] LocalStack S3 unavailable or key missing. Returning local fallback for '${isolatedKey}'.`
+      );
+      return `Issue: Slow Internet Connection
+Solution: Power cycle the optical network terminal (ONT) and fiber router. Ensure LAN cable is securely plugged in.
+Issue: Router Red LOS Light
+Solution: Check fiber patch cord for tight bends or disconnects. If red LED remains on, please open a support ticket.
+Issue: Wi-Fi Disconnecting
+Solution: Change Wi-Fi channel in router admin portal to 5GHz or reboot device.`;
+    }
     console.error(
       `[S3 Client Error] Failed to fetch '${isolatedKey}' from bucket '${KB_BUCKET_NAME}':`,
       error

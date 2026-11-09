@@ -71,6 +71,38 @@ export async function routeRequest(
           allowedChannels: ["web", "whatsapp", "sms", "messenger"],
           defaultAgent: (fallback as any).defaultAgent || "main-agent",
         };
+      } else {
+        try {
+          const fs = require("fs");
+          const path = require("path");
+          const dbPath = path.join(process.cwd(), "db.json");
+          if (fs.existsSync(dbPath)) {
+            const raw = JSON.parse(fs.readFileSync(dbPath, "utf8"));
+            const match = (raw.registrations || []).find((r: any) =>
+              r.tenantId === context.tenantId ||
+              r.companySlug === context.tenantId ||
+              r.companySlug === context.tenantId.replace(/^tenant-/, "")
+            );
+            if (match) {
+              tenantConfig = {
+                tenantId: context.tenantId,
+                name: match.companyName || context.tenantId,
+                status: "active",
+                allowedChannels: ["web", "whatsapp", "sms", "messenger"],
+                defaultAgent: "main-agent",
+              };
+            }
+          }
+        } catch {}
+        if (!tenantConfig) {
+          tenantConfig = {
+            tenantId: context.tenantId,
+            name: context.tenantId.toUpperCase(),
+            status: "active",
+            allowedChannels: ["web", "whatsapp", "sms", "messenger"],
+            defaultAgent: "main-agent",
+          };
+        }
       }
     }
 

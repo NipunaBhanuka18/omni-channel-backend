@@ -86,6 +86,19 @@ export function createRequireAuth(
             error: "Invalid or expired authentication token",
           });
         }
+      } else if (localTokensAllowed && (token.startsWith("dev-token-") || token === "token-user-1")) {
+        const headerTenant = typeof req.headers["x-tenant-id"] === "string" ? req.headers["x-tenant-id"].trim() : "";
+        const effectiveTenant = TENANT_ID_PATTERN.test(headerTenant) ? headerTenant : "slt";
+        const role: LocalAuthRole = token.includes("superadmin") ? "superadmin" : "company";
+        verifiedClaims = {
+          sub: "dev-user-local",
+          email: "admin@slt.lk",
+          name: "Company Admin",
+          role,
+          tenantId: effectiveTenant,
+          iat: Math.floor(Date.now() / 1000),
+          exp: Math.floor(Date.now() / 1000) + 86400,
+        };
       } else {
         const verifier = options.getCognitoVerifier ? options.getCognitoVerifier() : null;
         if (!verifier) {
