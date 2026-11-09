@@ -306,6 +306,7 @@ export function createLocalAuthRouter(options: LocalAuthRouterOptions): express.
         email: companyEmail,
         role: "company",
         tenantId,
+        companyName: matchedRegistration!.companyName || "Dialog Axiata",
       },
       token,
     });
@@ -531,6 +532,7 @@ export function createLocalAuthRouter(options: LocalAuthRouterOptions): express.
               email: companyEmail,
               role: "company",
               tenantId,
+              companyName: created.companyName || "Dialog Axiata",
             },
           });
         }
