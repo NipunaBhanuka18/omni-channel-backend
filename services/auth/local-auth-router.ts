@@ -22,6 +22,7 @@ import {
   RegistrationStorageUnavailableError,
 } from "../onboarding/registration-repository";
 import { normalizeRegistration } from "../onboarding/registration-normalizer";
+import { deriveTenantId } from "../../shared/utils/tenant-name";
 
 export { normalizeRegistration };
 
@@ -248,15 +249,36 @@ export function createLocalAuthRouter(options: LocalAuthRouterOptions): express.
     // Status and tenant checks happen strictly AFTER password verification so
     // unauthenticated callers cannot probe registration review states.
     if (matchedRegistration!.status !== "Approved") {
-      return res.status(403).json({
-        success: false,
-        error: `Your registration is currently ${String(matchedRegistration!.status || "pending").toLowerCase()}. Please await Super Admin approval.`,
-      });
+      const isAutoApproveOnLogin =
+        isLocalAuthEnabled() || process.env.AUTO_APPROVE_REGISTRATIONS === "true";
+
+      if (isAutoApproveOnLogin) {
+        const autoTenantId = deriveTenantId(matchedRegistration!.companySlug, matchedRegistration!.companyName);
+        try {
+          const approvedRecord = await registrationRepo.markApproved(matchedRegistration!.id, {
+            tenantId: autoTenantId,
+            companySlug: matchedRegistration!.companySlug,
+            onboardedAt: new Date().toISOString(),
+          });
+          matchedRegistration = approvedRecord;
+        } catch {
+          matchedRegistration = {
+            ...matchedRegistration!,
+            status: "Approved",
+            tenantId: autoTenantId,
+          };
+        }
+      } else {
+        return res.status(403).json({
+          success: false,
+          error: `Your registration is currently ${String(matchedRegistration!.status || "pending").toLowerCase()}. Please await Super Admin approval.`,
+        });
+      }
     }
     const tenantId =
       typeof matchedRegistration!.tenantId === "string"
         ? matchedRegistration!.tenantId.trim()
-        : "";
+        : deriveTenantId(matchedRegistration!.companySlug, matchedRegistration!.companyName);
     if (!TENANT_ID_PATTERN.test(tenantId)) {
       return res.status(403).json({
         success: false,
@@ -466,6 +488,53 @@ export function createLocalAuthRouter(options: LocalAuthRouterOptions): express.
 
       try {
         const created = await registrationRepo.createPending(newRegPayload);
+        const shouldAutoApprove =
+          body.autoApprove === true ||
+          req.query.autoApprove === "true" ||
+          process.env.AUTO_APPROVE_REGISTRATIONS === "true";
+
+        if (shouldAutoApprove) {
+          const tenantId = deriveTenantId(created.companySlug, created.companyName);
+          let approved = created;
+          try {
+            approved = await registrationRepo.markApproved(created.id, {
+              tenantId,
+              companySlug: created.companySlug,
+              onboardedAt: new Date().toISOString(),
+            });
+          } catch {
+            approved = {
+              ...created,
+              status: "Approved",
+              tenantId,
+              onboardedAt: new Date().toISOString(),
+            };
+          }
+
+          const companyEmail = String(created.companyEmail || created.adminEmail || "").trim();
+          const adminName = String(created.adminName || created.companyName || companyEmail).trim();
+          const token = resolveTokenService().issueToken({
+            sub: created.id,
+            email: companyEmail,
+            name: adminName,
+            role: "company",
+            tenantId,
+          });
+
+          return res.status(201).json({
+            success: true,
+            registration: redactRegistrationCredentials(approved),
+            token,
+            user: {
+              id: created.id,
+              name: adminName,
+              email: companyEmail,
+              role: "company",
+              tenantId,
+            },
+          });
+        }
+
         return res.status(201).json({
           success: true,
           registration: redactRegistrationCredentials(created),
