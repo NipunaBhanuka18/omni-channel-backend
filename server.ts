@@ -727,6 +727,8 @@ export function createApp(options: CreateAppOptions = {}): express.Express {
     }
   });
 
+  const localMemoryAgents = new Map<string, Array<Record<string, any>>>();
+
   // Tenant-scoped agent list.
   app.get("/api/dev/admin/agents", ...requireCompanyAdmin, async (req, res) => {
     if (!isLocalDevAllowed() || !isLoopbackOriginAllowed(req)) {
@@ -734,8 +736,8 @@ export function createApp(options: CreateAppOptions = {}): express.Express {
     }
     const tenantId = req.authorizedTenantId!;
 
+    const records: Array<Record<string, any>> = [];
     try {
-      const records: Array<Record<string, any>> = [];
       let lastKey: Record<string, any> | undefined;
       do {
         const result = await docClient.send(new QueryCommand({
@@ -747,25 +749,37 @@ export function createApp(options: CreateAppOptions = {}): express.Express {
         records.push(...((result.Items || []) as Array<Record<string, any>>));
         lastKey = result.LastEvaluatedKey;
       } while (lastKey);
-
-      records.sort((a, b) => String(a.agentId || "").localeCompare(String(b.agentId || "")));
-      return res.json({
-        tenantId, source: "localstack", demoOnly: true,
-        total: records.length,
-        items: records.map(a => ({
-          agentId: String(a.agentId || ""),
-          displayName: String(a.displayName || a.name || a.agentName || a.agentId || "Unnamed agent"),
-          modelId: typeof a.modelId === "string" ? a.modelId :
-            (typeof a.defaultModel === "string" ? a.defaultModel : null),
-          status: typeof a.status === "string" ? a.status.toUpperCase() : "UNKNOWN",
-          publicAgentKey: typeof a.publicAgentKey === "string" && a.publicAgentKey.trim()
-            ? a.publicAgentKey : null,
-        })),
-      });
     } catch (error) {
-      console.error("[LocalAdminAgents] LocalStack query failed:", error);
-      return res.status(503).json({ error: "Agent list unavailable; check the agent DynamoDB table" });
+      console.warn("[LocalAdminAgents] LocalStack offline, reading from local memory agent store");
     }
+
+    const localList = localMemoryAgents.get(tenantId) || [];
+    for (const item of localList) {
+      if (!records.some((r) => r.agentId === item.agentId)) {
+        records.push(item);
+      }
+    }
+
+    records.sort((a, b) => String(a.agentId || "").localeCompare(String(b.agentId || "")));
+    return res.json({
+      tenantId,
+      source: "local",
+      demoOnly: true,
+      total: records.length,
+      items: records.map((a) => ({
+        agentId: String(a.agentId || ""),
+        displayName: String(a.displayName || a.name || a.agentName || a.agentId || "Unnamed agent"),
+        brandName: String(a.brandName || ""),
+        modelId: typeof a.modelId === "string" ? a.modelId : (typeof a.defaultModel === "string" ? a.defaultModel : null),
+        status: typeof a.status === "string" ? a.status.toUpperCase() : "DRAFT",
+        publicAgentKey: typeof a.publicAgentKey === "string" && a.publicAgentKey.trim() ? a.publicAgentKey : null,
+        toolIds: a.toolIds || [],
+        enabledSubAgents: a.enabledSubAgents || [],
+        welcomeMessage: a.welcomeMessage || "",
+        systemPrompt: a.systemPrompt || "",
+        createdAt: a.createdAt || new Date().toISOString(),
+      })),
+    });
   });
 
   // Create tenant-scoped DRAFT agent record (requires explicit opt-in flag + company admin token).
@@ -815,6 +829,11 @@ export function createApp(options: CreateAppOptions = {}): express.Express {
       suggestedPrompts, toolIds, enabledSubAgents,
       deploymentStatus: "NOT_DEPLOYED",
     };
+    // Store in local memory cache
+    const currentList = localMemoryAgents.get(tenantId) || [];
+    currentList.push(item);
+    localMemoryAgents.set(tenantId, currentList);
+
     try {
       const { PutCommand } = await import("@aws-sdk/lib-dynamodb");
       await docClient.send(new PutCommand({
@@ -825,7 +844,7 @@ export function createApp(options: CreateAppOptions = {}): express.Express {
       return res.status(201).json({ source: "localstack", tenantId, demoOnly: true, item });
     } catch (error: any) {
       if (isLocalDevAllowed()) {
-        console.warn("[LocalAdminAgents] LocalStack offline, saving in local memory:", error?.message);
+        console.warn("[LocalAdminAgents] LocalStack offline, saved in local memory:", error?.message);
         return res.status(201).json({ source: "local-memory", tenantId, demoOnly: true, item });
       }
       console.error("[LocalAdminAgents] Could not create DRAFT agent record:", error);
