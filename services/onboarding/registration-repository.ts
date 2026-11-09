@@ -792,3 +792,132 @@ export class JsonRegistrationRepository implements RegistrationRepository {
     };
   }
 }
+
+/**
+ * Resilient registration repository wrapper used during local development.
+ * Attempts the primary durable repository (e.g. LocalStack DynamoDB).
+ * If LocalStack is unreachable (ECONNREFUSED / table not found), seamlessly
+ * falls back to local file storage (db.json) so frontend developers and local
+ * smoke tests are never blocked by offline Docker containers.
+ */
+export class ResilientLocalRegistrationRepository implements RegistrationRepository {
+  constructor(
+    private readonly primary: RegistrationRepository,
+    private readonly fallback: RegistrationRepository
+  ) {}
+
+  private isStorageError(err: any): boolean {
+    const msg = String(err?.message || "");
+    const code = String(err?.code || "");
+    return (
+      err instanceof RegistrationStorageUnavailableError ||
+      code === "STORAGE_UNAVAILABLE" ||
+      code === "ECONNREFUSED" ||
+      msg.includes("ECONNREFUSED") ||
+      msg.includes("ResourceNotFoundException") ||
+      msg.includes("Cannot do operations on a non-existent table") ||
+      msg.includes("ResourceNotFound")
+    );
+  }
+
+  async createPending(record: Record<string, any>): Promise<CompanyRegistrationRecord> {
+    try {
+      return await this.primary.createPending(record);
+    } catch (err: any) {
+      if (this.isStorageError(err)) {
+        console.warn(`[RegistrationRepo] Primary store unavailable (${err.message}); storing in local database.`);
+        return await this.fallback.createPending(record);
+      }
+      throw err;
+    }
+  }
+
+  async list(statusFilter?: string): Promise<CompanyRegistrationRecord[]> {
+    try {
+      return await this.primary.list(statusFilter);
+    } catch (err: any) {
+      if (this.isStorageError(err)) {
+        return await this.fallback.list(statusFilter);
+      }
+      throw err;
+    }
+  }
+
+  async getById(id: string): Promise<CompanyRegistrationRecord | null> {
+    try {
+      return await this.primary.getById(id);
+    } catch (err: any) {
+      if (this.isStorageError(err)) {
+        return await this.fallback.getById(id);
+      }
+      throw err;
+    }
+  }
+
+  async claimForReview(id: string): Promise<ClaimReviewResult> {
+    try {
+      return await this.primary.claimForReview(id);
+    } catch (err: any) {
+      if (this.isStorageError(err)) {
+        return await this.fallback.claimForReview(id);
+      }
+      throw err;
+    }
+  }
+
+  async releaseReviewClaim(id: string): Promise<void> {
+    try {
+      return await this.primary.releaseReviewClaim(id);
+    } catch (err: any) {
+      if (this.isStorageError(err)) {
+        return await this.fallback.releaseReviewClaim(id);
+      }
+      throw err;
+    }
+  }
+
+  async markApproved(id: string, approval: RegistrationApprovalUpdate): Promise<CompanyRegistrationRecord> {
+    try {
+      return await this.primary.markApproved(id, approval);
+    } catch (err: any) {
+      if (this.isStorageError(err)) {
+        return await this.fallback.markApproved(id, approval);
+      }
+      throw err;
+    }
+  }
+
+  async markRejected(id: string, reviewedBy?: string): Promise<CompanyRegistrationRecord | null> {
+    try {
+      return await this.primary.markRejected(id, reviewedBy);
+    } catch (err: any) {
+      if (this.isStorageError(err)) {
+        return await this.fallback.markRejected(id, reviewedBy);
+      }
+      throw err;
+    }
+  }
+
+  async findLatestByEmailForLocalLogin(normalizedEmail: string): Promise<Record<string, any> | null> {
+    try {
+      return await this.primary.findLatestByEmailForLocalLogin(normalizedEmail);
+    } catch (err: any) {
+      if (this.isStorageError(err)) {
+        return await this.fallback.findLatestByEmailForLocalLogin(normalizedEmail);
+      }
+      throw err;
+    }
+  }
+
+  async getPlatformStats(): Promise<PlatformStats> {
+    try {
+      return await this.primary.getPlatformStats();
+    } catch (err: any) {
+      if (this.isStorageError(err)) {
+        return await this.fallback.getPlatformStats();
+      }
+      throw err;
+    }
+  }
+}
+

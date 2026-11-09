@@ -68,10 +68,10 @@ async function runTenantOnboardingTests() {
   // TEST 1: Register New Company (Dialog Axiata)
   console.log("\n--- Test 1: Successful Company Registration ---");
   const testDeps = makeLocalTestDeps();
-  const testSlug = `dialog-test-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+  const testSlug = `dialog-test-${Date.now().toString().slice(-4)}`;
   const onboardResult = await registerTenant(
     {
-      companyName: `Dialog Axiata PLC ${testSlug}`,
+      companyName: "Dialog Axiata PLC",
       companySlug: testSlug,
       adminEmail: `cloud-admin-${testSlug}@dialog.lk`,
       planTier: "enterprise",
@@ -121,12 +121,12 @@ async function runTenantOnboardingTests() {
 
   // TEST 3: HTTP API Gateway Handler (POST /tenants/register)
   console.log("\n--- Test 3: HTTP API Gateway Request Handler ---");
-  const fintechSlug = `fintech-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+  const fintechSlug = `fintech-${Date.now().toString().slice(-4)}`;
   const httpResponse = await handleRegisterTenantRequest(
     {
       httpMethod: "POST",
       body: JSON.stringify({
-        companyName: `Fintech Lanka ${fintechSlug}`,
+        companyName: "Fintech Lanka",
         companySlug: fintechSlug,
         adminEmail: `dev@${fintechSlug}.lk`,
         planTier: "pro",

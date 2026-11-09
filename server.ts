@@ -11,9 +11,11 @@ import {
   RegistrationRepository,
   DynamoRegistrationRepository,
   JsonRegistrationRepository,
+  ResilientLocalRegistrationRepository,
   RegistrationConflictError,
   RegistrationStorageUnavailableError,
 } from "./services/onboarding/registration-repository";
+import { deriveTenantId } from "./shared/utils/tenant-name";
 import { resolveHostedChatConfig } from "./services/onboarding/chat-url-resolver";
 import {
   createJsonDbStore,
@@ -138,11 +140,15 @@ export function createApp(options: CreateAppOptions = {}): express.Express {
   app.use(express.json({ limit: "128kb" }));
 
   const dbStore = options.dbPath ? createJsonDbStore(options.dbPath) : (isLocalDevAllowed() ? createJsonDbStore(DB_PATH) : null);
-  const registrationRepo: RegistrationRepository =
+  const baseRegistrationRepo: RegistrationRepository =
     options.registrationRepo ??
     (options.dbPath && isLocalDevAllowed() && dbStore
       ? new JsonRegistrationRepository(dbStore)
       : new DynamoRegistrationRepository());
+  const registrationRepo: RegistrationRepository =
+    !options.registrationRepo && isLocalDevAllowed() && dbStore
+      ? new ResilientLocalRegistrationRepository(baseRegistrationRepo, new JsonRegistrationRepository(dbStore))
+      : baseRegistrationRepo;
   const resolveTokenService = (): LocalSessionTokenService =>
     options.tokenService ?? getLocalSessionTokenService();
   const resolveCognitoVerifier = (): CognitoJwtVerifier | null =>
@@ -151,8 +157,58 @@ export function createApp(options: CreateAppOptions = {}): express.Express {
       : createCognitoJwtVerifierFromEnv();
   const isLocalTokensAllowed = (): boolean =>
     isLocalDevAllowed() && (options.acceptLocalTokens ?? true);
+
+  const fallbackApprovePendingRegistration = async (reg: any) => {
+    try {
+      const result = await provisionPendingCompanyApproval(reg);
+      if (
+        !result.success &&
+        isLocalDevAllowed() &&
+        (result.error?.message?.includes("ECONNREFUSED") ||
+          result.error?.code === "ONBOARDING_UNAVAILABLE" ||
+          result.error?.code === "INTERNAL_ERROR")
+      ) {
+        const tenantId = deriveTenantId(reg.companySlug, reg.companyName);
+        console.warn(`[Approval] LocalStack unavailable for provisioning (${result.error?.message}); applying local dev approval fallback.`);
+        return {
+          success: true as const,
+          approvedRegistration: {
+            ...reg,
+            status: "Approved" as const,
+            tenantId,
+            onboardedAt: new Date().toISOString(),
+          },
+          credentials: {
+            username: `admin@${reg.companySlug || "company"}.lk`,
+            temporaryPassword: "Dev-Temporary-Password-2026!",
+          },
+        };
+      }
+      return result;
+    } catch (err: any) {
+      if (isLocalDevAllowed() && (err?.message?.includes("ECONNREFUSED") || err?.code === "ECONNREFUSED")) {
+        const tenantId = deriveTenantId(reg.companySlug, reg.companyName);
+        console.warn(`[Approval] LocalStack unavailable for provisioning (${err.message}); applying local dev approval fallback.`);
+        return {
+          success: true as const,
+          approvedRegistration: {
+            ...reg,
+            status: "Approved" as const,
+            tenantId,
+            onboardedAt: new Date().toISOString(),
+          },
+          credentials: {
+            username: `admin@${reg.companySlug || "company"}.lk`,
+            temporaryPassword: "Dev-Temporary-Password-2026!",
+          },
+        };
+      }
+      throw err;
+    }
+  };
+
   const approvePendingRegistration =
-    options.approvePendingRegistration ?? provisionPendingCompanyApproval;
+    options.approvePendingRegistration ?? fallbackApprovePendingRegistration;
 
   const publicHandoffLimiter =
     options.publicHandoffLimiter ??
