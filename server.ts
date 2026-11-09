@@ -1221,6 +1221,160 @@ export function createApp(options: CreateAppOptions = {}): express.Express {
     }
   });
 
+  interface LocalKnowledgeBase {
+    kbId: string;
+    tenantId: string;
+    name: string;
+    description: string;
+    category: string;
+    filesCount: number;
+    totalBytes: number;
+    status: "READY" | "SYNCING";
+    createdAt: string;
+    updatedAt: string;
+    documents: Array<{
+      name: string;
+      size: number;
+      type: string;
+      uploadedAt: string;
+      contentPreview?: string;
+    }>;
+  }
+
+  const localKnowledgeBases = new Map<string, LocalKnowledgeBase[]>();
+
+  function getTenantKnowledgeBases(tenantId: string): LocalKnowledgeBase[] {
+    let list = localKnowledgeBases.get(tenantId);
+    if (!list) {
+      list = [
+        {
+          kbId: "kb-products",
+          tenantId,
+          name: "Products & Packages (kb-products)",
+          description: "Official broadband, voice, and fiber data packages and fair usage policy documentation.",
+          category: "Products & Plans",
+          filesCount: 2,
+          totalBytes: 24580,
+          status: "READY",
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+          documents: [
+            { name: "dialog_broadband_plans_2026.pdf", size: 18450, type: "pdf", uploadedAt: "Yesterday" },
+            { name: "fair_usage_policy_faq.txt", size: 6130, type: "txt", uploadedAt: "Yesterday" },
+          ],
+        },
+        {
+          kbId: "kb-support",
+          tenantId,
+          name: "Support Guides (kb-support)",
+          description: "Fiber ONU router setup, self-troubleshooting steps, and optical loss error diagnosis.",
+          category: "Technical Support",
+          filesCount: 2,
+          totalBytes: 15300,
+          status: "READY",
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+          documents: [
+            { name: "fiber_onu_router_setup.md", size: 9200, type: "md", uploadedAt: "2 days ago" },
+            { name: "los_red_light_troubleshooting.txt", size: 6100, type: "txt", uploadedAt: "2 days ago" },
+          ],
+        },
+      ];
+      localKnowledgeBases.set(tenantId, list);
+    }
+    return list;
+  }
+
+  // GET /api/dev/admin/knowledge-bases (List Tenant Knowledge Bases)
+  app.get(["/api/dev/admin/knowledge-bases", "/api/knowledge-bases"], ...requireCompanyAdmin, async (req, res) => {
+    const tenantId = req.authorizedTenantId || "slt";
+    const kbs = getTenantKnowledgeBases(tenantId);
+    return res.json({ success: true, tenantId, total: kbs.length, items: kbs });
+  });
+
+  // POST /api/dev/admin/knowledge-bases (Create / Upload Knowledge Base with Files)
+  app.post(["/api/dev/admin/knowledge-bases", "/api/knowledge-bases"], ...requireCompanyAdmin, async (req, res) => {
+    const tenantId = req.authorizedTenantId || "slt";
+    const body = req.body || {};
+    const name = String(body.name || "Custom Knowledge Base").trim();
+    const cleanId = name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "custom";
+    const kbId = String(body.kbId || (cleanId.startsWith("kb-") ? cleanId : `kb-${cleanId}`)).trim();
+    const description = String(body.description || "Uploaded documentation for AI context").trim();
+    const category = String(body.category || "General").trim();
+    const rawFiles = Array.isArray(body.files) ? body.files : [];
+
+    const documents = rawFiles.map((f: any) => ({
+      name: String(f.name || `doc-${Date.now()}.txt`),
+      size: Number(f.size) || (typeof f.content === "string" ? Buffer.byteLength(f.content, "utf8") : 1024),
+      type: String(f.type || (f.name?.endsWith(".pdf") ? "pdf" : f.name?.endsWith(".md") ? "md" : "txt")),
+      uploadedAt: new Date().toISOString(),
+      contentPreview: typeof f.content === "string" ? f.content.slice(0, 300) : undefined,
+    }));
+
+    // Attempt S3 upload
+    const bucket = process.env.KB_BUCKET_NAME || "omni-channel-kb-docs";
+    for (const f of rawFiles) {
+      if (typeof f.content === "string") {
+        try {
+          const key = `tenants/${tenantId}/${f.name}`;
+          const bodyBuf = Buffer.from(f.content, "utf8");
+          await s3Client.send(new PutObjectCommand({
+            Bucket: bucket,
+            Key: key,
+            Body: bodyBuf,
+            ContentType: f.type === "pdf" ? "application/pdf" : "text/plain; charset=utf-8",
+            Metadata: { "tenant-id": tenantId, "kb-id": kbId },
+          }));
+        } catch (err: any) {
+          console.warn(`[KnowledgeBase] S3 upload fallback for '${f.name}':`, err?.message || err);
+        }
+      }
+    }
+
+    const totalBytes = documents.reduce((sum, d) => sum + d.size, 0);
+    const newKb: LocalKnowledgeBase = {
+      kbId,
+      tenantId,
+      name,
+      description,
+      category,
+      filesCount: documents.length,
+      totalBytes,
+      status: "READY",
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      documents,
+    };
+
+    const list = getTenantKnowledgeBases(tenantId);
+    const existingIdx = list.findIndex(k => k.kbId === kbId);
+    if (existingIdx >= 0) {
+      list[existingIdx] = {
+        ...list[existingIdx],
+        ...newKb,
+        documents: [...list[existingIdx].documents, ...documents],
+        filesCount: list[existingIdx].documents.length + documents.length,
+        totalBytes: list[existingIdx].totalBytes + totalBytes,
+        updatedAt: new Date().toISOString(),
+      };
+    } else {
+      list.push(newKb);
+    }
+    localKnowledgeBases.set(tenantId, list);
+
+    return res.status(201).json({ success: true, item: newKb });
+  });
+
+  // DELETE /api/dev/admin/knowledge-bases/:kbId
+  app.delete(["/api/dev/admin/knowledge-bases/:kbId", "/api/knowledge-bases/:kbId"], ...requireCompanyAdmin, async (req, res) => {
+    const tenantId = req.authorizedTenantId || "slt";
+    const kbId = req.params.kbId;
+    const list = getTenantKnowledgeBases(tenantId);
+    const updated = list.filter(k => k.kbId !== kbId);
+    localKnowledgeBases.set(tenantId, updated);
+    return res.json({ success: true, deleted: true, kbId });
+  });
+
   // Read a single small text document from the authenticated tenant's S3 prefix.
   app.get("/api/dev/admin/knowledge-files/:documentName", ...requireCompanyAdmin, async (req, res) => {
     const origin = req.headers.origin;
