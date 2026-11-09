@@ -139,6 +139,9 @@ export function createApp(options: CreateAppOptions = {}): express.Express {
   app.use(cors(resolveCorsOptions()));
   app.use(express.json({ limit: "128kb" }));
 
+  const mvpFrontendPath = path.join(__dirname, "customer-agent-mvp-source", "frontend");
+  app.use("/mvp", express.static(mvpFrontendPath));
+
   const dbStore = options.dbPath ? createJsonDbStore(options.dbPath) : (isLocalDevAllowed() ? createJsonDbStore(DB_PATH) : null);
   const baseRegistrationRepo: RegistrationRepository =
     options.registrationRepo ??
