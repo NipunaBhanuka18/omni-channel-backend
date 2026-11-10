@@ -396,20 +396,85 @@ export function createApp(options: CreateAppOptions = {}): express.Express {
   app.put("/api/registrations/:id/status", ...requireSuperAdmin, handleUpdateRegistrationStatus);
 
   // DELETE /api/registrations/:id or /api/organizations/:id (Super Admin deletes company workspace)
-  app.delete(["/api/registrations/:id", "/api/organizations/:id"], ...requireSuperAdmin, async (req, res) => {
-    const { id } = req.params;
+  const handleDeleteOrganization = async (req: express.Request, res: express.Response) => {
+    // Authorization: superadmin or local dev loopback
+    const authHeader = req.headers.authorization;
+    let isAuthorized = false;
+    if (isLocalDevAllowed() && isLoopbackOriginAllowed(req)) {
+      isAuthorized = true;
+    }
+    if (!isAuthorized && authHeader) {
+      try {
+        const token = authHeader.replace(/^Bearer\s+/i, "");
+        const verified = resolveTokenService().verifyToken(token);
+        if (verified && verified.role === "superadmin") {
+          isAuthorized = true;
+        }
+      } catch {}
+    }
+    if (!isAuthorized) {
+      return res.status(403).json({ error: "Insufficient permissions to delete company workspace" });
+    }
+
+    const rawId = req.params.id ? String(req.params.id).trim().toLowerCase() : "";
+    const queryEmail = typeof req.query.email === "string" ? req.query.email.trim().toLowerCase() : "";
+    const queryName = typeof req.query.name === "string" ? req.query.name.trim().toLowerCase() : "";
+    const querySlug = typeof req.query.slug === "string" ? req.query.slug.trim().toLowerCase() : "";
+    const isDeleteAll = rawId === "all" || req.query.all === "true";
+
     try {
       if (dbStore) {
         const db = dbStore.readDB();
-        const filteredRegs = db.registrations.filter((r: any) => r.id !== id && r.companyName !== id);
+        let filteredRegs = db.registrations || [];
+        if (isDeleteAll) {
+          filteredRegs = [];
+        } else {
+          filteredRegs = filteredRegs.filter((r: any) => {
+            const rId = String(r.id || "").toLowerCase();
+            const rName = String(r.companyName || r.name || "").toLowerCase();
+            const rSlug = String(r.companySlug || "").toLowerCase();
+            const rEmail = String(r.companyEmail || r.email || r.adminEmail || "").toLowerCase();
+            const rAdminEmail = String(r.adminEmail || "").toLowerCase();
+            const rTenantId = String(r.tenantId || "").toLowerCase();
+
+            // Match against rawId
+            if (rawId && (rId === rawId || rName === rawId || rSlug === rawId || rEmail === rawId || rTenantId === rawId)) {
+              return false;
+            }
+            // Match against mock identifiers (e.g. comp-apex -> apex)
+            if (rawId && rawId.startsWith("comp-") && (rSlug === rawId.replace(/^comp-/, "") || rName.includes(rawId.replace(/^comp-/, "")))) {
+              return false;
+            }
+            // Match query params
+            if (queryEmail && (rEmail === queryEmail || rAdminEmail === queryEmail)) return false;
+            if (queryName && rName === queryName) return false;
+            if (querySlug && rSlug === querySlug) return false;
+            return true;
+          });
+        }
         dbStore.writeDB({ ...db, registrations: filteredRegs });
       }
-      return res.json({ success: true, message: `Organization ${id} deleted successfully` });
+
+      // Also clean up DynamoDB if available
+      try {
+        if (rawId && rawId !== "all" && registrationRepo) {
+          if (typeof (registrationRepo as any).deleteRegistration === "function") {
+            await (registrationRepo as any).deleteRegistration(rawId);
+          }
+        }
+      } catch {}
+
+      return res.json({ success: true, message: `Organization ${rawId || 'record'} deleted successfully` });
     } catch (err: any) {
       console.error("[OrganizationDelete] Failed to delete organization:", err);
       return res.status(500).json({ error: "Failed to delete organization" });
     }
-  });
+  };
+
+  app.delete("/api/registrations/:id", handleDeleteOrganization);
+  app.delete("/api/organizations/:id", handleDeleteOrganization);
+  app.delete("/api/registrations", handleDeleteOrganization);
+  app.delete("/api/organizations", handleDeleteOrganization);
 
   // GET /api/stats (Admin Console Dashboard Stats)
   app.get("/api/stats", ...requireSuperAdmin, async (_req, res) => {

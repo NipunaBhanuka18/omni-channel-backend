@@ -1,5 +1,6 @@
 import {
   DynamoDBDocumentClient,
+  DeleteCommand,
   GetCommand,
   PutCommand,
   QueryCommand,
@@ -71,6 +72,7 @@ export interface RegistrationRepository {
   markRejected(id: string, reviewedBy?: string): Promise<CompanyRegistrationRecord | null>;
   findLatestByEmailForLocalLogin(normalizedEmail: string): Promise<Record<string, any> | null>;
   getPlatformStats(): Promise<PlatformStats>;
+  deleteRegistration?(id: string): Promise<boolean>;
 }
 
 export interface LocalStoreAdapter {
@@ -616,6 +618,20 @@ export class DynamoRegistrationRepository implements RegistrationRepository {
       throw error;
     }
   }
+
+  async deleteRegistration(id: string): Promise<boolean> {
+    try {
+      await this.dynamo.send(
+        new DeleteCommand({
+          TableName: this.registrationsTable,
+          Key: { id },
+        })
+      );
+      return true;
+    } catch {
+      return false;
+    }
+  }
 }
 
 /**
@@ -791,6 +807,21 @@ export class JsonRegistrationRepository implements RegistrationRepository {
       systemLatencyMs: 1,
     };
   }
+
+  async deleteRegistration(id: string): Promise<boolean> {
+    const db = this.store.readDB();
+    const idLower = id.trim().toLowerCase();
+    const beforeCount = (db.registrations || []).length;
+    db.registrations = (db.registrations || []).filter((r: any) => {
+      const rId = String(r.id || "").toLowerCase();
+      const rName = String(r.companyName || r.name || "").toLowerCase();
+      const rSlug = String(r.companySlug || "").toLowerCase();
+      const rEmail = String(r.companyEmail || r.email || r.adminEmail || "").toLowerCase();
+      return rId !== idLower && rName !== idLower && rSlug !== idLower && rEmail !== idLower;
+    });
+    this.store.writeDB(db);
+    return db.registrations.length < beforeCount;
+  }
 }
 
 /**
@@ -918,6 +949,22 @@ export class ResilientLocalRegistrationRepository implements RegistrationReposit
       }
       throw err;
     }
+  }
+
+  async deleteRegistration(id: string): Promise<boolean> {
+    let deleted = false;
+    if (typeof (this.primary as any).deleteRegistration === "function") {
+      try {
+        deleted = await (this.primary as any).deleteRegistration(id);
+      } catch {}
+    }
+    if (typeof (this.fallback as any).deleteRegistration === "function") {
+      try {
+        const fallbackDeleted = await (this.fallback as any).deleteRegistration(id);
+        deleted = deleted || fallbackDeleted;
+      } catch {}
+    }
+    return deleted;
   }
 }
 
