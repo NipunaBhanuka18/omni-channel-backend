@@ -395,6 +395,22 @@ export function createApp(options: CreateAppOptions = {}): express.Express {
   // PUT /api/registrations/:id/status (Backwards compatibility)
   app.put("/api/registrations/:id/status", ...requireSuperAdmin, handleUpdateRegistrationStatus);
 
+  // DELETE /api/registrations/:id or /api/organizations/:id (Super Admin deletes company workspace)
+  app.delete(["/api/registrations/:id", "/api/organizations/:id"], ...requireSuperAdmin, async (req, res) => {
+    const { id } = req.params;
+    try {
+      if (dbStore) {
+        const db = dbStore.readDB();
+        const filteredRegs = db.registrations.filter((r: any) => r.id !== id && r.companyName !== id);
+        dbStore.writeDB({ ...db, registrations: filteredRegs });
+      }
+      return res.json({ success: true, message: `Organization ${id} deleted successfully` });
+    } catch (err: any) {
+      console.error("[OrganizationDelete] Failed to delete organization:", err);
+      return res.status(500).json({ error: "Failed to delete organization" });
+    }
+  });
+
   // GET /api/stats (Admin Console Dashboard Stats)
   app.get("/api/stats", ...requireSuperAdmin, async (_req, res) => {
     try {
