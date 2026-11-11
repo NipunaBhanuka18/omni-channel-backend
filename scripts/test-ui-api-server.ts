@@ -46,10 +46,15 @@ async function runUiServerTests() {
   }
 
   // Helper for HTTP requests
-  async function api(path: string, options: { method?: string; body?: any } = {}) {
+  async function api(path: string, options: { method?: string; body?: any; token?: string; headers?: Record<string, string> } = {}) {
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      ...(options.token ? { Authorization: `Bearer ${options.token}` } : {}),
+      ...(options.headers || {}),
+    };
     const res = await fetch(`${baseUrl}${path}`, {
       method: options.method || "GET",
-      headers: { "Content-Type": "application/json" },
+      headers,
       body: options.body ? JSON.stringify(options.body) : undefined,
     });
     const json = await res.json().catch(() => ({}));
@@ -57,9 +62,9 @@ async function runUiServerTests() {
   }
 
   try {
-    // TEST 1: Dashboard Stats
+    // TEST 1: Dashboard Stats (Super Admin Protected)
     console.log("--- Test 1: Admin Console Stats Endpoint ---");
-    const statsRes = await api("/api/stats");
+    const statsRes = await api("/api/stats", { token: "dev-token-superadmin" });
     assert(
       "GET /api/stats returns 200 with dashboard metric counters",
       statsRes.status === 200 && statsRes.data.totalAvailability !== undefined && statsRes.data.activeAgentsCount === 12,
@@ -72,6 +77,7 @@ async function runUiServerTests() {
       method: "POST",
       body: { email: "superadmin@slt.lk", password: "admin123" },
     });
+    const adminToken = loginRes.data.token;
     assert(
       "POST /api/auth/login returns 200 with auth token and superadmin role",
       loginRes.status === 200 && loginRes.data.success === true && loginRes.data.user?.role === "superadmin",
@@ -101,6 +107,7 @@ async function runUiServerTests() {
     console.log("\n--- Test 4: Registration Approval & Auto-Provisioning ---");
     const approveRes = await api(`/api/registrations/${regId}/status`, {
       method: "PUT",
+      token: adminToken,
       body: { status: "Approved" },
     });
     assert(
@@ -160,6 +167,7 @@ async function runUiServerTests() {
     console.log("\n--- Test 8: Workspace Portal KB Document Upload ---");
     const uploadRes = await api("/api/workspace/upload-doc", {
       method: "POST",
+      token: "dev-token-company",
       body: {
         tenantId: "slt",
         documentName: "fiber-troubleshooting-v2.txt",

@@ -11,3 +11,26 @@
 export function normalizeCompanyName(companyName: string): string {
   return companyName.trim().toLowerCase().replace(/\s+/g, " ");
 }
+
+/**
+ * Normalizes a company slug or name into a lowercase URL/DB-safe slug.
+ */
+export function normalizeCompanySlug(rawSlug: string): string {
+  return rawSlug
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 54);
+}
+
+/**
+ * Derives a canonical tenantId from a company slug or company name.
+ * Preserves "slt" as the baseline seeded tenant ID and prefixes others with "tenant-".
+ */
+export function deriveTenantId(companySlug?: string, companyName?: string): string {
+  const cleanSlug = normalizeCompanySlug(companySlug || companyName || "");
+  if (!cleanSlug) return "";
+  if (cleanSlug === "slt") return "slt";
+  return cleanSlug.startsWith("tenant-") ? cleanSlug : `tenant-${cleanSlug}`;
+}

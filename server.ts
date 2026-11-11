@@ -10,6 +10,18 @@ import { uploadKbDocument } from "./agents/utils/s3-client";
 import { inMemoryTenants, inMemoryAgents, provisionTenantResources } from "./scripts/create-tenants-table";
 import { TenantContext } from "./shared/types/tenant-context";
 
+import { LocalSessionTokenService } from "./services/auth/local-session-token";
+import {
+  createRequireAuth,
+  requireRole,
+  requireTenantScope,
+  resolveAuthorizedAgentId,
+} from "./services/auth/local-auth-middleware";
+import { createCognitoJwtVerifierFromEnv } from "./services/auth/cognito-jwt-verifier";
+import { verifyPassword, hashPassword } from "./services/auth/password-hashing";
+import { BoundedRateLimiter, createRateLimitMiddleware } from "./services/auth/bounded-rate-limiter";
+import { redactRegistrationCredentials } from "./services/onboarding/registration-privacy";
+
 // Enable mock authorization for local development environment
 if (process.env.NODE_ENV !== "production") {
   process.env.ALLOW_MOCK_AUTH = "true";
@@ -20,6 +32,39 @@ const PORT = process.env.PORT || 3001;
 
 app.use(cors());
 app.use(express.json());
+
+let cachedLocalTokenService: LocalSessionTokenService | null = null;
+export function getLocalSessionTokenService(): LocalSessionTokenService {
+  if (!cachedLocalTokenService) {
+    cachedLocalTokenService = new LocalSessionTokenService();
+  }
+  return cachedLocalTokenService;
+}
+
+export const requireAuth = createRequireAuth({
+  getTokenService: getLocalSessionTokenService,
+  getCognitoVerifier: () => {
+    try {
+      return createCognitoJwtVerifierFromEnv();
+    } catch {
+      return null;
+    }
+  },
+  isLocalTokensAllowed: () => process.env.NODE_ENV !== "production" && process.env.IS_LOCAL !== "false",
+});
+
+export const requireSuperAdmin = [requireAuth, requireRole("superadmin")];
+export const requireCompanyAdmin = [requireAuth, requireRole("company"), requireTenantScope()];
+export const requireAgentOrCompany = [requireAuth, requireRole("live_agent", "company"), requireTenantScope()];
+
+const registrationLimiter = new BoundedRateLimiter({
+  maxRequests: 30,
+  windowMs: 60_000,
+  maxTrackedKeys: 2048,
+});
+const limitRegistrations = createRateLimitMiddleware(registrationLimiter, {
+  errorMessage: "Too many registration attempts. Please wait and try again.",
+});
 
 function getDbPath(): string {
   return process.env.DB_PATH || path.join(__dirname, "db.json");
@@ -86,48 +131,100 @@ readDB();
 // ==========================================
 
 // POST /api/auth/login
-app.post("/api/auth/login", (req, res) => {
+app.post("/api/auth/login", async (req, res) => {
   const { email, password } = req.body;
   if (!email || !password) {
     return res.status(400).json({ success: false, error: "Email and password are required" });
   }
 
   const db = readDB();
+  const tokenService = getLocalSessionTokenService();
+
+  // 1. Check Super Admin user
   const user = db.users.find(
-    (u: any) => u.email.toLowerCase() === email.toLowerCase() && u.password === password
+    (u: any) => u.email.toLowerCase() === email.toLowerCase()
   );
 
   if (user) {
-    return res.json({
-      success: true,
-      user: { id: user.id, name: user.fullName || user.email, email: user.email, role: user.role },
-      token: `token-${user.id}-${Date.now()}`,
-    });
+    let passwordMatches = false;
+    if (user.passwordHash) {
+      passwordMatches = await verifyPassword(password, user.passwordHash);
+    } else if (user.password) {
+      if (user.password.startsWith("scrypt-")) {
+        passwordMatches = await verifyPassword(password, user.password);
+      } else {
+        passwordMatches = user.password === password;
+      }
+    }
+
+    if (passwordMatches) {
+      const token = tokenService.issueToken({
+        sub: user.id,
+        email: user.email,
+        name: user.fullName || user.email.split("@")[0],
+        role: "superadmin",
+      });
+      return res.json({
+        success: true,
+        user: { id: user.id, name: user.fullName || user.email, email: user.email, role: user.role || "superadmin" },
+        token,
+      });
+    }
   }
 
+  // 2. Check Company Registration user
   const registration = db.registrations.find(
-    (r: any) => r.companyEmail && r.companyEmail.toLowerCase() === email.toLowerCase() && r.password === password
+    (r: any) =>
+      (r.companyEmail && r.companyEmail.toLowerCase() === email.toLowerCase()) ||
+      (r.adminEmail && r.adminEmail.toLowerCase() === email.toLowerCase()) ||
+      (r.email && r.email.toLowerCase() === email.toLowerCase())
   );
 
   if (registration) {
-    if (registration.status !== "Approved") {
-      return res.status(403).json({
-        success: false,
-        error: `Your registration is currently ${registration.status.toLowerCase()}. Please await Super Admin approval.`,
-      });
+    let passwordMatches = false;
+    if (registration.passwordHash) {
+      passwordMatches = await verifyPassword(password, registration.passwordHash);
+    } else if (registration.password) {
+      if (registration.password.startsWith("scrypt-")) {
+        passwordMatches = await verifyPassword(password, registration.password);
+      } else {
+        passwordMatches = registration.password === password;
+      }
     }
 
-    return res.json({
-      success: true,
-      user: {
-        id: registration.id,
-        name: registration.adminName || registration.companyName,
-        email: registration.companyEmail,
+    if (passwordMatches) {
+      if (registration.status !== "Approved") {
+        return res.status(403).json({
+          success: false,
+          error: `Your registration is currently ${registration.status.toLowerCase()}. Please await Super Admin approval.`,
+        });
+      }
+
+      const tenantId = registration.tenantId || `tenant-${registration.companySlug || registration.id}`;
+      const companyEmail = registration.adminEmail || registration.companyEmail || registration.email;
+      const adminName = registration.adminName || registration.companyName;
+
+      const token = tokenService.issueToken({
+        sub: registration.id,
+        email: companyEmail,
+        name: adminName,
         role: "company",
-        tenantId: registration.tenantId || `tenant-${registration.id}`,
-      },
-      token: `token-org-${registration.id}-${Date.now()}`,
-    });
+        tenantId,
+      });
+
+      return res.json({
+        success: true,
+        user: {
+          id: registration.id,
+          name: adminName,
+          email: companyEmail,
+          role: "company",
+          tenantId,
+          companyName: registration.companyName,
+        },
+        token,
+      });
+    }
   }
 
   return res.status(401).json({ success: false, error: "Invalid email or password" });
@@ -200,23 +297,36 @@ function normalizeRegistration(r: any) {
 }
 
 // GET /api/registrations (supports ?status=pending or ?status=approved)
-app.get("/api/registrations", (req, res) => {
+app.get("/api/registrations", requireAuth, (req, res) => {
   const db = readDB();
-  const rawList = (db.registrations || []).map(normalizeRegistration);
+  const caller = req.localAuth;
+  let rawList = (db.registrations || []).map(normalizeRegistration);
+
+  // If caller is company admin, scope list to their own tenant
+  if (caller?.role === "company" && caller.tenantId) {
+    rawList = rawList.filter(
+      (r: any) =>
+        r.tenantId === caller.tenantId ||
+        r.id === caller.sub ||
+        (r.companyEmail && caller.email && r.companyEmail.toLowerCase() === caller.email.toLowerCase())
+    );
+  }
+
+  const redactedList = rawList.map((r: any) => redactRegistrationCredentials(r));
   const statusParam = req.query.status as string;
 
   if (statusParam) {
-    const filtered = rawList.filter(
+    const filtered = redactedList.filter(
       (r: any) => (r.status || "").toLowerCase() === statusParam.toLowerCase()
     );
     return res.json(filtered);
   }
 
-  return res.json({ success: true, registrations: rawList });
+  return res.json({ success: true, registrations: redactedList });
 });
 
 // POST /api/registrations
-app.post("/api/registrations", (req, res) => {
+app.post("/api/registrations", limitRegistrations, async (req, res) => {
   const body = req.body;
   if (!body || typeof body !== "object") {
     return res.status(400).json({ success: false, error: "Invalid request body" });
@@ -245,6 +355,16 @@ app.post("/api/registrations", (req, res) => {
 
   const cleanSlug = (body.companySlug || rawCompanyName).toLowerCase().replace(/[^a-z0-9]/g, "-");
   const dateStr = new Date().toISOString().split("T")[0];
+
+  let passwordHash: string | undefined;
+  if (body.password && typeof body.password === "string") {
+    try {
+      passwordHash = await hashPassword(body.password);
+    } catch {
+      passwordHash = undefined;
+    }
+  }
+
   const newReg = normalizeRegistration({
     id: `reg-${Date.now()}`,
     companyName: rawCompanyName,
@@ -266,6 +386,7 @@ app.post("/api/registrations", (req, res) => {
     employeeCount: body.employeeCount || "",
     about: body.about || "",
     password: body.password || "company123",
+    ...(passwordHash ? { passwordHash } : {}),
     status: "Pending",
     submissionDate: dateStr,
     date: dateStr,
@@ -278,7 +399,7 @@ app.post("/api/registrations", (req, res) => {
   db.registrations.push(newReg);
   writeDB(db);
 
-  res.status(201).json({ success: true, registration: newReg });
+  res.status(201).json({ success: true, registration: redactRegistrationCredentials(newReg) });
 });
 
 // Handler for approving or rejecting registration
@@ -295,42 +416,61 @@ const handleUpdateRegistrationStatus = async (req: express.Request, res: express
 
   const reg = db.registrations[regIndex];
   const normalizedStatus = rawStatus === "approved" ? "Approved" : rawStatus === "rejected" ? "Rejected" : req.body.status || "Approved";
-  reg.status = normalizedStatus;
+
+  // Enforce idempotency: re-approving an already Approved registration must return 409 Conflict
+  if (normalizedStatus === "Approved" && reg.status === "Approved") {
+    return res.status(409).json({
+      success: false,
+      error: "Registration has already been approved",
+      registration: redactRegistrationCredentials(reg),
+    });
+  }
 
   // Auto-Provision Tenant Partition when Approved
-  if (normalizedStatus === "Approved" && !reg.tenantId) {
-    try {
-      const onboardResult = await registerTenant({
-        companyName: reg.companyName,
-        companySlug: reg.companySlug || reg.companyName.toLowerCase().replace(/[^a-z0-9]/g, "-"),
-        adminEmail: reg.companyEmail || `admin@${reg.companyName.toLowerCase().replace(/[^a-z0-9]/g, "")}.com`,
-        planTier: reg.tier?.toLowerCase() === "enterprise" ? "enterprise" : "starter",
-      });
-      reg.tenantId = onboardResult.tenantId;
-      reg.onboardedAt = new Date().toISOString();
-      console.log(`✅ [Auto-Provisioning] Successfully provisioned tenant '${reg.tenantId}' for ${reg.companyName}`);
-    } catch (onboardErr: any) {
-      console.warn(`⚠️ [Auto-Provisioning Warning] ${onboardErr.message}`);
-      reg.tenantId = `tenant-${id}`;
+  if (normalizedStatus === "Approved") {
+    if (!reg.tenantId) {
+      try {
+        const onboardResult = await registerTenant({
+          companyName: reg.companyName,
+          companySlug: reg.companySlug || reg.companyName.toLowerCase().replace(/[^a-z0-9]/g, "-"),
+          adminEmail: reg.companyEmail || `admin@${reg.companyName.toLowerCase().replace(/[^a-z0-9]/g, "")}.com`,
+          planTier: reg.tier?.toLowerCase() === "enterprise" ? "enterprise" : "starter",
+        });
+        reg.tenantId = onboardResult.tenantId;
+        reg.onboardedAt = new Date().toISOString();
+        reg.status = "Approved";
+        console.log(`✅ [Auto-Provisioning] Successfully provisioned tenant '${reg.tenantId}' for ${reg.companyName}`);
+      } catch (onboardErr: any) {
+        console.error(`❌ [Auto-Provisioning Failed] ${onboardErr.message}`);
+        // Fail closed: retain Pending status, do not issue fake tenantId
+        return res.status(502).json({
+          success: false,
+          error: `Failed to provision tenant resources: ${onboardErr.message}`,
+        });
+      }
+    } else {
+      reg.status = "Approved";
     }
+  } else {
+    reg.status = normalizedStatus;
   }
 
   db.registrations[regIndex] = normalizeRegistration(reg);
   writeDB(db);
-  return res.json({ success: true, registration: db.registrations[regIndex] });
+  return res.json({ success: true, registration: redactRegistrationCredentials(db.registrations[regIndex]) });
 };
 
 // PATCH /api/registrations/:id (Super Admin Approves / Rejects)
-app.patch("/api/registrations/:id", handleUpdateRegistrationStatus);
+app.patch("/api/registrations/:id", ...requireSuperAdmin, handleUpdateRegistrationStatus);
 
 // PUT /api/registrations/:id
-app.put("/api/registrations/:id", handleUpdateRegistrationStatus);
+app.put("/api/registrations/:id", ...requireSuperAdmin, handleUpdateRegistrationStatus);
 
 // PUT /api/registrations/:id/status (Backwards compatibility)
-app.put("/api/registrations/:id/status", handleUpdateRegistrationStatus);
+app.put("/api/registrations/:id/status", ...requireSuperAdmin, handleUpdateRegistrationStatus);
 
 // GET /api/stats (Admin Console Dashboard Stats)
-app.get("/api/stats", (req, res) => {
+app.get("/api/stats", requireAuth, (req, res) => {
   const db = readDB();
   const activeCount = db.registrations.filter((r: any) => (r.status || "").toLowerCase() === "approved").length;
   const pendingCount = db.registrations.filter((r: any) => (r.status || "").toLowerCase() === "pending").length;
@@ -346,7 +486,7 @@ app.get("/api/stats", (req, res) => {
 });
 
 // GET /api/notifications (Admin Notifications)
-app.get("/api/notifications", (req, res) => {
+app.get("/api/notifications", ...requireSuperAdmin, (req, res) => {
   const db = readDB();
   const list = db.registrations || [];
   const pendingRegs = list.filter((r: any) => (r.status || "").toLowerCase() === "pending");
@@ -379,7 +519,7 @@ app.get("/api/notifications", (req, res) => {
 // ==========================================
 
 // POST /api/tenants/register
-app.post("/api/tenants/register", async (req, res) => {
+app.post("/api/tenants/register", ...requireSuperAdmin, async (req, res) => {
   const response = await handleRegisterTenantRequest({
     httpMethod: "POST",
     body: req.body,
@@ -462,16 +602,16 @@ app.post(["/api/chat/handoff/resolve", "/chat/handoff/resolve"], async (req, res
 // ==========================================
 
 // POST /api/workspace/upload-doc (Knowledge Base Upload)
-app.post("/api/workspace/upload-doc", async (req, res) => {
-  const { documentName, content, tenantId, userId } = req.body;
+app.post("/api/workspace/upload-doc", ...requireCompanyAdmin, async (req, res) => {
+  const { documentName, content, userId } = req.body;
   if (!documentName || !content) {
     return res.status(400).json({ success: false, error: "Missing documentName or content" });
   }
 
-  const effectiveTenantId = tenantId || "slt";
+  const effectiveTenantId = req.authorizedTenantId || "slt";
   const context: TenantContext = {
     tenantId: effectiveTenantId,
-    userId: userId || "console-admin",
+    userId: userId || req.localAuth?.sub || "console-admin",
     role: "admin",
     permissions: ["faults:read", "billing:read", "usage:read"],
     channel: "web",
@@ -493,7 +633,8 @@ app.post("/api/workspace/upload-doc", async (req, res) => {
 });
 
 // GET /api/workspace/conversations (Conversation Transcripts)
-app.get("/api/workspace/conversations", (req, res) => {
+app.get("/api/workspace/conversations", ...requireCompanyAdmin, (req, res) => {
+  const effectiveTenantId = req.authorizedTenantId || "slt";
   res.json({
     success: true,
     conversations: [
@@ -504,6 +645,7 @@ app.get("/api/workspace/conversations", (req, res) => {
         status: "RESOLVED",
         assignedAgent: "admin1",
         updatedAt: new Date().toISOString(),
+        tenantId: effectiveTenantId,
       },
       {
         conversationId: "conv-102",
@@ -512,6 +654,7 @@ app.get("/api/workspace/conversations", (req, res) => {
         status: "BOT_HANDLED",
         assignedAgent: "AI Bot",
         updatedAt: new Date().toISOString(),
+        tenantId: effectiveTenantId,
       },
     ],
   });

@@ -148,7 +148,8 @@ async function runRegistrationWorkflowTests() {
     // Test 4: Query Filter by Status (?status=pending / ?status=approved)
     // -------------------------------------------------------------
     console.log("\n--- Test 4: Status Query Filtering ---");
-    const pendingListRes = await api("/api/registrations?status=pending");
+    const superAdminHeaders = { Authorization: "Bearer dev-token-superadmin" };
+    const pendingListRes = await api("/api/registrations?status=pending", { headers: superAdminHeaders });
     assert(
       "GET /api/registrations?status=pending returns array containing pending registration",
       pendingListRes.status === 200 &&
@@ -157,7 +158,7 @@ async function runRegistrationWorkflowTests() {
       JSON.stringify(pendingListRes.data)
     );
 
-    const approvedListRes = await api("/api/registrations?status=approved");
+    const approvedListRes = await api("/api/registrations?status=approved", { headers: superAdminHeaders });
     assert(
       "GET /api/registrations?status=approved excludes pending registration",
       approvedListRes.status === 200 &&
@@ -170,7 +171,7 @@ async function runRegistrationWorkflowTests() {
     // Test 5: Admin Notifications Endpoint
     // -------------------------------------------------------------
     console.log("\n--- Test 5: Admin Notifications Endpoint ---");
-    const notifRes = await api("/api/notifications");
+    const notifRes = await api("/api/notifications", { headers: superAdminHeaders });
     assert(
       "GET /api/notifications returns 200 with pending registration alert and system health",
       notifRes.status === 200 &&
@@ -196,6 +197,7 @@ async function runRegistrationWorkflowTests() {
 
     const rejectRes = await api(`/api/registrations/${spamId}`, {
       method: "PATCH",
+      headers: superAdminHeaders,
       body: { status: "rejected" },
     });
     assert(
@@ -213,6 +215,7 @@ async function runRegistrationWorkflowTests() {
     console.log("\n--- Test 7: Company Approval & Auto-Provisioning ---");
     const approveRes = await api(`/api/registrations/${apexRegId}`, {
       method: "PATCH",
+      headers: superAdminHeaders,
       body: { status: "approved" },
     });
     assert(
@@ -241,6 +244,7 @@ async function runRegistrationWorkflowTests() {
 
     const putStatusRes = await api(`/api/registrations/${ceylonId}/status`, {
       method: "PUT",
+      headers: superAdminHeaders,
       body: { status: "Approved" },
     });
     assert(
@@ -257,6 +261,7 @@ async function runRegistrationWorkflowTests() {
     console.log("\n--- Test 9: Non-Existent Registration 404 ---");
     const missingRes = await api("/api/registrations/reg-non-existent-99999", {
       method: "PATCH",
+      headers: superAdminHeaders,
       body: { status: "Approved" },
     });
     assert(
