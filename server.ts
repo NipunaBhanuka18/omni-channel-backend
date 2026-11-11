@@ -1261,12 +1261,53 @@ app.get(["/api/resolve-chat-url", "/resolve-chat-url"], async (req, res) => {
 // 6A. SUPERVISOR PUBLIC AI CHAT API
 // ==========================================
 
+const publicChatSessionLimiter = new BoundedRateLimiter({
+  maxRequests: 60,
+  windowMs: 60_000,
+  maxTrackedKeys: 2048,
+});
+const limitPublicChatSessions = createRateLimitMiddleware(publicChatSessionLimiter, {
+  errorMessage: "Too many chat sessions created. Please wait and try again.",
+});
+
+const publicChatMessageLimiter = new BoundedRateLimiter({
+  maxRequests: 120,
+  windowMs: 60_000,
+  maxTrackedKeys: 2048,
+});
+const limitPublicChatMessages = createRateLimitMiddleware(publicChatMessageLimiter, {
+  errorMessage: "Too many chat messages sent. Please slow down.",
+});
+
+function extractSessionToken(req: express.Request): string | null {
+  const tokenHeader = req.headers["x-session-token"];
+  if (typeof tokenHeader === "string" && tokenHeader.trim()) return tokenHeader.trim();
+  const authHeader = req.headers.authorization;
+  if (typeof authHeader === "string") {
+    const bearer = extractBearerToken(authHeader);
+    if (bearer) return bearer;
+  }
+  if (typeof req.body?.sessionToken === "string" && req.body.sessionToken.trim()) {
+    return req.body.sessionToken.trim();
+  }
+  if (typeof req.query?.sessionToken === "string" && req.query.sessionToken.trim()) {
+    return req.query.sessionToken.trim();
+  }
+  return null;
+}
+
 // 1. Resolve public agent by key
 app.get(["/v1/public/agents/:agentKey", "/api/public/agents/:agentKey"], async (req, res) => {
   const agentKey = req.params.agentKey;
   const agent = await agentRepository.getAgentByPublicKey(agentKey);
   if (!agent || agent.status !== "PUBLISHED") {
     return res.status(404).json({ success: false, message: "Assistant not found" });
+  }
+
+  // Tenant status verification
+  const tenant = inMemoryTenants.get(agent.tenantId);
+  if (tenant && tenant.status !== "active") {
+    return res.status(403).json({ success: false, error: "Tenant workspace is suspended or inactive" });
   }
 
   return res.json({
@@ -1281,7 +1322,7 @@ app.get(["/v1/public/agents/:agentKey", "/api/public/agents/:agentKey"], async (
 });
 
 // 2. Create public conversation session
-app.post(["/v1/public/sessions", "/api/public/sessions"], async (req, res) => {
+app.post(["/v1/public/sessions", "/api/public/sessions"], limitPublicChatSessions, async (req, res) => {
   const { agentKey } = req.body || {};
   if (!agentKey) {
     return res.status(400).json({ success: false, message: "agentKey is required" });
@@ -1292,10 +1333,17 @@ app.post(["/v1/public/sessions", "/api/public/sessions"], async (req, res) => {
     return res.status(404).json({ success: false, message: "Assistant not found" });
   }
 
-  const session = await agentRepository.createSession(agent);
+  // Tenant status verification
+  const tenant = inMemoryTenants.get(agent.tenantId);
+  if (tenant && tenant.status !== "active") {
+    return res.status(403).json({ success: false, error: "Tenant workspace is suspended or inactive" });
+  }
+
+  const { session, sessionToken } = await agentRepository.createSession(agent);
   return res.status(201).json({
     success: true,
     sessionId: session.sessionId,
+    sessionToken,
     agent: {
       agentKey: agent.publicAgentKey,
       displayName: agent.displayName,
@@ -1307,11 +1355,23 @@ app.post(["/v1/public/sessions", "/api/public/sessions"], async (req, res) => {
 });
 
 // 3. Send message / execute AI turn in public session
-app.post(["/v1/public/sessions/:sessionId/messages", "/api/public/sessions/:sessionId/messages"], async (req, res) => {
+app.post(["/v1/public/sessions/:sessionId/messages", "/api/public/sessions/:sessionId/messages"], limitPublicChatMessages, async (req, res) => {
   const { sessionId } = req.params;
   const session = await agentRepository.getSession(sessionId);
   if (!session) {
     return res.status(404).json({ success: false, message: "Session not found" });
+  }
+
+  // Session ownership check
+  const token = extractSessionToken(req);
+  if (!agentRepository.validateSessionToken(session, token)) {
+    return res.status(403).json({ success: false, error: "Unauthorized session access: invalid or missing session token" });
+  }
+
+  // Tenant status verification
+  const tenant = inMemoryTenants.get(session.tenantId);
+  if (tenant && tenant.status !== "active") {
+    return res.status(403).json({ success: false, error: "Tenant workspace is suspended or inactive" });
   }
 
   const agent = await agentRepository.getAgent(session.tenantId, session.agentId);
@@ -1347,6 +1407,18 @@ app.get(["/v1/public/sessions/:sessionId/messages", "/api/public/sessions/:sessi
     return res.status(404).json({ success: false, message: "Session not found" });
   }
 
+  // Session ownership check
+  const token = extractSessionToken(req);
+  if (!agentRepository.validateSessionToken(session, token)) {
+    return res.status(403).json({ success: false, error: "Unauthorized session access: invalid or missing session token" });
+  }
+
+  // Tenant status verification
+  const tenant = inMemoryTenants.get(session.tenantId);
+  if (tenant && tenant.status !== "active") {
+    return res.status(403).json({ success: false, error: "Tenant workspace is suspended or inactive" });
+  }
+
   const messages = await agentRepository.listMessages(sessionId);
   return res.json({
     success: true,
@@ -1369,6 +1441,12 @@ app.post(["/v1/public/sessions/:sessionId/feedback", "/api/public/sessions/:sess
   const session = await agentRepository.getSession(sessionId);
   if (!session) {
     return res.status(404).json({ success: false, message: "Session not found" });
+  }
+
+  // Session ownership check
+  const token = extractSessionToken(req);
+  if (!agentRepository.validateSessionToken(session, token)) {
+    return res.status(403).json({ success: false, error: "Unauthorized session access: invalid or missing session token" });
   }
 
   const { messageId, rating } = req.body || {};

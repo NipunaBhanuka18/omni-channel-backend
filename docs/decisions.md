@@ -734,4 +734,66 @@ We evaluated two architectural integration paths:
 - Terraform configuration (`terraform -chdir=infra validate`): Clean / valid.
 - Real database immutability: Tracked `db.json` unmutated (`git diff db.json` empty).
 
+---
+
+## ADR-021: AI Runtime Security Hardening: Anti-Hijacking Session Tokens, SSRF Defense, and Suspended Tenant Gating
+
+- **Status**: Accepted
+- **Date**: 2026-11-11
+- **Scope**: AI Runtime Security, Public Chat Session Tokens, SSRF & Network Boundary Defense, Suspended Tenant Gating, Test Harness Audit (Task 13)
+
+### Context
+
+Following the integration of supervisor Tharusha's Bedrock AI runtime in Task 12, an in-depth security and regression review was conducted to address the following potential security exposures and discrepancies:
+1. **Test-Count Accounting Discrepancy**: Task 11 established 155 assertions across 12 suites. Task 12 added 32 assertions (summing to 187 executed assertions across 13 suites). However, the summary table in the Task 12 report markdown had a transcription discrepancy summing to 177 assertions due to manual count transcription errors in `test-onboarding.ts` (6 vs 24), `test-router.ts` (10 vs 4), and `test-ui-api-server.ts` (11 vs 9). Source-level audit was required to confirm exact assertion execution and ensure no security tests were lost.
+2. **Public Chat Session Anti-Hijacking**: Previously, public chat sessions relied on predictable session IDs without cryptographic proof of ownership. Any party knowing or guessing a `sessionId` could inject messages or inspect chat history.
+3. **SSRF and External Tool Execution**: AI runtime external tools could theoretically be misconfigured to target loopback (`127.0.0.1`), link-local metadata endpoints (`169.254.169.254` IMDS), or internal RFC 1918 networks, or follow HTTP redirects.
+4. **Suspended Tenant Public API Gating**: When a tenant workspace was suspended via the control plane, public agent resolution and public chat sessions were not strictly checking tenant workspace status, potentially permitting chat interaction with suspended tenant assistants.
+5. **Production Mock Mode Fail-Closed Enforcement**: Ensuring that neither Bedrock mock mode nor external tools can run in production without explicit configuration.
+
+### Architectural Decisions
+
+1. **Cryptographic Session Token Anti-Hijacking**:
+   - Every public conversation session generates a cryptographically random `sessionId` (128-bit) and a separate high-entropy `sessionToken` (`stk_` + 192-bit hex).
+   - Only the SHA-256 hash (`sessionSecretHash`) is stored in the database.
+   - All subsequent session endpoints (`POST /v1/public/sessions/:id/messages`, `GET /v1/public/sessions/:id/messages`, `POST /v1/public/sessions/:id/feedback`) require caller proof of ownership via `x-session-token` header, Bearer token, query parameter, or JSON body.
+   - Validation uses constant-time comparison (`crypto.timingSafeEqual`) to prevent timing side-channel attacks.
+   - Rate limiting is enforced on session creation (60 req/min) and session messages (120 req/min).
+
+2. **SSRF and Protocol Boundary Defense (`tool-executor.ts`)**:
+   - `isRestrictedHostOrIp()` comprehensively validates target hostnames and IP addresses against:
+     - IPv4 loopback (`127.0.0.0/8`, `localhost`)
+     - Link-local and AWS EC2 IMDS metadata (`169.254.0.0/16`, `instance-data`, `metadata`)
+     - RFC 1918 private IPv4 (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`)
+     - Carrier-grade NAT (`100.64.0.0/10`)
+     - Current/zero network (`0.0.0.0/8`) and broadcast (`255.255.255.255`)
+     - IPv6 loopback (`::1`), unspecified (`::`), and link-local/unique local (`fe80:`, `fc`, `fd`)
+   - HTTPS protocol is strictly enforced; plain HTTP and embedded credentials (`user:pass@host`) are rejected.
+   - HTTP 3xx redirects are prohibited and immediately rejected.
+   - Tool response payload sizes are clamped to a 256KB maximum buffer.
+   - Read-only tools (`readOnly: true`) strictly reject mutating HTTP methods (`DELETE`, `PUT`, `PATCH`).
+   - In production (`NODE_ENV === "production"`), tool execution fails closed unless explicitly enabled via `EXTERNAL_TOOLS_ENABLED=true`.
+
+3. **Suspended Tenant Verification on Public Endpoints**:
+   - `GET /v1/public/agents/:key`, `POST /v1/public/sessions`, and `POST /v1/public/sessions/:id/messages` verify that the owning tenant has `status === "active"`.
+   - Inactive or suspended workspaces return `403 Forbidden` (`Tenant workspace is suspended or inactive`).
+
+4. **Test-Count Discrepancy Resolution & Adversarial Verification**:
+   - Line-by-line audit verified that no assertions were dropped:
+     - Task 11 baseline: 155 assertions across 12 suites.
+     - Task 12 baseline: 187 assertions across 13 suites (+32 in `test-ai-runtime.ts`).
+     - Task 13 baseline: 204 assertions across 13 suites (+17 adversarial assertions added in `test-ai-runtime.ts` covering anti-hijacking, SSRF, suspended tenant gating, and fail-closed policies).
+   - All 204 assertions verified passing across two consecutive test runs.
+
+### Verification Results
+
+- `scripts/test-ai-runtime.ts`: 49/49 assertions passed (exit code 0).
+- `npm test`: 204/204 assertions passed across all 13 suites, twice consecutively (exit code 0).
+- TypeScript typecheck (`npx tsc --noEmit`): 0 errors.
+- Production build (`npm run build`): 0 errors.
+- Terraform configuration (`terraform -chdir=infra validate`): Clean / valid.
+- Frontend build (`omni-agent-ui`): `npm run build` and `npx tsc --noEmit` 0 errors.
+- Real database immutability: Tracked `db.json` unmutated (`git diff db.json` clean).
+
+
 

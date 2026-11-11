@@ -1,3 +1,4 @@
+import crypto from "crypto";
 import { docClient } from "../../agents/utils/dynamo-client";
 import { GetCommand, PutCommand, UpdateCommand, QueryCommand } from "@aws-sdk/lib-dynamodb";
 import { AgentConfig, PublicMapping, ConversationSession, ChatMessage } from "./types";
@@ -222,8 +223,10 @@ export class AgentRepository {
     return this.inMemoryMappings.get(cleanKey) || null;
   }
 
-  async createSession(agent: AgentConfig): Promise<ConversationSession> {
-    const sessionId = `sess-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
+  async createSession(agent: AgentConfig): Promise<{ session: ConversationSession; sessionToken: string }> {
+    const sessionId = `sess_${crypto.randomBytes(16).toString("hex")}`;
+    const sessionToken = `stk_${crypto.randomBytes(24).toString("hex")}`;
+    const sessionSecretHash = crypto.createHash("sha256").update(sessionToken).digest("hex");
     const now = Math.floor(Date.now() / 1000);
 
     const session: ConversationSession = {
@@ -232,6 +235,7 @@ export class AgentRepository {
       agentId: agent.agentId,
       publicAgentKey: agent.publicAgentKey,
       status: "AI_ACTIVE",
+      sessionSecretHash,
       createdAt: now,
       updatedAt: now,
     };
@@ -254,7 +258,20 @@ export class AgentRepository {
 
     this.inMemorySessions.set(sessionId, session);
     this.inMemoryMessages.set(sessionId, []);
-    return session;
+    return { session, sessionToken };
+  }
+
+  validateSessionToken(session: ConversationSession, token: unknown): boolean {
+    if (!session) return false;
+    // Backward compatibility for sessions created without a secret (if any legacy)
+    if (!session.sessionSecretHash) return true;
+    if (typeof token !== "string" || !token.trim()) return false;
+    const computed = crypto.createHash("sha256").update(token.trim()).digest("hex");
+    try {
+      return crypto.timingSafeEqual(Buffer.from(computed, "hex"), Buffer.from(session.sessionSecretHash, "hex"));
+    } catch {
+      return false;
+    }
   }
 
   async getSession(sessionId: string): Promise<ConversationSession | null> {

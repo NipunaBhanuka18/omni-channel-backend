@@ -19,6 +19,7 @@ fs.writeFileSync(tempDbPath, realDbSnapshotBefore);
 process.env.DB_PATH = tempDbPath;
 
 import { app, getLocalSessionTokenService } from "../server";
+import { inMemoryTenants } from "../scripts/create-tenants-table";
 import {
   agentRepository,
   orchestrator,
@@ -215,11 +216,15 @@ async function runAiRuntimeTestSuite() {
     const sessionRes = await api("/v1/public/sessions", "POST", {
       agentKey: "slt-support",
     });
-    assert(
-      "4a. POST /v1/public/sessions returns 201 Created with sessionId and public agent details",
-      sessionRes.status === 201 && !!sessionRes.data?.sessionId
-    );
     const sessionId = sessionRes.data?.sessionId;
+    const sessionToken = sessionRes.data?.sessionToken;
+    assert(
+      "4a. POST /v1/public/sessions returns 201 Created with sessionId and high-entropy sessionToken",
+      sessionRes.status === 201 &&
+        !!sessionId &&
+        typeof sessionToken === "string" &&
+        sessionToken.startsWith("stk_")
+    );
 
     const sessionRecord = await agentRepository.getSession(sessionId);
     assert(
@@ -321,25 +326,36 @@ async function runAiRuntimeTestSuite() {
     // --- Test 10: Multi-Turn Conversation Memory Isolation ---
     console.log("\n--- 10. Multi-Turn Conversation Memory Isolation ---");
     // Turn 1
-    const turn1 = await api(`/v1/public/sessions/${sessionId}/messages`, "POST", {
-      message: "Hello, my internet has been very slow today.",
-    });
+    const turn1 = await api(
+      `/v1/public/sessions/${sessionId}/messages`,
+      "POST",
+      { message: "Hello, my internet has been very slow today." },
+      { "x-session-token": sessionToken }
+    );
     assert(
       "10a. Turn 1 executes successfully, categorized as 'technical' route",
       turn1.status === 200 && turn1.data?.route === "technical"
     );
 
     // Turn 2
-    const turn2 = await api(`/v1/public/sessions/${sessionId}/messages`, "POST", {
-      message: "Can I check my current bill payment status?",
-    });
+    const turn2 = await api(
+      `/v1/public/sessions/${sessionId}/messages`,
+      "POST",
+      { message: "Can I check my current bill payment status?" },
+      { "x-session-token": sessionToken }
+    );
     assert(
       "10b. Turn 2 executes successfully, categorized as 'billing' route",
       turn2.status === 200 && turn2.data?.route === "billing"
     );
 
     // Verify session history in repository
-    const historyRes = await api(`/v1/public/sessions/${sessionId}/messages`);
+    const historyRes = await api(
+      `/v1/public/sessions/${sessionId}/messages`,
+      "GET",
+      undefined,
+      { "x-session-token": sessionToken }
+    );
     assert(
       "10c. Session message history contains 4 chronological turns (2 user, 2 assistant)",
       historyRes.status === 200 && historyRes.data?.messages?.length === 4
@@ -350,7 +366,13 @@ async function runAiRuntimeTestSuite() {
       agentKey: "slt-support",
     });
     const sessionId2 = sessionRes2.data?.sessionId;
-    const historyRes2 = await api(`/v1/public/sessions/${sessionId2}/messages`);
+    const sessionToken2 = sessionRes2.data?.sessionToken;
+    const historyRes2 = await api(
+      `/v1/public/sessions/${sessionId2}/messages`,
+      "GET",
+      undefined,
+      { "x-session-token": sessionToken2 }
+    );
     assert(
       "10d. Separate session has empty message history (strict partition isolation between sessions)",
       historyRes2.data?.messages?.length === 0
@@ -398,9 +420,12 @@ async function runAiRuntimeTestSuite() {
 
     // --- Test 12: Human Handoff Intent Detection & Session Escalation ---
     console.log("\n--- 12. Human Handoff Intent Detection & Session Escalation ---");
-    const handoffMsgRes = await api(`/v1/public/sessions/${sessionId}/messages`, "POST", {
-      message: "I want to speak to a real human person or live agent please.",
-    });
+    const handoffMsgRes = await api(
+      `/v1/public/sessions/${sessionId}/messages`,
+      "POST",
+      { message: "I want to speak to a real human person or live agent please." },
+      { "x-session-token": sessionToken }
+    );
     assert(
       "12a. Message containing 'human' or 'live agent' triggers handoff route with 200 OK",
       handoffMsgRes.status === 200 &&
@@ -416,9 +441,12 @@ async function runAiRuntimeTestSuite() {
     );
 
     // Follow-up message during handoff routes to human queue
-    const followUpRes = await api(`/v1/public/sessions/${sessionId}/messages`, "POST", {
-      message: "Are you connecting me to someone?",
-    });
+    const followUpRes = await api(
+      `/v1/public/sessions/${sessionId}/messages`,
+      "POST",
+      { message: "Are you connecting me to someone?" },
+      { "x-session-token": sessionToken }
+    );
     assert(
       "12c. Subsequent message while in HANDOFF_REQUESTED status routes to human (status: delivered_to_human)",
       followUpRes.status === 200 &&
@@ -433,10 +461,14 @@ async function runAiRuntimeTestSuite() {
       agentKey: "slt-support",
     });
     const leadSessionId = leadSessionRes.data?.sessionId;
+    const leadSessionToken = leadSessionRes.data?.sessionToken;
 
-    const leadPromptRes = await api(`/v1/public/sessions/${leadSessionId}/messages`, "POST", {
-      message: "I am interested in buying a new connection. Please call me for a quote.",
-    });
+    const leadPromptRes = await api(
+      `/v1/public/sessions/${leadSessionId}/messages`,
+      "POST",
+      { message: "I am interested in buying a new connection. Please call me for a quote." },
+      { "x-session-token": leadSessionToken }
+    );
     assert(
       "13a. Sales/lead purchase intent triggers structured form payload in uiAction",
       leadPromptRes.status === 200 &&
@@ -445,16 +477,21 @@ async function runAiRuntimeTestSuite() {
     );
 
     // Submit form response
-    const formSubmitRes = await api(`/v1/public/sessions/${leadSessionId}/messages`, "POST", {
-      formSubmission: {
-        formId: "sales_interest",
-        values: {
-          fullName: "Kasun Perera",
-          contactPhone: "+94771234567",
-          packageInterest: "Fiber Unlimited 100Mbps",
+    const formSubmitRes = await api(
+      `/v1/public/sessions/${leadSessionId}/messages`,
+      "POST",
+      {
+        formSubmission: {
+          formId: "sales_interest",
+          values: {
+            fullName: "Kasun Perera",
+            contactPhone: "+94771234567",
+            packageInterest: "Fiber Unlimited 100Mbps",
+          },
         },
       },
-    });
+      { "x-session-token": leadSessionToken }
+    );
     assert(
       "13b. Submitting form values completes successfully with confirmation message and submissionId",
       formSubmitRes.status === 200 &&
@@ -475,20 +512,254 @@ async function runAiRuntimeTestSuite() {
 
     // --- Test 15: Session Feedback Endpoint ---
     console.log("\n--- 15. Session Feedback Rating ---");
-    const feedbackRes = await api(`/v1/public/sessions/${sessionId}/feedback`, "POST", {
-      messageId: "msg-test-101",
-      rating: "up",
-    });
+    const feedbackRes = await api(
+      `/v1/public/sessions/${sessionId}/feedback`,
+      "POST",
+      { messageId: "msg-test-101", rating: "up" },
+      { "x-session-token": sessionToken }
+    );
     assert(
       "15. POST /v1/public/sessions/:id/feedback saves positive rating with 201 Created",
       feedbackRes.status === 201 && feedbackRes.data?.saved === true
     );
 
-    // --- Test 16: Real db.json Immutability Check ---
-    console.log("\n--- Real Database Immutability Check ---");
+    // --- Test 16: Public Session Anti-Hijacking & Token Enforcement ---
+    console.log("\n--- 16. Public Session Anti-Hijacking & Token Enforcement ---");
+    // Missing session token on message POST
+    const missingTokenMsg = await api(`/v1/public/sessions/${sessionId}/messages`, "POST", {
+      message: "Unauthenticated hijack attempt",
+    });
+    assert(
+      "16a. POST messages without session token returns 403 Forbidden",
+      missingTokenMsg.status === 403 && missingTokenMsg.data?.success === false
+    );
+
+    // Invalid session token on message POST
+    const invalidTokenMsg = await api(
+      `/v1/public/sessions/${sessionId}/messages`,
+      "POST",
+      { message: "Hijack with forged token" },
+      { "x-session-token": "stk_forged_invalid_random_string_12345" }
+    );
+    assert(
+      "16b. POST messages with forged session token returns 403 Forbidden",
+      invalidTokenMsg.status === 403 && invalidTokenMsg.data?.success === false
+    );
+
+    // Cross-session token substitution: session 2 token cannot access session 1
+    const crossTokenMsg = await api(
+      `/v1/public/sessions/${sessionId}/messages`,
+      "POST",
+      { message: "Cross-session injection attempt" },
+      { "x-session-token": sessionToken2 }
+    );
+    assert(
+      "16c. Cross-session token substitution (session B token on session A) returns 403 Forbidden",
+      crossTokenMsg.status === 403 && crossTokenMsg.data?.success === false
+    );
+
+    // Missing session token on message GET history
+    const missingTokenHistory = await api(`/v1/public/sessions/${sessionId}/messages`, "GET");
+    assert(
+      "16d. GET message history without session token returns 403 Forbidden",
+      missingTokenHistory.status === 403 && missingTokenHistory.data?.success === false
+    );
+
+    // Missing session token on feedback POST
+    const missingTokenFeedback = await api(`/v1/public/sessions/${sessionId}/feedback`, "POST", {
+      messageId: "msg-test-101",
+      rating: "up",
+    });
+    assert(
+      "16e. POST feedback without session token returns 403 Forbidden",
+      missingTokenFeedback.status === 403 && missingTokenFeedback.data?.success === false
+    );
+
+    // --- Test 17: Suspended Tenant Gating on Public Endpoints ---
+    console.log("\n--- 17. Suspended Tenant Public Endpoint Gating ---");
+    const sltTenantRecord = inMemoryTenants.get("slt");
+    const originalSltStatus = sltTenantRecord ? sltTenantRecord.status : "active";
+
+    try {
+      if (sltTenantRecord) sltTenantRecord.status = "suspended";
+
+      const suspendedAgentRes = await api("/v1/public/agents/slt-support");
+      assert(
+        "17a. GET /v1/public/agents/:key for suspended tenant returns 403 Forbidden",
+        suspendedAgentRes.status === 403 && suspendedAgentRes.data?.error?.includes("suspended")
+      );
+
+      const suspendedSessionRes = await api("/v1/public/sessions", "POST", {
+        agentKey: "slt-support",
+      });
+      assert(
+        "17b. POST /v1/public/sessions for suspended tenant returns 403 Forbidden",
+        suspendedSessionRes.status === 403 && suspendedSessionRes.data?.error?.includes("suspended")
+      );
+
+      const suspendedMsgRes = await api(
+        `/v1/public/sessions/${sessionId}/messages`,
+        "POST",
+        { message: "Chat under suspended tenant" },
+        { "x-session-token": sessionToken }
+      );
+      assert(
+        "17c. POST /v1/public/sessions/:id/messages for suspended tenant returns 403 Forbidden",
+        suspendedMsgRes.status === 403 && suspendedMsgRes.data?.error?.includes("suspended")
+      );
+    } finally {
+      if (sltTenantRecord) sltTenantRecord.status = originalSltStatus;
+    }
+
+    const restoredAgentRes = await api("/v1/public/agents/slt-support");
+    assert(
+      "17d. Restored active tenant allows public agent resolution again with 200 OK",
+      restoredAgentRes.status === 200 && restoredAgentRes.data?.success === true
+    );
+
+    // --- Test 18: Tool SSRF, Private Network & Protocol Defense ---
+    console.log("\n--- 18. Tool SSRF, Private Network & Protocol Defense ---");
+    let loopbackBlocked = false;
+    try {
+      toolExecutor.validateHttpsUrl("https://127.0.0.1:8080/internal/metrics");
+    } catch (e: any) {
+      if (e.message.includes("SSRF security policy") || e.message.includes("prohibited")) {
+        loopbackBlocked = true;
+      }
+    }
+    assert(
+      "18a. SSRF defense blocks IPv4 loopback (127.0.0.1)",
+      loopbackBlocked
+    );
+
+    let imdsBlocked = false;
+    try {
+      toolExecutor.validateHttpsUrl("https://169.254.169.254/latest/meta-data/identity-credentials");
+    } catch (e: any) {
+      if (e.message.includes("SSRF security policy") || e.message.includes("prohibited")) {
+        imdsBlocked = true;
+      }
+    }
+    assert(
+      "18b. SSRF defense blocks AWS EC2 IMDS link-local metadata address (169.254.169.254)",
+      imdsBlocked
+    );
+
+    let privateIpBlocked = false;
+    try {
+      toolExecutor.validateHttpsUrl("https://10.0.1.25:8443/cluster-admin");
+    } catch (e: any) {
+      if (e.message.includes("SSRF security policy") || e.message.includes("prohibited")) {
+        privateIpBlocked = true;
+      }
+    }
+    assert(
+      "18c. SSRF defense blocks RFC 1918 private network destinations (10.0.0.0/8, 192.168.0.0/16)",
+      privateIpBlocked
+    );
+
+    let localhostBlocked = false;
+    try {
+      toolExecutor.validateHttpsUrl("https://localhost:9000/internal-api");
+    } catch (e: any) {
+      if (e.message.includes("SSRF security policy") || e.message.includes("prohibited")) {
+        localhostBlocked = true;
+      }
+    }
+    assert(
+      "18d. SSRF defense blocks 'localhost' hostname destination",
+      localhostBlocked
+    );
+
+    let insecureHttpBlocked = false;
+    try {
+      toolExecutor.validateHttpsUrl("http://api.example.com/data");
+    } catch (e: any) {
+      if (e.message.includes("HTTPS protocol")) {
+        insecureHttpBlocked = true;
+      }
+    }
+    assert(
+      "18e. Plain HTTP protocol rejected (enforces HTTPS only)",
+      insecureHttpBlocked
+    );
+
+    let basicAuthBlocked = false;
+    try {
+      toolExecutor.validateHttpsUrl("https://admin:secret123@api.example.com/data");
+    } catch (e: any) {
+      if (e.message.includes("basic auth credentials")) {
+        basicAuthBlocked = true;
+      }
+    }
+    assert(
+      "18f. URL with embedded basic auth credentials rejected",
+      basicAuthBlocked
+    );
+
+    // Read-only tool with mutating method
+    const mutatingReadOnlyToolAgent: AgentConfig = {
+      tenantId: "dialog-telecom",
+      agentId: "agent-ro-test",
+      displayName: "RO Test Agent",
+      status: "DRAFT",
+      tools: [
+        {
+          name: "delete_record",
+          type: "api",
+          description: "Delete a record",
+          enabled: true,
+          readOnly: true,
+          method: "DELETE",
+          endpoint: "https://mock.internal/api/record",
+        },
+      ],
+    };
+    let readOnlyMutatingBlocked = false;
+    try {
+      await toolExecutor.execute(mutatingReadOnlyToolAgent, "delete_record", {});
+    } catch (e: any) {
+      if (e.message.includes("Read-only tool") && e.message.includes("cannot use mutating HTTP method")) {
+        readOnlyMutatingBlocked = true;
+      }
+    }
+    assert(
+      "18g. Tool flagged as readOnly rejects mutating HTTP methods (DELETE, PUT)",
+      readOnlyMutatingBlocked
+    );
+
+    // --- Test 19: Tool Production Fail-Closed Boundary ---
+    console.log("\n--- 19. Tool Production Fail-Closed Boundary ---");
+    const prevEnvForTools = process.env.NODE_ENV;
+    const prevExtTools = process.env.EXTERNAL_TOOLS_ENABLED;
+    process.env.NODE_ENV = "production";
+    delete process.env.EXTERNAL_TOOLS_ENABLED;
+
+    let prodToolsFailClosed = false;
+    try {
+      await toolExecutor.execute(dialogAgent, "check_coverage", { postalCode: "00100" });
+    } catch (e: any) {
+      if (e.message.includes("External tool execution is disabled in production")) {
+        prodToolsFailClosed = true;
+      }
+    } finally {
+      process.env.NODE_ENV = prevEnvForTools;
+      if (prevExtTools !== undefined) {
+        process.env.EXTERNAL_TOOLS_ENABLED = prevExtTools;
+      } else {
+        delete process.env.EXTERNAL_TOOLS_ENABLED;
+      }
+    }
+    assert(
+      "19. In production without EXTERNAL_TOOLS_ENABLED=true, tool execution fails closed",
+      prodToolsFailClosed
+    );
+
+    // --- Test 20: Real db.json Immutability Check ---
+    console.log("\n--- 20. Real Database Immutability Check ---");
     const realDbSnapshotAfter = fs.readFileSync(realDbPath, "utf-8");
     assert(
-      "Real tracked db.json was NOT mutated during AI runtime test execution",
+      "20. Real tracked db.json was NOT mutated during AI runtime test execution",
       realDbSnapshotBefore === realDbSnapshotAfter
     );
   } finally {

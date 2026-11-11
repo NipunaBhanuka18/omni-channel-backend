@@ -71,6 +71,7 @@ export interface ConversationSession {
   agentId: string;
   publicAgentKey: string;
   status: "AI_ACTIVE" | "HANDOFF_REQUESTED" | "HUMAN_ACTIVE" | "CLOSED";
+  sessionSecretHash?: string;
   createdAt: number;
   updatedAt: number;
   handoffReason?: string;

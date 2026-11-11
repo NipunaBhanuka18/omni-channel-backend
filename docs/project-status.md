@@ -1,6 +1,6 @@
 # Omni Channel Platform — Current Project Status
 **Date**: November 11, 2026  
-**Status**: Supervisor MVP Feature Reconciliation & AI Runtime Integration (Task 12 Checkpoint)  
+**Status**: AI Runtime Regression Integrity, Security Hardening & Verified Checkpoint (Task 13 Complete)  
 **Branch**: `integration/supervisor-mvp-ai`  
 **Base Commit**: `5182ac49e6acfc9d93122626b9483ad90ec5d845`
 
@@ -10,7 +10,7 @@
 
 The **SLT Mobitel Omni Channel Platform** is a multi-tenant AI customer engagement platform engineered to handle enterprise customer interactions across multiple channels (Web Chat, WhatsApp, SMS, Messenger). It routes customer intents dynamically through domain-specialist AI agents (Billing, Usage, Technical Support) backed by tenant-partitioned knowledge bases, with automated escalation to human agents when needed.
 
-This document describes the exact implementation status of the TypeScript backend and React frontend as of the Task 11 full-stack integration checkpoint.
+This document describes the exact implementation status of the TypeScript backend and React frontend as of the Task 13 AI security verification checkpoint.
 
 ---
 
@@ -53,17 +53,18 @@ The following subsystems are verified and functional in the integrated codebase:
    - All client endpoints configurable via `VITE_API_BASE_URL`.
 9. **[TESTED] Live Full-Stack End-to-End Suite (`scripts/e2e-live-fullstack.ts`)**:
    - Verified 16 live functional scenarios across live backend (port 3001) and React frontend (port 5173). All 23 assertions passed.
-10. **[TESTED] Native TypeScript AI Runtime Subsystem (`services/ai-runtime/`, Task 12)**:
+10. **[TESTED] Native TypeScript AI Runtime Subsystem (`services/ai-runtime/`, Task 12 & Task 13)**:
    - Amazon Bedrock `Converse` API provider adapter with explicit mock/production fail-closed separation.
-   - Public chat endpoints (`GET /v1/public/agents/:key`, `POST /v1/public/sessions`, `POST /v1/public/sessions/:id/messages`, `GET /v1/public/sessions/:id/messages`, `POST /v1/public/sessions/:id/feedback`).
-   - Admin agent, KB, and tool management (`/api/dev/admin/agents`, `/api/dev/admin/knowledge-bases`, `/api/dev/admin/tools`).
+   - Public chat anti-hijacking: Cryptographic session tokens (`stk_...`) with SHA-256 hash storage and timing-safe token validation on all public turn/history/feedback endpoints.
+   - Public chat rate limiting: 60 req/min session creation, 120 req/min message turns.
+   - Suspended tenant public endpoint gating: 403 Forbidden on agent resolution, session creation, and conversation turns.
+   - External tool SSRF defense: Strict filtering blocking loopback (`127.0.0.0/8`, `localhost`), metadata endpoints (`169.254.169.254` IMDS), and private networks (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`), with redirect rejection, 256KB payload capping, and read-only mutating method prevention.
+   - Production tool policy: External tools fail closed unless `EXTERNAL_TOOLS_ENABLED=true`.
    - Dynamic agent configuration loading and public URL mapping (`/chat/:publicAgentKey`).
    - Multi-turn conversation memory isolation partitioned by `sessionId`.
    - Tenant-scoped Knowledge Base vector retrieval with shared-KB tenant filtering (`equals: { key: "tenant_id", value: agent.tenantId }`).
-   - Allowlisted tool execution (API & MCP with SigV4) with prototype pollution defense.
-   - Intent routing (`billing`, `technical`, `sales`, `lead`, `general`) and dynamic lead form triggers.
    - Human handoff regex escalation (`\b(human|person|representative|live agent)\b`) with session state transition to `HANDOFF_REQUESTED`.
-   - 32/32 assertions verified in automated test suite `scripts/test-ai-runtime.ts`.
+   - 49/49 assertions verified in automated test suite `scripts/test-ai-runtime.ts`. Total test baseline: 204 assertions across 13 suites.
 
 ---
 
