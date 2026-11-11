@@ -8,7 +8,7 @@
   "scripts": {
     "build": "tsc",
     "start": "npx tsx server.ts",
-    "test": "tsx ./scripts/test-all.ts && tsx ./scripts/test-tenant-resolver.ts && tsx ./scripts/test-tenant-onboarding.ts && tsx ./scripts/test-import-safety.ts && tsx ./scripts/test-onboarding.ts && tsx ./scripts/test-router.ts && tsx ./scripts/test-ui-api-server.ts && tsx ./scripts/test-registration-workflows.ts && tsx ./scripts/test-member4-ai-engine.ts && tsx ./scripts/test-auth-security.ts",
+    "test": "tsx ./scripts/test-all.ts && tsx ./scripts/test-tenant-resolver.ts && tsx ./scripts/test-tenant-onboarding.ts && tsx ./scripts/test-import-safety.ts && tsx ./scripts/test-onboarding.ts && tsx ./scripts/test-router.ts && tsx ./scripts/test-ui-api-server.ts && tsx ./scripts/test-registration-workflows.ts && tsx ./scripts/test-member4-ai-engine.ts && tsx ./scripts/test-auth-security.ts && tsx ./scripts/test-endpoint-hardening.ts",
     "test:agents": "tsx ./scripts/test-all.ts",
     "test:tenant-resolver": "tsx ./scripts/test-tenant-resolver.ts",
     "test:tenant-onboarding": "tsx ./scripts/test-tenant-onboarding.ts",
@@ -18,7 +18,8 @@
     "test:ui-server": "tsx ./scripts/test-ui-api-server.ts",
     "test:registration-workflows": "tsx ./scripts/test-registration-workflows.ts",
     "test:member4": "tsx ./scripts/test-member4-ai-engine.ts",
-    "test:security": "tsx ./scripts/test-auth-security.ts"
+    "test:security": "tsx ./scripts/test-auth-security.ts",
+    "test:hardening": "tsx ./scripts/test-endpoint-hardening.ts"
   },
   "repository": {
     "type": "git",

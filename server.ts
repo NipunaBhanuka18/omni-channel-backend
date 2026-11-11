@@ -2,6 +2,7 @@ import express from "express";
 import cors from "cors";
 import fs from "fs";
 import path from "path";
+import crypto from "crypto";
 import { handleTenantRequest } from "./services/tenant-router/handler";
 import { handleHandoffApi } from "./services/handoff/handler";
 
@@ -10,7 +11,7 @@ import { uploadKbDocument } from "./agents/utils/s3-client";
 import { inMemoryTenants, inMemoryAgents, provisionTenantResources } from "./scripts/create-tenants-table";
 import { TenantContext } from "./shared/types/tenant-context";
 
-import { LocalSessionTokenService } from "./services/auth/local-session-token";
+import { LocalSessionTokenService, extractBearerToken } from "./services/auth/local-session-token";
 import {
   createRequireAuth,
   requireRole,
@@ -231,23 +232,92 @@ app.post("/api/auth/login", async (req, res) => {
 });
 
 // POST /api/auth/register-admin
-app.post("/api/auth/register-admin", (req, res) => {
-  const { fullName, email, password } = req.body;
-  if (!email || !password) {
-    return res.status(400).json({ success: false, error: "Missing required fields" });
+app.post("/api/auth/register-admin", async (req, res) => {
+  const db = readDB();
+  const existingSuperAdmins = (db.users || []).filter((u: any) => u.role === "superadmin");
+  const hasExistingSuperAdmin = existingSuperAdmins.length > 0;
+
+  // Check if caller provides a valid Bearer token for an existing Super Admin
+  const authHeader = req.headers.authorization;
+  const token = extractBearerToken(authHeader);
+  let callerIsSuperAdmin = false;
+
+  if (token) {
+    if (token.startsWith("v1.")) {
+      const claims = getLocalSessionTokenService().verifyToken(token);
+      if (claims && claims.role === "superadmin") {
+        callerIsSuperAdmin = true;
+      }
+    } else if (process.env.NODE_ENV !== "production" && (token.startsWith("dev-token-") || token === "token-user-1")) {
+      if (token.includes("superadmin") || token.includes("staff")) {
+        callerIsSuperAdmin = true;
+      }
+    }
   }
 
-  const db = readDB();
-  const existing = db.users.find((u: any) => u.email.toLowerCase() === email.toLowerCase());
-  if (existing) {
-    return res.status(400).json({ success: false, error: "Email already registered" });
+  // If a Super Admin already exists:
+  // Public bootstrap is permanently closed. Creating subsequent platform admins requires an existing Super Admin.
+  if (hasExistingSuperAdmin && !callerIsSuperAdmin) {
+    return res.status(403).json({
+      success: false,
+      error: "Platform admin registration is closed. Additional platform administrators must be created by an authenticated Super Admin.",
+    });
   }
+
+  // If NO Super Admin exists in the system (initial bootstrap):
+  if (!hasExistingSuperAdmin && !callerIsSuperAdmin) {
+    const envIsProd = process.env.NODE_ENV === "production" || process.env.IS_LOCAL === "false";
+    const configuredBootstrapToken = (process.env.ADMIN_BOOTSTRAP_TOKEN || "").trim();
+    const providedBootstrapToken = (typeof req.headers["x-bootstrap-token"] === "string" ? req.headers["x-bootstrap-token"] : "").trim();
+
+    let bootstrapAuthorized = false;
+    if (configuredBootstrapToken && configuredBootstrapToken.length >= 16) {
+      if (providedBootstrapToken.length === configuredBootstrapToken.length) {
+        bootstrapAuthorized = crypto.timingSafeEqual(
+          Buffer.from(providedBootstrapToken, "utf8"),
+          Buffer.from(configuredBootstrapToken, "utf8"),
+        );
+      }
+    } else if (!envIsProd && process.env.ALLOW_INITIAL_ADMIN_BOOTSTRAP === "true") {
+      // In local dev ONLY, explicit environment flag can allow initial bootstrap without token
+      bootstrapAuthorized = true;
+    }
+
+    if (!bootstrapAuthorized) {
+      return res.status(403).json({
+        success: false,
+        error: "Initial admin bootstrap is disabled. Set ADMIN_BOOTSTRAP_TOKEN or authenticate as Super Admin.",
+      });
+    }
+  }
+
+  // Input validation
+  const { fullName, email, password } = req.body || {};
+  if (!email || !password || typeof email !== "string" || typeof password !== "string") {
+    return res.status(400).json({ success: false, error: "Missing or invalid required fields: email and password" });
+  }
+
+  const cleanEmail = email.trim().toLowerCase();
+  if (cleanEmail.length < 3 || !cleanEmail.includes("@") || cleanEmail.length > 254) {
+    return res.status(400).json({ success: false, error: "Invalid email format" });
+  }
+  if (password.length < 8) {
+    return res.status(400).json({ success: false, error: "Password must be at least 8 characters" });
+  }
+
+  const existing = db.users.find((u: any) => u.email.toLowerCase() === cleanEmail);
+  if (existing) {
+    return res.status(409).json({ success: false, error: "Email already registered" });
+  }
+
+  // Cryptographic password hashing
+  const passwordHash = await hashPassword(password);
 
   const newUser = {
     id: `user-${Date.now()}`,
-    fullName: fullName || email.split("@")[0],
-    email,
-    password,
+    fullName: (fullName && typeof fullName === "string" ? fullName.trim() : "") || cleanEmail.split("@")[0],
+    email: cleanEmail,
+    passwordHash,
     role: "superadmin",
     createdAt: new Date().toISOString(),
   };
@@ -255,7 +325,17 @@ app.post("/api/auth/register-admin", (req, res) => {
   db.users.push(newUser);
   writeDB(db);
 
-  return res.status(201).json({ success: true, user: newUser });
+  // Return redacted user object: NEVER return password, passwordHash, salt, or secrets
+  return res.status(201).json({
+    success: true,
+    user: {
+      id: newUser.id,
+      fullName: newUser.fullName,
+      email: newUser.email,
+      role: newUser.role,
+      createdAt: newUser.createdAt,
+    },
+  });
 });
 
 // ==========================================
@@ -531,47 +611,108 @@ app.post("/api/tenants/register", ...requireSuperAdmin, async (req, res) => {
 // 4. MEMBER 3 LIVE AGENT CONSOLE & PRESENCE ROUTES
 // ==========================================
 
-// POST /api/agent/presence/online ("Go Online")
-app.post(["/api/agent/presence/online", "/agent/presence/online"], async (req, res) => {
-  const { tenantId, agentId, connectionId } = req.body;
+// Authorized presence mutation handler
+const handlePresenceMutation = (isOnline: boolean) => async (req: express.Request, res: express.Response) => {
+  const caller = req.localAuth;
+  if (!caller) {
+    return res.status(401).json({ success: false, error: "Authentication required" });
+  }
+
+  // Requirement 7: Company admin cannot impersonate live agent
+  if (caller.role === "company") {
+    return res.status(403).json({
+      success: false,
+      error: "Insufficient permissions. Company administrators cannot modify live agent presence.",
+    });
+  }
+
+  if (caller.role !== "live_agent" && caller.role !== "superadmin") {
+    return res.status(403).json({
+      success: false,
+      error: "Insufficient permissions. Only live agents can modify presence.",
+    });
+  }
+
+  const body = req.body || {};
+  const requestedTenant = typeof body.tenantId === "string" ? body.tenantId.trim() : "";
+  const requestedAgentId = typeof body.agentId === "string" ? body.agentId.trim() : "";
+  const connectionId = typeof body.connectionId === "string" ? body.connectionId.trim() : undefined;
+
+  // Requirement 9: Cross-tenant presence mutation denied
+  let effectiveTenantId = caller.tenantId;
+  if (caller.role === "superadmin") {
+    effectiveTenantId = requestedTenant || "slt";
+  } else {
+    if (requestedTenant && requestedTenant !== caller.tenantId) {
+      return res.status(403).json({
+        success: false,
+        error: "Cross-tenant presence modification denied.",
+      });
+    }
+  }
+
+  if (!effectiveTenantId) {
+    return res.status(403).json({ success: false, error: "Presence modification requires a valid tenant scope" });
+  }
+
+  // Requirement 8: Live agent cannot modify another agent's presence
+  let effectiveAgentId = caller.sub;
+  if (caller.role === "live_agent") {
+    if (requestedAgentId && requestedAgentId !== caller.sub) {
+      return res.status(403).json({
+        success: false,
+        error: `Agents cannot modify another agent's presence. Authenticated as '${caller.sub}', requested '${requestedAgentId}'.`,
+      });
+    }
+  } else if (caller.role === "superadmin") {
+    effectiveAgentId = requestedAgentId || caller.sub;
+  }
+
   const result = await handleHandoffApi({
-    action: "presence_online",
-    tenantId: tenantId || "slt",
-    agentId: agentId || "admin1",
-    connectionId,
+    action: isOnline ? "presence_online" : "presence_offline",
+    tenantId: effectiveTenantId,
+    agentId: effectiveAgentId,
+    connectionId: isOnline ? connectionId : undefined,
   });
-  if (!result.success) return res.status(400).json(result);
+
+  if (!result.success) {
+    return res.status(400).json(result);
+  }
   return res.status(200).json({ success: true, ...result.data });
-});
+};
+
+// POST /api/agent/presence/online ("Go Online")
+app.post(["/api/agent/presence/online", "/agent/presence/online"], requireAuth, handlePresenceMutation(true));
 
 // POST /api/agent/presence/offline ("Go Offline")
-app.post(["/api/agent/presence/offline", "/agent/presence/offline"], async (req, res) => {
-  const { tenantId, agentId } = req.body;
-  const result = await handleHandoffApi({
-    action: "presence_offline",
-    tenantId: tenantId || "slt",
-    agentId: agentId || "admin1",
-  });
-  if (!result.success) return res.status(400).json(result);
-  return res.status(200).json({ success: true, ...result.data });
-});
+app.post(["/api/agent/presence/offline", "/agent/presence/offline"], requireAuth, handlePresenceMutation(false));
 
 // GET /api/agent/presence/status
-app.get(["/api/agent/presence/status", "/agent/presence/status"], async (req, res) => {
-  const tenantId = (req.query.tenantId as string) || "slt";
-  const agentId = (req.query.agentId as string) || "admin1";
+app.get(["/api/agent/presence/status", "/agent/presence/status"], requireAuth, async (req, res) => {
+  const caller = req.localAuth;
+  const requestedTenant = (typeof req.query.tenantId === "string" ? req.query.tenantId.trim() : "") || caller?.tenantId || "slt";
+  const requestedAgentId = (typeof req.query.agentId === "string" ? req.query.agentId.trim() : "") || caller?.sub || "admin1";
+
+  if (caller?.role !== "superadmin" && caller?.tenantId && requestedTenant !== caller.tenantId) {
+    return res.status(403).json({ success: false, error: "Cross-tenant access denied" });
+  }
+
+  if (caller?.role === "live_agent" && requestedAgentId && requestedAgentId !== caller.sub) {
+    return res.status(403).json({ success: false, error: "Live agents can only view their own presence status" });
+  }
+
   const result = await handleHandoffApi({
     action: "presence_status",
-    tenantId,
-    agentId,
+    tenantId: requestedTenant,
+    agentId: requestedAgentId,
   });
   if (!result.success) return res.status(400).json(result);
   return res.status(200).json({ success: true, ...result.data });
 });
 
-// POST /api/chat/handoff/request (Escalation Trigger)
+// POST /api/chat/handoff/request (Escalation Trigger - Public Customer Ingress)
 app.post(["/api/chat/handoff/request", "/chat/handoff/request"], async (req, res) => {
-  const { tenantId, sessionId, reason, customerInfo } = req.body;
+  const { tenantId, sessionId, reason, customerInfo } = req.body || {};
   const result = await handleHandoffApi({
     action: "request_handoff",
     tenantId: tenantId || "slt",
@@ -584,15 +725,58 @@ app.post(["/api/chat/handoff/request", "/chat/handoff/request"], async (req, res
 });
 
 // POST /api/chat/handoff/resolve (Live Agent Resolves Session)
-app.post(["/api/chat/handoff/resolve", "/chat/handoff/resolve"], async (req, res) => {
-  const { tenantId, sessionId, agentId } = req.body;
+app.post(["/api/chat/handoff/resolve", "/chat/handoff/resolve"], requireAuth, async (req, res) => {
+  const caller = req.localAuth;
+  if (!caller) {
+    return res.status(401).json({ success: false, error: "Authentication required" });
+  }
+
+  const { sessionId, tenantId: bodyTenant, agentId: bodyAgent } = req.body || {};
+  if (!sessionId || typeof sessionId !== "string" || !sessionId.trim()) {
+    return res.status(400).json({ success: false, error: "Missing or invalid 'sessionId'" });
+  }
+
+  // Derive tenant
+  let effectiveTenant = caller.tenantId;
+  if (caller.role === "superadmin") {
+    effectiveTenant = (typeof bodyTenant === "string" ? bodyTenant.trim() : "") || "slt";
+  } else {
+    if (bodyTenant && bodyTenant !== caller.tenantId) {
+      return res.status(403).json({ success: false, error: "Cross-tenant handoff resolution denied." });
+    }
+  }
+
+  if (!effectiveTenant) {
+    return res.status(403).json({ success: false, error: "Handoff resolution requires a valid tenant scope" });
+  }
+
+  // Derive agent ID
+  let effectiveAgent = caller.sub;
+  if (caller.role === "company" || caller.role === "superadmin") {
+    effectiveAgent = (typeof bodyAgent === "string" ? bodyAgent.trim() : "") || caller.sub;
+  } else {
+    // live_agent can only resolve as themselves
+    if (bodyAgent && bodyAgent !== caller.sub) {
+      return res.status(403).json({
+        success: false,
+        error: `Live agents cannot resolve sessions as another agent. Authenticated as '${caller.sub}', requested '${bodyAgent}'.`,
+      });
+    }
+  }
+
   const result = await handleHandoffApi({
     action: "resolve_session",
-    tenantId: tenantId || "slt",
-    sessionId,
-    agentId,
+    tenantId: effectiveTenant,
+    sessionId: sessionId.trim(),
+    agentId: effectiveAgent,
+    callerRole: caller.role,
   });
-  if (!result.success) return res.status(400).json(result);
+
+  if (!result.success) {
+    const statusCode = result.error?.code === "NOT_FOUND" ? 404 : result.error?.code === "FORBIDDEN" ? 403 : 400;
+    const errorMsg = typeof result.error === "string" ? result.error : result.error?.message || "Failed to resolve session";
+    return res.status(statusCode).json({ success: false, error: errorMsg, code: result.error?.code });
+  }
   return res.status(200).json({ success: true, ...result.data });
 });
 

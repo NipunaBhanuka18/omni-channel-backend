@@ -10,6 +10,7 @@ export interface HandoffApiRequest {
   connectionId?: string;
   customerName?: string;
   issueSummary?: string;
+  callerRole?: string;
 }
 
 /**
@@ -76,7 +77,18 @@ export async function handleHandoffApi(request: HandoffApiRequest): Promise<Agen
           tenantId,
           sessionId: request.sessionId,
           agentId: request.agentId,
+          callerRole: request.callerRole,
         });
+        if (!result.success) {
+          return {
+            success: false,
+            error: {
+              code: result.error?.code || "RESOLVE_FAILED",
+              message: result.error?.message || "Failed to resolve chat session",
+              retryable: false,
+            },
+          };
+        }
         return { success: true, data: result };
       }
 

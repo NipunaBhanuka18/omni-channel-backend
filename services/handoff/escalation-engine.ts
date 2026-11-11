@@ -136,17 +136,75 @@ export async function resolveChatSession(params: {
   tenantId: string;
   sessionId: string;
   agentId: string;
-}): Promise<{ success: boolean; status: string }> {
-  const { tenantId, sessionId, agentId } = params;
+  callerRole?: string;
+}): Promise<{
+  success: boolean;
+  status?: string;
+  message?: string;
+  error?: { code: string; message: string };
+}> {
+  const { tenantId, sessionId, agentId, callerRole } = params;
 
-  // Decrement agent's active chat count
-  await adjustActiveChats(tenantId, agentId, -1);
-
-  const existing = MEMORY_SESSION_STORE.get(sessionId);
-  if (existing) {
-    existing.status = "RESOLVED";
-    existing.updatedAt = new Date().toISOString();
+  if (!sessionId || typeof sessionId !== "string" || !sessionId.trim()) {
+    return {
+      success: false,
+      error: { code: "BAD_REQUEST", message: "Missing or invalid 'sessionId'" },
+    };
   }
+
+  const existing = await getSessionStatus(sessionId);
+  if (!existing) {
+    return {
+      success: false,
+      error: { code: "NOT_FOUND", message: `Chat session '${sessionId}' was not found.` },
+    };
+  }
+
+  // Cross-tenant verification
+  if (existing.tenantId && existing.tenantId !== tenantId) {
+    return {
+      success: false,
+      error: {
+        code: "FORBIDDEN",
+        message: `Cross-tenant handoff resolution denied. Session '${sessionId}' belongs to tenant '${existing.tenantId}'.`,
+      },
+    };
+  }
+
+  // Assignment / ownership verification:
+  // If caller is NOT a privileged administrator (superadmin or company admin),
+  // they must be the assigned agent!
+  const isPrivileged = callerRole === "superadmin" || callerRole === "company";
+  if (!isPrivileged) {
+    if (existing.assignedAgentId && existing.assignedAgentId !== agentId) {
+      return {
+        success: false,
+        error: {
+          code: "FORBIDDEN",
+          message: `Agent '${agentId}' is not assigned to session '${sessionId}' (assigned to '${existing.assignedAgentId}').`,
+        },
+      };
+    }
+  }
+
+  // Idempotency: If already resolved, return cleanly without duplicate decrement
+  if (existing.status === "RESOLVED") {
+    return {
+      success: true,
+      status: "RESOLVED",
+      message: `Session '${sessionId}' is already resolved.`,
+    };
+  }
+
+  // Decrement agent's active chat count on active session
+  const targetAgent = existing.assignedAgentId || agentId;
+  if (targetAgent) {
+    await adjustActiveChats(existing.tenantId || tenantId, targetAgent, -1);
+  }
+
+  existing.status = "RESOLVED";
+  existing.updatedAt = new Date().toISOString();
+  MEMORY_SESSION_STORE.set(sessionId, existing);
 
   try {
     await docClient.send(

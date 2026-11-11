@@ -100,10 +100,17 @@ export function createRequireAuth(
           });
         }
 
+        let sub = isSuper ? "dev-superadmin-local" : role === "live_agent" ? "live-agent-01" : "dev-user-local";
+        if (token.includes("agent-02") || token.includes("agent2")) {
+          sub = "live-agent-02";
+        } else if (token.includes("agent-01") || token.includes("agent1")) {
+          sub = "live-agent-01";
+        }
+
         verifiedClaims = {
-          sub: isSuper ? "dev-superadmin-local" : "dev-user-local",
-          email: isSuper ? "superadmin@slt.lk" : "admin@slt.lk",
-          name: isSuper ? "System Super Admin" : "Company Admin",
+          sub,
+          email: isSuper ? "superadmin@slt.lk" : role === "live_agent" ? `${sub}@slt.lk` : "admin@slt.lk",
+          name: isSuper ? "System Super Admin" : role === "live_agent" ? `Live Agent (${sub})` : "Company Admin",
           role,
           ...(assignedTenant ? { tenantId: assignedTenant } : {}),
           iat: Math.floor(Date.now() / 1000),

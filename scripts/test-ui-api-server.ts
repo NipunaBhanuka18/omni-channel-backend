@@ -122,6 +122,7 @@ async function runUiServerTests() {
     console.log("\n--- Test 5: Live Agent Console - Go Online ---");
     const onlineRes = await api("/api/agent/presence/online", {
       method: "POST",
+      token: "dev-token-live-agent",
       body: { tenantId: "slt", agentId: "live-agent-01", connectionId: "conn-socket-99" },
     });
     assert(
@@ -151,6 +152,7 @@ async function runUiServerTests() {
     console.log("\n--- Test 7: Live Agent Console - Resolve Session ---");
     const resolveRes = await api("/api/chat/handoff/resolve", {
       method: "POST",
+      token: "dev-token-live-agent",
       body: {
         tenantId: "slt",
         sessionId: "sess-web-customer-777",
