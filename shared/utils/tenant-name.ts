@@ -25,6 +25,36 @@ export function normalizeCompanySlug(rawSlug: string): string {
 }
 
 /**
+ * Reserved platform slugs that cannot be claimed by ordinary tenant registrations.
+ */
+export const RESERVED_TENANT_SLUGS = new Set<string>([
+  "slt",
+  "admin",
+  "administrator",
+  "superadmin",
+  "system",
+  "platform",
+  "api",
+  "root",
+  "null",
+  "undefined",
+  "console",
+  "auth",
+  "login",
+  "register",
+  "workspace",
+  "internal",
+]);
+
+/**
+ * Checks if a company slug is reserved for platform operations.
+ */
+export function isReservedTenantSlug(rawSlug: string): boolean {
+  const clean = normalizeCompanySlug(rawSlug);
+  return RESERVED_TENANT_SLUGS.has(clean) || clean.startsWith("system-") || clean.startsWith("platform-");
+}
+
+/**
  * Derives a canonical tenantId from a company slug or company name.
  * Preserves "slt" as the baseline seeded tenant ID and prefixes others with "tenant-".
  */

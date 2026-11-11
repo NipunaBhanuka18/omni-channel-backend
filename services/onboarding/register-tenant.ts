@@ -1,5 +1,5 @@
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
-import { DynamoDBDocumentClient, PutCommand, GetCommand } from "@aws-sdk/lib-dynamodb";
+import { DynamoDBDocumentClient, PutCommand, GetCommand, DeleteCommand } from "@aws-sdk/lib-dynamodb";
 import { uploadKbDocument } from "../../agents/utils/s3-client";
 import { TenantContext } from "../../shared/types/tenant-context";
 import {
@@ -8,6 +8,12 @@ import {
   inMemoryTenants,
   inMemoryAgents,
 } from "../../scripts/create-tenants-table";
+import {
+  deriveTenantId,
+  normalizeCompanyName,
+  normalizeCompanySlug,
+  isReservedTenantSlug,
+} from "../../shared/utils/tenant-name";
 
 const rawClient = new DynamoDBClient({
   region: "us-east-1",
@@ -26,6 +32,8 @@ export interface RegisterTenantInput {
   planTier?: "starter" | "pro" | "enterprise";
   themeColor?: string;
   allowedOrigins?: string[];
+  password?: string;
+  idempotencyKey?: string;
 }
 
 export interface RegisterTenantResult {
@@ -35,6 +43,7 @@ export interface RegisterTenantResult {
   companySlug: string;
   adminEmail: string;
   status: "active" | "pending";
+  provisioningStatus: "ACTIVE" | "PROVISIONING" | "FAILED" | "SUSPENDED" | "PENDING";
   planTier: "starter" | "pro" | "enterprise";
   defaultAgent: {
     agentId: string;
@@ -55,8 +64,9 @@ export interface RegisterTenantResult {
 }
 
 /**
- * Onboards a new company onto the Multi-Tenant Platform.
- * Enforces strict tenant partitioning across DynamoDB, S3, and Cognito credentials.
+ * Onboards a new company workspace onto the Multi-Tenant Platform automatically.
+ * Enforces strict tenant partitioning across DynamoDB, S3, and identity credentials.
+ * Automatically provisions DynamoDB records, default specialist agent, and S3 knowledge base prefix.
  */
 export async function registerTenant(
   input: RegisterTenantInput
@@ -72,12 +82,22 @@ export async function registerTenant(
     throw new Error("Validation Failed: Valid 'adminEmail' is required.");
   }
 
-  const cleanSlug = input.companySlug.toLowerCase().trim().replace(/[^a-z0-9-]/g, "-");
-  const tenantId = cleanSlug === "slt" ? "slt" : `tenant-${cleanSlug}`;
+  const cleanSlug = normalizeCompanySlug(input.companySlug);
+  if (!cleanSlug) {
+    throw new Error("Validation Failed: 'companySlug' cannot be empty after normalization.");
+  }
+
+  // 1b. Reject Reserved Slugs (except 'slt' for existing seed verification)
+  if (cleanSlug !== "slt" && isReservedTenantSlug(cleanSlug)) {
+    throw new Error(`Validation Failed: '${cleanSlug}' is a reserved tenant identifier.`);
+  }
+
+  const tenantId = deriveTenantId(cleanSlug);
+  const normalizedName = normalizeCompanyName(input.companyName);
   const planTier = input.planTier || "starter";
   const now = new Date().toISOString();
 
-  // 2. Check for Duplicate Tenant
+  // 2. Check for Duplicate Tenant by tenantId or normalizedName
   let existingTenant = inMemoryTenants.get(tenantId);
   if (!existingTenant) {
     try {
@@ -89,7 +109,7 @@ export async function registerTenant(
       );
       if (resp.Item) existingTenant = resp.Item as TenantRecord;
     } catch {
-      // LocalStack offline fallback
+      // LocalStack offline fallback handled via inMemoryTenants
     }
   }
 
@@ -97,13 +117,24 @@ export async function registerTenant(
     throw new Error(`Conflict: Tenant with ID '${tenantId}' already exists.`);
   }
 
-  // 3. Create Tenant Record in DynamoDB
+  // Check inMemoryTenants for duplicate normalized company name
+  for (const t of inMemoryTenants.values()) {
+    const tNorm = normalizeCompanyName(String(t.companyName || t.name || ""));
+    if (tNorm === normalizedName && t.tenantId !== tenantId) {
+      throw new Error(`Conflict: A company named '${input.companyName}' is already registered as tenant '${t.tenantId}'.`);
+    }
+  }
+
+  // 3. Create Tenant Record in DynamoDB / inMemoryTenants
   const tenantRecord: TenantRecord = {
     tenantId,
     companyName: input.companyName.trim(),
+    name: input.companyName.trim(),
+    normalizedName,
     companySlug: cleanSlug,
     adminEmail: input.adminEmail.trim().toLowerCase(),
     status: "active",
+    provisioningStatus: "ACTIVE",
     planTier,
     createdAt: now,
     updatedAt: now,
@@ -125,7 +156,7 @@ export async function registerTenant(
     // LocalStack fallback handled via inMemoryTenants
   }
 
-  // 4. Provision Default Agent in DynamoDB
+  // 4. Provision Default Agent in DynamoDB / inMemoryAgents
   const defaultAgentId = `agent-${cleanSlug}-support-01`;
   const defaultAgent: TenantAgentRecord = {
     tenantId,
@@ -185,6 +216,7 @@ Only AI agents and users authorized for ${tenantId} can access these documents.
     companySlug: cleanSlug,
     adminEmail: input.adminEmail,
     status: "active",
+    provisioningStatus: "ACTIVE",
     planTier,
     defaultAgent: {
       agentId: defaultAgentId,
@@ -242,7 +274,7 @@ export async function handleRegisterTenantRequest(event: {
       body: JSON.stringify(result),
     };
   } catch (error: any) {
-    const isConflict = error.message?.includes("already exists");
+    const isConflict = error.message?.includes("already exists") || error.message?.includes("Conflict");
     const statusCode = isConflict ? 409 : 400;
 
     return {

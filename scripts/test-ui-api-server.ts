@@ -86,14 +86,16 @@ async function runUiServerTests() {
 
     // TEST 3: Company Registration Submission
     console.log("\n--- Test 3: Company Registration Submission ---");
+    const testCompanySlug = `hemas-${Date.now().toString().slice(-4)}`;
     const regRes = await api("/api/registrations", {
       method: "POST",
       body: {
-        companyName: "Hemas Holdings",
-        companySlug: "hemas",
-        companyEmail: "admin@hemas.com",
+        companyName: `Hemas Enterprise ${testCompanySlug}`,
+        companySlug: testCompanySlug,
+        companyEmail: `admin@${testCompanySlug}.com`,
         tier: "Enterprise",
         channels: ["Web", "WhatsApp"],
+        requireApproval: true,
       },
     });
     const regId = regRes.data.registration?.id;

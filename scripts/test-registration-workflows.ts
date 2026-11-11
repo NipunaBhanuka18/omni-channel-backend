@@ -99,6 +99,7 @@ async function runRegistrationWorkflowTests() {
       tier: "Enterprise",
       allocatedAgents: 8,
       channels: ["Web", "WhatsApp"],
+      requireApproval: true,
     };
     const regRes = await api("/api/registrations", {
       method: "POST",
@@ -191,6 +192,7 @@ async function runRegistrationWorkflowTests() {
       body: {
         companyName: "Spam Inbound Corp",
         companyEmail: "spam@unverified.org",
+        requireApproval: true,
       },
     });
     const spamId = spamRegRes.data.registration?.id;
@@ -238,6 +240,7 @@ async function runRegistrationWorkflowTests() {
       body: {
         companyName: "Ceylon Cloud Labs",
         companyEmail: "dev@ceyloncloud.lk",
+        requireApproval: true,
       },
     });
     const ceylonId = ceylonRegRes.data.registration?.id;

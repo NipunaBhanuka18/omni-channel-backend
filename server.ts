@@ -10,6 +10,12 @@ import { registerTenant, handleRegisterTenantRequest } from "./services/onboardi
 import { uploadKbDocument } from "./agents/utils/s3-client";
 import { inMemoryTenants, inMemoryAgents, provisionTenantResources } from "./scripts/create-tenants-table";
 import { TenantContext } from "./shared/types/tenant-context";
+import {
+  isReservedTenantSlug,
+  normalizeCompanyName,
+  normalizeCompanySlug,
+  deriveTenantId,
+} from "./shared/utils/tenant-name";
 
 import { LocalSessionTokenService, extractBearerToken } from "./services/auth/local-session-token";
 import {
@@ -194,10 +200,26 @@ app.post("/api/auth/login", async (req, res) => {
     }
 
     if (passwordMatches) {
-      if (registration.status !== "Approved") {
+      const isApprovedOrActive =
+        (registration.status || "").toLowerCase() === "active" ||
+        (registration.status || "").toLowerCase() === "approved";
+
+      if (!isApprovedOrActive) {
+        if ((registration.status || "").toLowerCase() === "suspended") {
+          return res.status(403).json({
+            success: false,
+            error: "This company workspace has been suspended. Please contact platform support.",
+          });
+        }
+        if ((registration.status || "").toLowerCase() === "failed") {
+          return res.status(403).json({
+            success: false,
+            error: "Workspace provisioning failed. Please contact support or re-register.",
+          });
+        }
         return res.status(403).json({
           success: false,
-          error: `Your registration is currently ${registration.status.toLowerCase()}. Please await Super Admin approval.`,
+          error: `Your registration is currently ${registration.status.toLowerCase()}. Please await administrator review.`,
         });
       }
 
@@ -405,8 +427,11 @@ app.get("/api/registrations", requireAuth, (req, res) => {
   return res.json({ success: true, registrations: redactedList });
 });
 
+const inFlightRegistrations = new Set<string>();
+
 // POST /api/registrations
 app.post("/api/registrations", limitRegistrations, async (req, res) => {
+  const tokenService = getLocalSessionTokenService();
   const body = req.body;
   if (!body || typeof body !== "object") {
     return res.status(400).json({ success: false, error: "Invalid request body" });
@@ -417,72 +442,264 @@ app.post("/api/registrations", limitRegistrations, async (req, res) => {
     return res.status(400).json({ success: false, error: "Validation Failed: 'companyName' is required." });
   }
 
-  const db = readDB();
+  const rawEmail = (body.companyEmail || body.email || body.adminEmail || "").trim();
+  if (!rawEmail || !rawEmail.includes("@")) {
+    return res.status(400).json({ success: false, error: "Validation Failed: Valid 'adminEmail' or 'companyEmail' is required." });
+  }
 
-  // Check for duplicate pending registration
-  const duplicatePending = db.registrations.find(
-    (r: any) =>
-      (r.status || "").toLowerCase() === "pending" &&
-      ((r.companyName || "").toLowerCase().trim() === rawCompanyName.toLowerCase() ||
-       (r.name || "").toLowerCase().trim() === rawCompanyName.toLowerCase())
-  );
-  if (duplicatePending) {
-    return res.status(409).json({
+  const rawSlug = body.companySlug || rawCompanyName;
+  const cleanSlug = normalizeCompanySlug(rawSlug);
+  if (!cleanSlug) {
+    return res.status(400).json({ success: false, error: "Validation Failed: 'companySlug' cannot be empty after normalization." });
+  }
+
+  // Reject reserved platform slugs (e.g. slt, admin, system, api, etc.)
+  if (isReservedTenantSlug(cleanSlug)) {
+    return res.status(400).json({
       success: false,
-      error: `Conflict: A pending registration for '${rawCompanyName}' already exists.`,
+      error: `Validation Failed: '${cleanSlug}' is a reserved tenant identifier.`,
     });
   }
 
-  const cleanSlug = (body.companySlug || rawCompanyName).toLowerCase().replace(/[^a-z0-9]/g, "-");
-  const dateStr = new Date().toISOString().split("T")[0];
+  const normalizedName = normalizeCompanyName(rawCompanyName);
+  const derivedTenantId = deriveTenantId(cleanSlug);
 
-  let passwordHash: string | undefined;
-  if (body.password && typeof body.password === "string") {
+  // Concurrency lock: prevent race condition on simultaneous registration attempts
+  const lockKey = `${derivedTenantId}#${normalizedName}`;
+  if (inFlightRegistrations.has(lockKey) || inFlightRegistrations.has(derivedTenantId)) {
+    return res.status(409).json({
+      success: false,
+      error: `Conflict: Workspace for '${rawCompanyName}' is currently being provisioned.`,
+    });
+  }
+  inFlightRegistrations.add(lockKey);
+  inFlightRegistrations.add(derivedTenantId);
+
+  try {
+    const db = readDB();
+
+    // 1. Idempotency Check: replay response if duplicate idempotency key is provided
+    const idempotencyKey = (req.headers["idempotency-key"] as string) || body.idempotencyKey;
+    if (idempotencyKey) {
+      const existingByIdempotency = db.registrations.find(
+        (r: any) => r.idempotencyKey === idempotencyKey
+      );
+      if (existingByIdempotency) {
+        const activeTenantId = existingByIdempotency.tenantId || derivedTenantId;
+        const adminEmail = existingByIdempotency.adminEmail || existingByIdempotency.companyEmail;
+        const adminName = existingByIdempotency.adminName || existingByIdempotency.companyName;
+        const token = tokenService.issueToken({
+          sub: existingByIdempotency.id,
+          email: adminEmail,
+          name: adminName,
+          role: "company",
+          tenantId: activeTenantId,
+        });
+
+        return res.status(200).json({
+          success: true,
+          registration: redactRegistrationCredentials(existingByIdempotency),
+          token,
+          user: {
+            id: existingByIdempotency.id,
+            name: adminName,
+            email: adminEmail,
+            role: "company",
+            tenantId: activeTenantId,
+            companyName: existingByIdempotency.companyName,
+          },
+          nextAction: "WORKSPACE_DASHBOARD",
+          message: "Idempotent registration replay",
+        });
+      }
+    }
+
+    // 2. Duplicate Registration / Tenant Collision Check
+    const duplicate = db.registrations.find((r: any) => {
+      const rNameNorm = normalizeCompanyName(r.companyName || r.name || "");
+      const rSlug = r.companySlug || normalizeCompanySlug(r.companyName || "");
+      const rEmail = (r.companyEmail || r.email || r.adminEmail || "").toLowerCase();
+      const rTenantId = r.tenantId;
+
+      return (
+        rNameNorm === normalizedName ||
+        rSlug === cleanSlug ||
+        (rTenantId && rTenantId === derivedTenantId) ||
+        (rEmail && rEmail === rawEmail.toLowerCase())
+      );
+    });
+
+    if (duplicate) {
+      const isPending = (duplicate.status || "").toLowerCase() === "pending";
+      const statusMsg = isPending ? "A pending registration" : "A workspace";
+      return res.status(409).json({
+        success: false,
+        error: `Conflict: ${statusMsg} for '${rawCompanyName}' already exists.`,
+        details: { existingTenantId: duplicate.tenantId, status: duplicate.status },
+      });
+    }
+
+    // Also verify inMemoryTenants / DynamoDB
+    if (inMemoryTenants.has(derivedTenantId)) {
+      return res.status(409).json({
+        success: false,
+        error: `Conflict: Tenant with ID '${derivedTenantId}' already exists.`,
+      });
+    }
+
+    const dateStr = new Date().toISOString().split("T")[0];
+    const nowIso = new Date().toISOString();
+
+    // Password hashing (never stored or returned in plaintext)
+    let passwordHash: string | undefined;
+    const rawPassword = body.password || "TempPass#2026!";
     try {
-      passwordHash = await hashPassword(body.password);
+      passwordHash = await hashPassword(rawPassword);
     } catch {
       passwordHash = undefined;
     }
+
+    // 3. Manual review opt-in (for enterprise manual compliance or explicit tests)
+    if (body.requireApproval === true) {
+      const pendingReg = normalizeRegistration({
+        id: `reg-${Date.now()}`,
+        companyName: rawCompanyName,
+        name: rawCompanyName,
+        companySlug: cleanSlug,
+        businessRegNumber: body.businessRegNumber || "BR-PENDING",
+        companyEmail: rawEmail,
+        email: rawEmail,
+        adminName: body.adminName || "Admin",
+        adminEmail: body.adminEmail || rawEmail,
+        adminPhone: body.adminPhone || body.phone || "-",
+        phone: body.phone || body.adminPhone || "-",
+        website: body.website || "-",
+        industry: body.industry || body.companyType || "Technology",
+        companyType: body.companyType || body.industry || "Technology",
+        country: body.country || "Sri Lanka",
+        city: body.city || "",
+        address: body.address || "",
+        employeeCount: body.employeeCount || "",
+        about: body.about || "",
+        ...(passwordHash ? { passwordHash } : {}),
+        status: "Pending",
+        provisioningStatus: "PENDING",
+        submissionDate: dateStr,
+        date: dateStr,
+        requestedDate: dateStr,
+        tier: body.tier || "Standard",
+        allocatedAgents: body.allocatedAgents || 5,
+        channels: body.channels || ["Web"],
+        idempotencyKey,
+      });
+
+      db.registrations.push(pendingReg);
+      writeDB(db);
+
+      return res.status(201).json({
+        success: true,
+        registration: redactRegistrationCredentials(pendingReg),
+        message: "Registration submitted for administrator review.",
+      });
+    }
+
+    // 4. Automatic Onboarding: Provision tenant resources immediately
+    try {
+      const onboardResult = await registerTenant({
+        companyName: rawCompanyName,
+        companySlug: cleanSlug,
+        adminEmail: rawEmail,
+        planTier: body.tier?.toLowerCase() === "enterprise" ? "enterprise" : "starter",
+        themeColor: body.themeColor,
+        allowedOrigins: body.allowedOrigins,
+        password: body.password,
+      });
+
+      const tenantId = onboardResult.tenantId;
+
+      const newReg = normalizeRegistration({
+        id: `reg-${Date.now()}`,
+        companyName: rawCompanyName,
+        name: rawCompanyName,
+        companySlug: cleanSlug,
+        tenantId,
+        businessRegNumber: body.businessRegNumber || "BR-ACTIVE",
+        companyEmail: rawEmail,
+        email: rawEmail,
+        adminName: body.adminName || "Admin",
+        adminEmail: body.adminEmail || rawEmail,
+        adminPhone: body.adminPhone || body.phone || "-",
+        phone: body.phone || body.adminPhone || "-",
+        website: body.website || "-",
+        industry: body.industry || body.companyType || "Technology",
+        companyType: body.companyType || body.industry || "Technology",
+        country: body.country || "Sri Lanka",
+        city: body.city || "",
+        address: body.address || "",
+        employeeCount: body.employeeCount || "",
+        about: body.about || "",
+        ...(passwordHash ? { passwordHash } : {}),
+        status: "Active",
+        provisioningStatus: "ACTIVE",
+        onboardedAt: nowIso,
+        submissionDate: dateStr,
+        date: dateStr,
+        requestedDate: dateStr,
+        tier: body.tier || "Standard",
+        allocatedAgents: body.allocatedAgents || 5,
+        channels: body.channels || ["Web"],
+        idempotencyKey,
+      });
+
+      db.registrations.push(newReg);
+      writeDB(db);
+
+      // Issue local session token for immediate workspace access
+      const token = tokenService.issueToken({
+        sub: newReg.id,
+        email: newReg.adminEmail,
+        name: newReg.adminName,
+        role: "company",
+        tenantId,
+      });
+
+      const user = {
+        id: newReg.id,
+        name: newReg.adminName,
+        email: newReg.adminEmail,
+        role: "company" as const,
+        tenantId,
+        companyName: newReg.companyName,
+      };
+
+      return res.status(201).json({
+        success: true,
+        registration: redactRegistrationCredentials(newReg),
+        token,
+        user,
+        nextAction: "WORKSPACE_DASHBOARD",
+      });
+    } catch (onboardErr: any) {
+      console.error(`❌ [Auto-Provisioning Failed] ${onboardErr.message}`);
+      const isConflict = onboardErr.message?.includes("already exists") || onboardErr.message?.includes("Conflict");
+      if (isConflict) {
+        return res.status(409).json({ success: false, error: onboardErr.message });
+      }
+      if (onboardErr.message?.includes("Validation Failed")) {
+        return res.status(400).json({ success: false, error: onboardErr.message });
+      }
+      return res.status(502).json({
+        success: false,
+        error: `Failed to provision tenant resources: ${onboardErr.message}`,
+      });
+    }
+  } finally {
+    inFlightRegistrations.delete(lockKey);
+    inFlightRegistrations.delete(derivedTenantId);
   }
-
-  const newReg = normalizeRegistration({
-    id: `reg-${Date.now()}`,
-    companyName: rawCompanyName,
-    name: rawCompanyName,
-    companySlug: cleanSlug,
-    businessRegNumber: body.businessRegNumber || "BR-PENDING",
-    companyEmail: body.companyEmail || body.email || "",
-    email: body.companyEmail || body.email || body.adminEmail || "",
-    adminName: body.adminName || "Admin",
-    adminEmail: body.adminEmail || body.companyEmail || body.email || "",
-    adminPhone: body.adminPhone || body.phone || "-",
-    phone: body.phone || body.adminPhone || "-",
-    website: body.website || "-",
-    industry: body.industry || body.companyType || "Technology",
-    companyType: body.companyType || body.industry || "Technology",
-    country: body.country || "Sri Lanka",
-    city: body.city || "",
-    address: body.address || "",
-    employeeCount: body.employeeCount || "",
-    about: body.about || "",
-    password: body.password || "company123",
-    ...(passwordHash ? { passwordHash } : {}),
-    status: "Pending",
-    submissionDate: dateStr,
-    date: dateStr,
-    requestedDate: dateStr,
-    tier: body.tier || "Standard",
-    allocatedAgents: body.allocatedAgents || 5,
-    channels: body.channels || ["Web"],
-  });
-
-  db.registrations.push(newReg);
-  writeDB(db);
-
-  res.status(201).json({ success: true, registration: redactRegistrationCredentials(newReg) });
 });
 
-// Handler for approving or rejecting registration
+// Handler for approving, suspending, or rejecting registration
 const handleUpdateRegistrationStatus = async (req: express.Request, res: express.Response) => {
   const { id } = req.params;
   const rawStatus = (req.body.status || "").toLowerCase();
@@ -495,10 +712,20 @@ const handleUpdateRegistrationStatus = async (req: express.Request, res: express
   }
 
   const reg = db.registrations[regIndex];
-  const normalizedStatus = rawStatus === "approved" ? "Approved" : rawStatus === "rejected" ? "Rejected" : req.body.status || "Approved";
+  const normalizedStatus =
+    rawStatus === "approved" || rawStatus === "active"
+      ? "Approved"
+      : rawStatus === "rejected"
+      ? "Rejected"
+      : rawStatus === "suspended"
+      ? "Suspended"
+      : req.body.status || "Approved";
 
-  // Enforce idempotency: re-approving an already Approved registration must return 409 Conflict
-  if (normalizedStatus === "Approved" && reg.status === "Approved") {
+  // Enforce idempotency: re-approving an already Approved / Active registration must return 409 Conflict
+  if (
+    (normalizedStatus === "Approved" || normalizedStatus === "Active") &&
+    (reg.status === "Approved" || reg.status === "Active")
+  ) {
     return res.status(409).json({
       success: false,
       error: "Registration has already been approved",
@@ -506,8 +733,22 @@ const handleUpdateRegistrationStatus = async (req: express.Request, res: express
     });
   }
 
+  // Suspend tenant
+  if (normalizedStatus === "Suspended") {
+    reg.status = "Suspended";
+    reg.provisioningStatus = "SUSPENDED";
+    if (reg.tenantId && inMemoryTenants.has(reg.tenantId)) {
+      const existing = inMemoryTenants.get(reg.tenantId)!;
+      existing.status = "suspended";
+      inMemoryTenants.set(reg.tenantId, existing);
+    }
+    db.registrations[regIndex] = normalizeRegistration(reg);
+    writeDB(db);
+    return res.json({ success: true, registration: redactRegistrationCredentials(db.registrations[regIndex]) });
+  }
+
   // Auto-Provision Tenant Partition when Approved
-  if (normalizedStatus === "Approved") {
+  if (normalizedStatus === "Approved" || normalizedStatus === "Active") {
     if (!reg.tenantId) {
       try {
         const onboardResult = await registerTenant({
@@ -519,10 +760,10 @@ const handleUpdateRegistrationStatus = async (req: express.Request, res: express
         reg.tenantId = onboardResult.tenantId;
         reg.onboardedAt = new Date().toISOString();
         reg.status = "Approved";
+        reg.provisioningStatus = "ACTIVE";
         console.log(`✅ [Auto-Provisioning] Successfully provisioned tenant '${reg.tenantId}' for ${reg.companyName}`);
       } catch (onboardErr: any) {
         console.error(`❌ [Auto-Provisioning Failed] ${onboardErr.message}`);
-        // Fail closed: retain Pending status, do not issue fake tenantId
         return res.status(502).json({
           success: false,
           error: `Failed to provision tenant resources: ${onboardErr.message}`,
@@ -530,9 +771,16 @@ const handleUpdateRegistrationStatus = async (req: express.Request, res: express
       }
     } else {
       reg.status = "Approved";
+      reg.provisioningStatus = "ACTIVE";
+      if (inMemoryTenants.has(reg.tenantId)) {
+        const existing = inMemoryTenants.get(reg.tenantId)!;
+        existing.status = "active";
+        inMemoryTenants.set(reg.tenantId, existing);
+      }
     }
   } else {
     reg.status = normalizedStatus;
+    reg.provisioningStatus = normalizedStatus.toUpperCase() as any;
   }
 
   db.registrations[regIndex] = normalizeRegistration(reg);
@@ -540,7 +788,7 @@ const handleUpdateRegistrationStatus = async (req: express.Request, res: express
   return res.json({ success: true, registration: redactRegistrationCredentials(db.registrations[regIndex]) });
 };
 
-// PATCH /api/registrations/:id (Super Admin Approves / Rejects)
+// PATCH /api/registrations/:id (Super Admin Approves / Rejects / Suspends)
 app.patch("/api/registrations/:id", ...requireSuperAdmin, handleUpdateRegistrationStatus);
 
 // PUT /api/registrations/:id
@@ -549,10 +797,36 @@ app.put("/api/registrations/:id", ...requireSuperAdmin, handleUpdateRegistration
 // PUT /api/registrations/:id/status (Backwards compatibility)
 app.put("/api/registrations/:id/status", ...requireSuperAdmin, handleUpdateRegistrationStatus);
 
+// DELETE /api/registrations/:id (Super Admin deletes company workspace registration)
+app.delete("/api/registrations/:id", ...requireSuperAdmin, (req, res) => {
+  const { id } = req.params;
+  const idLower = String(id).toLowerCase();
+  const db = readDB();
+
+  const beforeLen = db.registrations.length;
+  db.registrations = db.registrations.filter((r: any) => {
+    const rId = String(r.id || "").toLowerCase();
+    const rSlug = String(r.companySlug || "").toLowerCase();
+    const rTenant = String(r.tenantId || "").toLowerCase();
+    const rEmail = String(r.companyEmail || r.email || r.adminEmail || "").toLowerCase();
+    return rId !== idLower && rSlug !== idLower && rTenant !== idLower && rEmail !== idLower;
+  });
+
+  if (db.registrations.length === beforeLen) {
+    return res.status(404).json({ success: false, error: "Registration not found" });
+  }
+
+  writeDB(db);
+  return res.json({ success: true, message: "Registration deleted successfully" });
+});
+
 // GET /api/stats (Admin Console Dashboard Stats)
 app.get("/api/stats", requireAuth, (req, res) => {
   const db = readDB();
-  const activeCount = db.registrations.filter((r: any) => (r.status || "").toLowerCase() === "approved").length;
+  const activeCount = db.registrations.filter((r: any) => {
+    const st = (r.status || "").toLowerCase();
+    return st === "approved" || st === "active";
+  }).length;
   const pendingCount = db.registrations.filter((r: any) => (r.status || "").toLowerCase() === "pending").length;
 
   res.json({

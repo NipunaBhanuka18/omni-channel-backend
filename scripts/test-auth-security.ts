@@ -368,6 +368,7 @@ async function runSecurityTests() {
       body: {
         companyName: "Secured Test Corp",
         companyEmail: "test@securedcorp.com",
+        requireApproval: true,
       },
     });
     const testRegId = newReg.data.registration?.id;
@@ -429,6 +430,7 @@ async function runSecurityTests() {
       body: {
         companyName: "Rejected Inbound Corp",
         companyEmail: "reject@test.com",
+        requireApproval: true,
       },
     });
     const rejectId = rejectTargetReg.data.registration?.id;

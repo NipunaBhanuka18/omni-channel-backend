@@ -550,3 +550,68 @@ Two independently-built "tenant prefix" conventions in the same bucket is exactl
 ### Verification
 
 `scripts/test-onboarding.ts` updated to assert the new `tenants/acme-corp/.kb-prefix` key and `tenants/acme-corp/` prefix; still 24/24 passing. `tsc --noEmit` clean (excluding the 4 pre-existing unrelated errors in Member 3/4's `create-handoff-resources.ts`, `test-fetch-kb-doc.ts`, `test-member4-ai-engine.ts`, `test-ui-api-server.ts`, which predate this change and are outside this scope).
+
+---
+
+## ADR-018: Automatic Company Workspace Onboarding & Tenant Provisioning (Supervisor Directive)
+
+- **Status**: Accepted
+- **Date**: 2026-11-11
+- **Scope**: `server.ts`, `services/onboarding/register-tenant.ts`, `shared/types/onboarding.ts`, `shared/utils/tenant-name.ts`, `scripts/test-automatic-onboarding.ts`
+- **Source**: Project owner's authoritative report of supervisor Tharusha's steering meeting direction.
+
+### Context
+
+Prior to this decision (Tasks 06–09), new company workspace registrations entered a mandatory manual review state (`status: "Pending"`). A platform Super Admin was required to review and approve each application via `PATCH /api/registrations/:id` before tenant infrastructure was provisioned or the company administrator was permitted to log in.
+
+Supervisor Tharusha instructed the team that ordinary companies must no longer wait for manual Super Admin approval. The target platform onboarding pipeline requires:
+`Company Registration -> Automated Validation -> Secure Identity/Account Setup -> Tenant Provisioning -> Active Workspace -> Company Admin Dashboard`.
+
+### Decision
+
+1. **Autonomous Provisioning Pipeline**:
+   - `POST /api/registrations` now executes automatic tenant provisioning immediately upon validating company inputs.
+   - Automatically derives normalized tenant slug (`deriveTenantId(cleanSlug)` -> `tenant-{slug}`).
+   - Rejects reserved slugs (`slt`, `admin`, `system`, `api`, `platform`, `root`, `superadmin`).
+   - Rejects duplicate company names (case & whitespace normalized) and existing tenant slugs with `409 Conflict`.
+   - Provisions DynamoDB records in `omni-channel-tenants` and `omni-channel-agents` (default support specialist).
+   - Provisions S3 knowledge-base prefix (`tenants/{tenantId}/welcome.txt` and `.kb-prefix`).
+   - Hashes administrator passwords using `scrypt-v2` with cryptographically random salts. Plaintext passwords and hashes are never returned in responses.
+   - Activates the tenant partition immediately with `status: "Active"` and `provisioningStatus: "ACTIVE"`.
+   - Returns HTTP `201 Created` with tenant metadata, company admin profile, and initial local session token so the frontend can redirect the administrator directly to their workspace dashboard.
+
+2. **Concurrency & Idempotency Safeguards**:
+   - In-memory concurrency locks (`inFlightRegistrations`) ensure simultaneous registration attempts on identical slugs produce exactly one `201 Created` and one `409 Conflict`.
+   - Idempotency keys (`idempotency-key` header) replay previously provisioned workspace responses without duplicating resources.
+   - Bounded sliding-window rate limiting (`registrationLimiter`) prevents unauthenticated flood attacks.
+
+3. **Super Admin Operational Role Retained**:
+   - Super Admin manual approval is removed from the critical onboarding path for ordinary companies.
+   - Administrative endpoints (`GET /api/registrations`, `PATCH /api/registrations/:id`, `DELETE /api/registrations/:id`) are retained for operational governance: suspending rogue tenants (`status: "Suspended"`), reactivating accounts (`status: "Active"`), rejecting spam, and reviewing enterprise manual compliance applications (`requireApproval: true`).
+   - Historical pending registrations in `db.json` remain untouched and are not silently auto-activated.
+
+4. **Lifecycle States Defined**:
+   - `REGISTERING`: Initial receipt, rate-check, and syntactic validation.
+   - `PROVISIONING`: Resource partitioning across DynamoDB, S3, and identity stores.
+   - `ACTIVE`: Fully provisioned, tenant active, admin account authenticated.
+   - `SUSPENDED`: Administratively halted by Super Admin; access blocked.
+   - `FAILED`: Provisioning failed; partial writes rolled back; fails closed.
+   - `PENDING`: Historical or enterprise manual review registrations.
+
+5. **Local vs AWS Behavior**:
+   - Local: Synchronous in-process orchestration using mock AWS clients or LocalStack with fallback to in-memory tables.
+   - AWS: Step Functions state machine (`infra/step-functions/tenant-onboarding.asl.json`) invokes Lambda tasks with Cognito AdminCreateUser and DynamoDB conditional puts.
+
+### Frontend Contract Impact
+
+- `POST /api/registrations` returns `{ success: true, registration, token, user, nextAction: "WORKSPACE_DASHBOARD" }`.
+- Modern frontend (`Register.tsx`) checks `if (data.token && data.user) { login(data.user, data.token); navigate('/dashboard'); }`, entering the dashboard immediately without landing on `/register-success`.
+- `POST /api/auth/login` permits company admins to log in once `status === "Active" || status === "Approved"`.
+
+### Verification
+
+- Comprehensive test suite `scripts/test-automatic-onboarding.ts` verifying all 18 requirements: 30/30 passed.
+- Full 12-suite regression harness (`npm test`): 152/152 assertions passed across all 12 suites, executed twice consecutively with exit code 0.
+- `terraform -chdir=infra validate` clean.
+- Real `db.json` unmutated (`git diff db.json` empty).
+
