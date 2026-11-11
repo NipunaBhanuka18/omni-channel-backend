@@ -1,5 +1,6 @@
 import { GetCommand, DynamoDBDocumentClient } from "@aws-sdk/lib-dynamodb";
 import { docClient } from "../../agents/utils/dynamo-client";
+import { inMemoryTenants } from "../../scripts/create-tenants-table";
 import { TenantContext } from "../../shared/types/tenant-context";
 import { AgentActionResponse } from "../../shared/types/agent-action";
 
@@ -50,17 +51,34 @@ export async function routeRequest(
       new GetCommand({ TableName: "omni-channel-tenants", Key: { tenantId: context.tenantId } })
     );
     tenantConfig = result.Item as TenantConfig | undefined;
-  } catch (err) {
-    console.error(`[TenantRouter] DynamoDB lookup failed for tenant '${context.tenantId}':`, err);
-    return {
-      success: false,
-      error: {
-        code: "INTERNAL_ERROR",
-        message: `Failed to look up tenant configuration: ${(err as Error).message}`,
-        retryable: true,
-        details: { tenantId: context.tenantId },
-      },
-    };
+  } catch (err: any) {
+    // If running in local standalone mode without LocalStack, fall back to in-memory store
+    if (!deps && (err?.code === "ECONNREFUSED" || err?.message?.includes("ECONNREFUSED") || err?.message?.includes("connect"))) {
+      console.warn(`[TenantRouter] LocalStack offline. Using in-memory store fallback for tenant '${context.tenantId}'.`);
+      const fallback = inMemoryTenants.get(context.tenantId);
+      if (fallback) {
+        tenantConfig = {
+          tenantId: fallback.tenantId,
+          name: fallback.companyName || (fallback as any).name || context.tenantId,
+          status: (fallback.status as any) || "active",
+          allowedChannels: ["web", "whatsapp", "sms", "messenger"],
+          defaultAgent: (fallback as any).defaultAgent || "main-agent",
+        };
+      }
+    }
+
+    if (!tenantConfig) {
+      console.error(`[TenantRouter] DynamoDB lookup failed for tenant '${context.tenantId}':`, err);
+      return {
+        success: false,
+        error: {
+          code: "INTERNAL_ERROR",
+          message: `Failed to look up tenant configuration: ${(err as Error).message}`,
+          retryable: true,
+          details: { tenantId: context.tenantId },
+        },
+      };
+    }
   }
 
   if (!tenantConfig) {
