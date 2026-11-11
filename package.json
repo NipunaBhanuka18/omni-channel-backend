@@ -20,7 +20,8 @@
     "test:member4": "tsx ./scripts/test-member4-ai-engine.ts",
     "test:security": "tsx ./scripts/test-auth-security.ts",
     "test:hardening": "tsx ./scripts/test-endpoint-hardening.ts",
-    "test:automatic-onboarding": "tsx ./scripts/test-automatic-onboarding.ts"
+    "test:automatic-onboarding": "tsx ./scripts/test-automatic-onboarding.ts",
+    "test:e2e": "tsx ./scripts/e2e-live-fullstack.ts"
   },
   "repository": {
     "type": "git",

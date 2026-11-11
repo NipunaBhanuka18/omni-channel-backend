@@ -615,3 +615,57 @@ Supervisor Tharusha instructed the team that ordinary companies must no longer w
 - `terraform -chdir=infra validate` clean.
 - Real `db.json` unmutated (`git diff db.json` empty).
 
+---
+
+## ADR-019: Public Idempotency Replay Protection, Production Fallback Boundaries, Non-Destructive Workspace Suspension Lifecycle, and Full-Stack Contract Alignment
+
+- **Status**: Accepted
+- **Date**: 2026-11-11
+- **Scope**: `server.ts`, `services/onboarding/register-tenant.ts`, `omni-agent-ui` React integration, `scripts/test-automatic-onboarding.ts`, `scripts/e2e-live-fullstack.ts`
+
+### Context
+
+Following the implementation of automatic company workspace onboarding in Task 10, several critical multi-tenant SaaS security vulnerabilities and frontend contract mismatches required resolution before full-stack validation:
+
+1. **Public Idempotency Key Replay Vulnerability**:
+   The previous `idempotency-key` handling re-minted a live session bearer token and returned the company administrator profile to any caller presenting the same key. This created a high-severity privilege escalation risk where an unauthenticated attacker or adversary could hijack an existing company's active session by reusing or guessing an idempotency key.
+2. **Implicit Production Fallbacks**:
+   `services/onboarding/register-tenant.ts` previously caught cloud errors from DynamoDB and S3 and fell back to in-memory mock structures without failing closed when running in production mode (`NODE_ENV === "production"`).
+3. **Destructive Workspace Deletion**:
+   `DELETE /api/registrations/:id` previously purged registration records from `db.json` but left DynamoDB tables, in-memory caches, and S3 knowledge base prefixes active, creating orphaned cloud partitions and destroying audit trails.
+4. **Hardcoded Frontend Endpoints**:
+   Multiple frontend views (`Register.tsx`, `OrganizationManagement.tsx`, `Agents.tsx`, `Notifications.tsx`, `Channels.tsx`, `ToolsManagement.tsx`, `HostedChatWidget.tsx`) hardcoded `http://localhost:3001` instead of consuming `ENV.API_BASE_URL`.
+
+### Decision
+
+1. **Idempotency Fingerprint Binding & Token Stripping (Stage 2.A)**:
+   - Every registration with an `idempotency-key` computes a SHA-256 request payload fingerprint: `crypto.createHash("sha256").update(`${cleanSlug}#${rawEmail}#${rawCompanyName}`).digest("hex")`.
+   - The key, fingerprint, and a 24-hour expiration timestamp (`idempotencyExpiresAt`) are persisted.
+   - An adversarial request presenting an existing key with a different payload is rejected with `409 Conflict` (idempotency key collision).
+   - An unauthenticated replay presenting an identical key and fingerprint returns `200 OK` with sanitized registration metadata, but **never** mints or returns a bearer token. It sets `nextAction: "LOGIN_REQUIRED"`, requiring credential authentication via `/api/auth/login`.
+2. **Production Fail-Closed Boundaries (Stage 2.B & 2.C)**:
+   - When `NODE_ENV === "production"` or `ALLOW_MOCK_AWS !== "true"`, `register-tenant.ts` disallows in-memory fallback. If DynamoDB or S3 operations fail, provisioning fails closed with HTTP 502 without modifying state.
+   - Cross-process uniqueness is guaranteed on DynamoDB via `ConditionExpression: "attribute_not_exists(tenantId)"`.
+   - Production error messages are sanitized to prevent cloud configuration leakage.
+3. **Production-Facing Activation Boundary (Stage 2.D)**:
+   - When `REQUIRE_EMAIL_VERIFICATION === "true"` or `NODE_ENV === "production"`, newly provisioned workspaces enter `provisioningStatus: "AWAITING_VERIFICATION"` and return `nextAction: "EMAIL_VERIFICATION_REQUIRED"`. Active session tokens are not minted prior to identity confirmation.
+   - Local development mode (`NODE_ENV !== "production"` and `ALLOW_MOCK_AUTH === "true"`) maintains immediate token issuance for seamless local DX.
+4. **Non-Destructive Workspace Suspension Lifecycle (Stage 2.E)**:
+   - `DELETE /api/registrations/:id` transitions workspaces to `status: "Suspended"` and `provisioningStatus: "SUSPENDED"`.
+   - Synchronizes `inMemoryTenants` and DynamoDB tenant status to `"suspended"`.
+   - Preserves all cloud partitions, S3 documents, and audit metadata.
+   - Blocks subsequent authentication attempts via `POST /api/auth/login` with `403 Forbidden`.
+5. **Full-Stack React Contract Alignment (Stage 3 & 4)**:
+   - All frontend components updated to utilize `ENV.API_BASE_URL`.
+   - `Register.tsx` dynamically responds to `token`, `LOGIN_REQUIRED`, and `EMAIL_VERIFICATION_REQUIRED`.
+   - Super Admin Organization Management safely excludes suspended workspaces from active tabs.
+   - Executed live full-stack E2E suite (`scripts/e2e-live-fullstack.ts`) verifying live backend (port 3001) and frontend (port 5173).
+
+### Verification
+
+- Backend regression harness: 155/155 assertions passed across 12 suites, twice consecutively (exit code 0).
+- Frontend production build: Vite production bundle built in 603ms with 0 errors.
+- Frontend typecheck: `npx tsc --noEmit` exited with code 0.
+- Live full-stack E2E suite: 23/23 assertions passed live over real HTTP (exit code 0).
+- Immutability check: `git diff db.json` is completely clean.
+

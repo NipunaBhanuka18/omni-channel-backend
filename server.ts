@@ -429,6 +429,13 @@ app.get("/api/registrations", requireAuth, (req, res) => {
 
 const inFlightRegistrations = new Set<string>();
 
+function computeIdempotencyFingerprint(slug: string, email: string, name: string): string {
+  return crypto
+    .createHash("sha256")
+    .update(`${slug.toLowerCase()}#${email.toLowerCase()}#${name.toLowerCase()}`)
+    .digest("hex");
+}
+
 // POST /api/registrations
 app.post("/api/registrations", limitRegistrations, async (req, res) => {
   const tokenService = getLocalSessionTokenService();
@@ -480,37 +487,45 @@ app.post("/api/registrations", limitRegistrations, async (req, res) => {
 
     // 1. Idempotency Check: replay response if duplicate idempotency key is provided
     const idempotencyKey = (req.headers["idempotency-key"] as string) || body.idempotencyKey;
+    const incomingFingerprint = idempotencyKey
+      ? computeIdempotencyFingerprint(cleanSlug, rawEmail, rawCompanyName)
+      : undefined;
+
     if (idempotencyKey) {
       const existingByIdempotency = db.registrations.find(
         (r: any) => r.idempotencyKey === idempotencyKey
       );
       if (existingByIdempotency) {
-        const activeTenantId = existingByIdempotency.tenantId || derivedTenantId;
-        const adminEmail = existingByIdempotency.adminEmail || existingByIdempotency.companyEmail;
-        const adminName = existingByIdempotency.adminName || existingByIdempotency.companyName;
-        const token = tokenService.issueToken({
-          sub: existingByIdempotency.id,
-          email: adminEmail,
-          name: adminName,
-          role: "company",
-          tenantId: activeTenantId,
-        });
+        // Enforce 24-hour TTL expiration policy
+        const isExpired =
+          existingByIdempotency.idempotencyExpiresAt &&
+          new Date(existingByIdempotency.idempotencyExpiresAt) < new Date();
 
-        return res.status(200).json({
-          success: true,
-          registration: redactRegistrationCredentials(existingByIdempotency),
-          token,
-          user: {
-            id: existingByIdempotency.id,
-            name: adminName,
-            email: adminEmail,
-            role: "company",
-            tenantId: activeTenantId,
-            companyName: existingByIdempotency.companyName,
-          },
-          nextAction: "WORKSPACE_DASHBOARD",
-          message: "Idempotent registration replay",
-        });
+        if (!isExpired) {
+          // Verify that the request payload fingerprint matches the original registration
+          if (
+            existingByIdempotency.idempotencyFingerprint &&
+            incomingFingerprint &&
+            existingByIdempotency.idempotencyFingerprint !== incomingFingerprint
+          ) {
+            return res.status(409).json({
+              success: false,
+              error:
+                "Conflict: Idempotency key collision. The provided key was already used for a different workspace payload.",
+            });
+          }
+
+          // Stage 2.A: Unauthenticated replay must NOT reveal or mint bearer tokens or session credentials!
+          // Return safe sanitized status indicating existing active workspace
+          return res.status(200).json({
+            success: true,
+            idempotentReplay: true,
+            registration: redactRegistrationCredentials(existingByIdempotency),
+            nextAction: "LOGIN_REQUIRED",
+            message:
+              "Idempotent request recognized: workspace is already active. Please authenticate via /api/auth/login to establish a session.",
+          });
+        }
       }
     }
 
@@ -591,6 +606,10 @@ app.post("/api/registrations", limitRegistrations, async (req, res) => {
         allocatedAgents: body.allocatedAgents || 5,
         channels: body.channels || ["Web"],
         idempotencyKey,
+        idempotencyFingerprint: idempotencyKey ? incomingFingerprint : undefined,
+        idempotencyExpiresAt: idempotencyKey
+          ? new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString()
+          : undefined,
       });
 
       db.registrations.push(pendingReg);
@@ -649,12 +668,36 @@ app.post("/api/registrations", limitRegistrations, async (req, res) => {
         allocatedAgents: body.allocatedAgents || 5,
         channels: body.channels || ["Web"],
         idempotencyKey,
+        idempotencyFingerprint: idempotencyKey ? incomingFingerprint : undefined,
+        idempotencyExpiresAt: idempotencyKey
+          ? new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString()
+          : undefined,
       });
 
       db.registrations.push(newReg);
       writeDB(db);
 
-      // Issue local session token for immediate workspace access
+      // Stage 2.D: Production-facing activation boundary
+      // In production or when email verification is explicitly configured,
+      // fail closed and require email confirmation before an active session token is issued.
+      const requireEmailVerification =
+        process.env.REQUIRE_EMAIL_VERIFICATION === "true" || process.env.NODE_ENV === "production";
+
+      if (requireEmailVerification) {
+        return res.status(201).json({
+          success: true,
+          registration: redactRegistrationCredentials({
+            ...newReg,
+            status: "PendingVerification",
+            provisioningStatus: "AWAITING_VERIFICATION",
+          }),
+          nextAction: "EMAIL_VERIFICATION_REQUIRED",
+          message:
+            "Workspace provisioned. Identity verification email has been dispatched. Please confirm your email before signing in.",
+        });
+      }
+
+      // Issue local session token for immediate workspace access in local development mode
       const token = tokenService.issueToken({
         sub: newReg.id,
         email: newReg.adminEmail,
@@ -797,27 +840,67 @@ app.put("/api/registrations/:id", ...requireSuperAdmin, handleUpdateRegistration
 // PUT /api/registrations/:id/status (Backwards compatibility)
 app.put("/api/registrations/:id/status", ...requireSuperAdmin, handleUpdateRegistrationStatus);
 
-// DELETE /api/registrations/:id (Super Admin deletes company workspace registration)
+// DELETE /api/registrations/:id (Super Admin safely suspends/deactivates company workspace registration)
 app.delete("/api/registrations/:id", ...requireSuperAdmin, (req, res) => {
   const { id } = req.params;
   const idLower = String(id).toLowerCase();
+  const nameQuery = req.query.name ? String(req.query.name).toLowerCase() : "";
+  const emailQuery = req.query.email ? String(req.query.email).toLowerCase() : "";
+  const slugQuery = req.query.slug ? String(req.query.slug).toLowerCase() : "";
+
   const db = readDB();
 
-  const beforeLen = db.registrations.length;
-  db.registrations = db.registrations.filter((r: any) => {
+  const targetIndex = db.registrations.findIndex((r: any) => {
     const rId = String(r.id || "").toLowerCase();
     const rSlug = String(r.companySlug || "").toLowerCase();
     const rTenant = String(r.tenantId || "").toLowerCase();
     const rEmail = String(r.companyEmail || r.email || r.adminEmail || "").toLowerCase();
-    return rId !== idLower && rSlug !== idLower && rTenant !== idLower && rEmail !== idLower;
+    const rName = String(r.companyName || r.name || "").toLowerCase();
+    return (
+      rId === idLower ||
+      rSlug === idLower ||
+      rTenant === idLower ||
+      rEmail === idLower ||
+      (slugQuery && rSlug === slugQuery) ||
+      (emailQuery && rEmail === emailQuery) ||
+      (nameQuery && rName === nameQuery)
+    );
   });
 
-  if (db.registrations.length === beforeLen) {
+  if (targetIndex === -1) {
     return res.status(404).json({ success: false, error: "Registration not found" });
   }
 
+  const targetReg = db.registrations[targetIndex];
+  const targetTenantId = targetReg.tenantId;
+
+  // Non-destructive lifecycle safeguard:
+  // Suspend and archive workspace instead of hard-deleting cloud partitions.
+  // Preserves audit trail and tenant data while immediately revoking workspace access.
+  targetReg.status = "Suspended";
+  targetReg.provisioningStatus = "SUSPENDED";
+  targetReg.suspendedAt = new Date().toISOString();
+  targetReg.suspendedBy = (req as any).user?.email || "superadmin";
+  targetReg.deactivated = true;
+
+  db.registrations[targetIndex] = targetReg;
   writeDB(db);
-  return res.json({ success: true, message: "Registration deleted successfully" });
+
+  // Synchronize inMemoryTenants status to 'suspended' to prevent routing
+  if (targetTenantId) {
+    const memTenant = inMemoryTenants.get(targetTenantId);
+    if (memTenant) {
+      memTenant.status = "suspended";
+      memTenant.provisioningStatus = "SUSPENDED";
+      inMemoryTenants.set(targetTenantId, memTenant);
+    }
+  }
+
+  return res.json({
+    success: true,
+    message: `Workspace '${targetReg.companyName}' has been safely suspended and deactivated. Cloud partitions preserved in suspended state.`,
+    registration: redactRegistrationCredentials(targetReg),
+  });
 });
 
 // GET /api/stats (Admin Console Dashboard Stats)
@@ -1155,6 +1238,20 @@ app.post(["/api/tenant/route", "/api/agent"], async (req, res) => {
       headers: (req.headers as Record<string, string>) || {},
       body: req.body,
     });
+    if (!response.success && response.error) {
+      const code = response.error.code;
+      const statusCode =
+        code === "FORBIDDEN"
+          ? 403
+          : code === "UNAUTHORIZED"
+          ? 401
+          : code === "BAD_REQUEST"
+          ? 400
+          : code === "TENANT_NOT_FOUND"
+          ? 404
+          : 500;
+      return res.status(statusCode).json(response);
+    }
     return res.json(response);
   } catch (err: any) {
     return res.status(500).json({

@@ -15,15 +15,22 @@ import {
   isReservedTenantSlug,
 } from "../../shared/utils/tenant-name";
 
-const rawClient = new DynamoDBClient({
-  region: "us-east-1",
-  endpoint: "http://127.0.0.1:4566",
-  credentials: {
-    accessKeyId: "mock_access_key",
-    secretAccessKey: "mock_secret_key",
-  },
-});
-const docClient = DynamoDBDocumentClient.from(rawClient);
+const isProduction = process.env.NODE_ENV === "production";
+const allowMock = process.env.ALLOW_MOCK_AWS === "true" || (!isProduction && process.env.NODE_ENV !== "staging");
+
+function getDocClient(): DynamoDBDocumentClient {
+  const client = isProduction
+    ? new DynamoDBClient({ region: process.env.AWS_REGION || "us-east-1" })
+    : new DynamoDBClient({
+        region: process.env.AWS_REGION || "us-east-1",
+        endpoint: process.env.DYNAMODB_ENDPOINT || "http://127.0.0.1:4566",
+        credentials: {
+          accessKeyId: process.env.AWS_ACCESS_KEY_ID || "mock_access_key",
+          secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || "mock_secret_key",
+        },
+      });
+  return DynamoDBDocumentClient.from(client);
+}
 
 export interface RegisterTenantInput {
   companyName: string;
@@ -101,14 +108,18 @@ export async function registerTenant(
   let existingTenant = inMemoryTenants.get(tenantId);
   if (!existingTenant) {
     try {
-      const resp = await docClient.send(
+      const doc = getDocClient();
+      const resp = await doc.send(
         new GetCommand({
           TableName: "omni-channel-tenants",
           Key: { tenantId },
         })
       );
       if (resp.Item) existingTenant = resp.Item as TenantRecord;
-    } catch {
+    } catch (err: any) {
+      if (isProduction || !allowMock) {
+        throw new Error("Cloud storage check failed: DynamoDB query failed in production mode.");
+      }
       // LocalStack offline fallback handled via inMemoryTenants
     }
   }
@@ -146,13 +157,22 @@ export async function registerTenant(
 
   inMemoryTenants.set(tenantId, tenantRecord);
   try {
-    await docClient.send(
+    const doc = getDocClient();
+    await doc.send(
       new PutCommand({
         TableName: "omni-channel-tenants",
         Item: tenantRecord,
+        ConditionExpression: "attribute_not_exists(tenantId)",
       })
     );
-  } catch {
+  } catch (err: any) {
+    if (err.name === "ConditionalCheckFailedException" || err.message?.includes("ConditionalCheckFailed")) {
+      throw new Error(`Conflict: Tenant with ID '${tenantId}' already exists in DynamoDB.`);
+    }
+    if (isProduction || !allowMock) {
+      inMemoryTenants.delete(tenantId);
+      throw new Error("Cloud storage provisioning failed: DynamoDB put failed in production mode.");
+    }
     // LocalStack fallback handled via inMemoryTenants
   }
 
@@ -170,13 +190,20 @@ export async function registerTenant(
 
   inMemoryAgents.set(`${tenantId}#${defaultAgentId}`, defaultAgent);
   try {
-    await docClient.send(
+    const doc = getDocClient();
+    await doc.send(
       new PutCommand({
         TableName: "omni-channel-agents",
         Item: defaultAgent,
+        ConditionExpression: "attribute_not_exists(agentId)",
       })
     );
-  } catch {
+  } catch (err: any) {
+    if (isProduction || !allowMock) {
+      inMemoryTenants.delete(tenantId);
+      inMemoryAgents.delete(`${tenantId}#${defaultAgentId}`);
+      throw new Error("Agent provisioning failed: DynamoDB put failed in production mode.");
+    }
     // LocalStack fallback handled via inMemoryAgents
   }
 
@@ -205,6 +232,11 @@ Only AI agents and users authorized for ${tenantId} can access these documents.
       welcomeDocContent
     );
   } catch (err: any) {
+    if (isProduction || !allowMock) {
+      inMemoryTenants.delete(tenantId);
+      inMemoryAgents.delete(`${tenantId}#${defaultAgentId}`);
+      throw new Error("Knowledge base provisioning failed: S3 upload failed in production mode.");
+    }
     console.warn(`[Onboarding Warning] S3 welcome upload note: ${err.message}`);
   }
 
@@ -275,15 +307,20 @@ export async function handleRegisterTenantRequest(event: {
     };
   } catch (error: any) {
     const isConflict = error.message?.includes("already exists") || error.message?.includes("Conflict");
-    const statusCode = isConflict ? 409 : 400;
+    const isValidation = error.message?.includes("Validation Failed");
+    const statusCode = isConflict ? 409 : (isValidation ? 400 : 502);
+
+    const clientMessage = isProduction && statusCode === 502
+      ? "Tenant provisioning failed due to cloud infrastructure unavailability."
+      : error.message;
 
     return {
       statusCode,
       headers,
       body: JSON.stringify({
         success: false,
-        error: isConflict ? "CONFLICT" : "INVALID_INPUT",
-        message: error.message,
+        error: isConflict ? "CONFLICT" : (isValidation ? "INVALID_INPUT" : "PROVISIONING_FAILED"),
+        message: clientMessage,
       }),
     };
   }

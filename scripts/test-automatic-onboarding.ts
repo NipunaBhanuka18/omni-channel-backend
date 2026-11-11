@@ -255,6 +255,7 @@ async function runAutomaticOnboardingTestSuite() {
         companyName: "Idempotent Services Ltd",
         companySlug: "idemp-services",
         companyEmail: "admin@idempotentservices.com",
+        password: "ValidPassword#2026",
       },
     });
     assert(
@@ -263,6 +264,24 @@ async function runAutomaticOnboardingTestSuite() {
       JSON.stringify(firstCall.data)
     );
 
+    // Adversarial test: Caller B attempts to use Caller A's idempotency key with different payload
+    const adversaryCall = await api("/api/registrations", {
+      method: "POST",
+      headers: { "idempotency-key": testIdempotencyKey },
+      body: {
+        companyName: "Adversary Attacker Corp",
+        companySlug: "adversary-corp",
+        companyEmail: "attacker@adversary.com",
+        password: "AttackerPassword#2026",
+      },
+    });
+    assert(
+      "9b. Adversarial collision with same idempotency key is rejected with 409 Conflict",
+      adversaryCall.status === 409 && adversaryCall.data.success === false,
+      JSON.stringify(adversaryCall.data)
+    );
+
+    // Safe unauthenticated replay: Caller A replays request
     const replayCall = await api("/api/registrations", {
       method: "POST",
       headers: { "idempotency-key": testIdempotencyKey },
@@ -270,11 +289,15 @@ async function runAutomaticOnboardingTestSuite() {
         companyName: "Idempotent Services Ltd",
         companySlug: "idemp-services",
         companyEmail: "admin@idempotentservices.com",
+        password: "ValidPassword#2026",
       },
     });
     assert(
-      "9b. Replayed call with identical idempotency key returns 200 OK with same tenantId",
+      "9c. Replayed call returns 200 OK without revealing or minting session token (LOGIN_REQUIRED)",
       replayCall.status === 200 &&
+        replayCall.data.idempotentReplay === true &&
+        replayCall.data.token === undefined &&
+        replayCall.data.nextAction === "LOGIN_REQUIRED" &&
         replayCall.data.registration?.id === firstCall.data.registration?.id &&
         replayCall.data.registration?.tenantId === "tenant-idemp-services",
       JSON.stringify(replayCall.data)
@@ -424,25 +447,56 @@ async function runAutomaticOnboardingTestSuite() {
     // -------------------------------------------------------------
     // Scenario 16: Super Admin Management (Listing & Deletion)
     // -------------------------------------------------------------
-    console.log("\n--- 16. Super Admin Operations & Deletion ---");
+    console.log("\n--- 16. Super Admin Operations & Deletion/Suspension Lifecycle ---");
     const deleteTarget = await api("/api/registrations", {
       method: "POST",
       body: {
         companyName: "Delete Target Inc",
         companySlug: "del-target",
         companyEmail: "del@target.lk",
+        password: "TargetPassword#2026",
       },
     });
     const delId = deleteTarget.data.registration?.id;
 
+    // 16a. Non-Super Admin attempting deletion is rejected (401/403)
+    const companyHeaders = { Authorization: "Bearer dev-token-company" };
+    const unauthDelRes = await api(`/api/registrations/${delId}`, {
+      method: "DELETE",
+      headers: companyHeaders,
+    });
+    assert(
+      "16a. Non-Super Admin cannot delete company registration (403 Forbidden)",
+      unauthDelRes.status === 403 && unauthDelRes.data.success === false,
+      JSON.stringify(unauthDelRes.data)
+    );
+
+    // 16b. Super Admin safely suspends/deactivates registration
     const delRes = await api(`/api/registrations/${delId}`, {
       method: "DELETE",
       headers: superAdminHeaders,
     });
     assert(
-      "16. Super Admin can delete company registration via DELETE /api/registrations/:id",
-      delRes.status === 200 && delRes.data.success === true,
+      "16b. Super Admin can safely suspend/deactivate workspace via DELETE /api/registrations/:id",
+      delRes.status === 200 &&
+        delRes.data.success === true &&
+        delRes.data.registration?.status === "Suspended" &&
+        delRes.data.registration?.provisioningStatus === "SUSPENDED",
       JSON.stringify(delRes.data)
+    );
+
+    // 16c. Company login for suspended workspace is rejected
+    const suspendedLoginRes = await api("/api/auth/login", {
+      method: "POST",
+      body: {
+        email: "del@target.lk",
+        password: "TargetPassword#2026",
+      },
+    });
+    assert(
+      "16c. Suspended workspace admin login is rejected with 403 Forbidden",
+      suspendedLoginRes.status === 403 && suspendedLoginRes.data.success === false,
+      JSON.stringify(suspendedLoginRes.data)
     );
 
     // -------------------------------------------------------------

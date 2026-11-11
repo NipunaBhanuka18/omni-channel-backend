@@ -1,8 +1,8 @@
 # Omni Channel Platform — Current Project Status
 **Date**: November 11, 2026  
-**Status**: Development Checkpoint Baseline  
-**Branch**: `integration/auth-onboarding-reconciliation` (`checkpoint/recovery-2026-11-11`)  
-**Commit**: `8f8293bb9905f0e98cf0d25c5d92353abb354f3e`
+**Status**: Full-Stack Development Baseline (Task 11 Checkpoint)  
+**Branch**: `integration/fullstack-onboarding-validation`  
+**Base Commit**: `df21ff1319de369a7093b0fc8f192d236d2d2604`
 
 ---
 
@@ -10,39 +10,49 @@
 
 The **SLT Mobitel Omni Channel Platform** is a multi-tenant AI customer engagement platform engineered to handle enterprise customer interactions across multiple channels (Web Chat, WhatsApp, SMS, Messenger). It routes customer intents dynamically through domain-specialist AI agents (Billing, Usage, Technical Support) backed by tenant-partitioned knowledge bases, with automated escalation to human agents when needed.
 
-This document describes the exact implementation status of the TypeScript backend as of the November 11, 2026 recovery checkpoint.
+This document describes the exact implementation status of the TypeScript backend and React frontend as of the Task 11 full-stack integration checkpoint.
 
 ---
 
-## 2. Implemented Features in the TypeScript Backend
+## 2. Implemented & Verified Full-Stack Subsystems
 
-The following subsystems are verified and functional in the current integration codebase:
+The following subsystems are verified and functional in the integrated codebase:
 
-1. **[TESTED] Zero-Trust Tenant Resolution (`services/tenant-resolver/`)**:
+1. **[TESTED] Automatic Company Workspace Onboarding (`services/onboarding/register-tenant.ts`, `server.ts`)**:
+   - Conforms to supervisor Tharusha's directive removing mandatory Super Admin approval for ordinary company onboarding.
+   - Automatically derives normalized tenant slug (`deriveTenantId(cleanSlug)` -> `tenant-{slug}`).
+   - Rejects reserved slugs (`slt`, `admin`, `system`, `api`, `platform`, `root`, `superadmin`).
+   - Rejects duplicate company names (case & whitespace normalized) and existing tenant slugs with `409 Conflict`.
+   - Provisions DynamoDB records in `omni-channel-tenants` and `omni-channel-agents` (default support specialist).
+   - Provisions S3 knowledge-base prefix (`tenants/{tenantId}/welcome.txt` and `.kb-prefix`).
+   - Returns HTTP `201 Created` with tenant metadata, company admin profile, and initial local session token for immediate dashboard access.
+2. **[TESTED] Public Idempotency Replay Protection (Stage 2.A)**:
+   - Request fingerprint binding using SHA-256 (`cleanSlug#adminEmail#companyName`).
+   - Adversarial requests reusing existing keys with mismatched payloads are rejected with `409 Conflict`.
+   - Unauthenticated replays return `200 OK` with sanitized registration metadata, but **never** mint or return bearer tokens. Replays require credential login (`nextAction: "LOGIN_REQUIRED"`).
+3. **[TESTED] Production Fail-Closed Boundaries (Stage 2.B & 2.C)**:
+   - When `NODE_ENV === "production"` or `ALLOW_MOCK_AWS !== "true"`, cloud failures fail closed (HTTP 502) without falling back to in-memory tables.
+   - Cross-process uniqueness guaranteed on DynamoDB via `ConditionExpression: "attribute_not_exists(tenantId)"`.
+4. **[TESTED] Production Identity Verification Boundary (Stage 2.D)**:
+   - When `REQUIRE_EMAIL_VERIFICATION === "true"` or `NODE_ENV === "production"`, newly created accounts require email verification before session issuance (`nextAction: "EMAIL_VERIFICATION_REQUIRED"`).
+5. **[TESTED] Non-Destructive Workspace Suspension Lifecycle (Stage 2.E)**:
+   - `DELETE /api/registrations/:id` safely suspends and deactivates company workspaces without deleting cloud partitions or destroying audit records.
+   - Synchronizes `inMemoryTenants` and DynamoDB tenant status to `"suspended"`.
+   - Subsequent company logins are immediately blocked with `403 Forbidden`.
+6. **[TESTED] Zero-Trust Tenant Resolution (`services/tenant-resolver/`)**:
    - Validates incoming requests against AWS Cognito user pool tokens.
    - Extracts tenant identity from `custom:tenant_id` and derives roles (`superadmin`, `company`, `live_agent`, `guest`) from `cognito:groups`.
    - Fails closed on missing tenant claims or mismatched `x-tenant-id` client headers.
-2. **[TESTED] Dual-Mode Authentication Middleware (`services/auth/`)**:
-   - **Production**: Native Node.js `node:crypto` RS256 JWKS token verifier (`cognito-jwt-verifier.ts`), validating cryptographic signatures against AWS Cognito public keys.
-   - **Local / Test**: HMAC-SHA256 session token service (`local-session-token.ts`), signing `v1.` session tokens with bounded lifetimes and tenant scoping.
-   - **Password Security**: Native `scrypt` hashing with 128-bit salt (`password-hashing.ts`) with automatic legacy credential upgrade on login.
-   - **Rate Limiting**: Bounded memory fixed-window rate limiter (`bounded-rate-limiter.ts`) protecting registration endpoints against automated abuse.
-3. **[TESTED] Multi-Tenant Onboarding Pipeline (`services/onboarding/`)**:
-   - Provisions DynamoDB tenant partition records (`TENANT#<id>`), Cognito user accounts, and S3 knowledge-base prefixes (`tenants/<tenantId>/`).
-   - Implements automated rollback across DynamoDB, Cognito, and S3 if any provisioning step fails.
-   - Normalizes company names to prevent duplicate or conflicting tenant registrations.
-4. **[TESTED] Administrative Approval Workflow (`services/onboarding/approval-workflow.ts`)**:
-   - Safely transforms pending inbound company registrations into provisioned tenants with one-time credentials.
-   - Enforces fail-closed behavior: errors during provisioning keep the registration in `Pending` state and prevent credential leakage.
-   - Idempotency guard rejects repeat approval requests with HTTP 409 Conflict.
-5. **[TESTED] Dynamic Tenant Router (`services/tenant-router/`)**:
-   - Queries DynamoDB `omni-channel-tenants` table to verify tenant status (`ACTIVE` vs `SUSPENDED`).
-   - Dispatches authorized requests to designated default agents; rejects suspended or non-existent tenants.
-6. **[TESTED] AI Plane B Supervisor Delegation (`services/agent-core/`)**:
-   - Bedrock AgentCore supervisor dispatches customer requests to specialist sub-agents (`Billing Specialist`, `Usage Specialist`, `Support Specialist`).
-   - Scopes Knowledge Base document retrieval strictly to the authenticated tenant's S3 folder prefix.
-7. **[TESTED] UI Express API Server (`server.ts`)**:
-   - Implements REST endpoints for platform dashboard statistics, notifications, registration approval, customer escalation, presence status, and hosted chat configuration.
+7. **[TESTED] Hardened Administrative Endpoints (`server.ts`)**:
+   - `/api/auth/register-admin`: Token-guarded bootstrap or existing Super Admin authorization required.
+   - `/api/agent/presence/online` & `offline`: Restricted to authorized `live_agent` roles scoped to their own tenant and agent ID.
+   - `/api/chat/handoff/resolve`: Restricted to authorized agents assigned to the session.
+8. **[TESTED] React Frontend Integration (`omni-agent-ui`)**:
+   - `Register.tsx`: Configurable via `ENV.API_BASE_URL`, handles automatic onboarding, `LOGIN_REQUIRED`, and `EMAIL_VERIFICATION_REQUIRED` states.
+   - `OrganizationManagement.tsx`: Consumes `ENV.API_BASE_URL` and excludes suspended companies from active views.
+   - All client endpoints configurable via `VITE_API_BASE_URL`.
+9. **[TESTED] Live Full-Stack End-to-End Suite (`scripts/e2e-live-fullstack.ts`)**:
+   - Verified 16 live functional scenarios across live backend (port 3001) and React frontend (port 5173). All 23 assertions passed.
 
 ---
 
