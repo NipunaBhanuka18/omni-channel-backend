@@ -21,7 +21,9 @@ const PORT = process.env.PORT || 3001;
 app.use(cors());
 app.use(express.json());
 
-const DB_PATH = path.join(__dirname, "db.json");
+function getDbPath(): string {
+  return process.env.DB_PATH || path.join(__dirname, "db.json");
+}
 
 // Initialize baseline tenant DynamoDB/in-memory records
 provisionTenantResources().catch((err) => {
@@ -30,7 +32,8 @@ provisionTenantResources().catch((err) => {
 
 // Helper to read database
 function readDB() {
-  if (!fs.existsSync(DB_PATH)) {
+  const dbPath = getDbPath();
+  if (!fs.existsSync(dbPath)) {
     const initial = {
       users: [
         {
@@ -44,11 +47,11 @@ function readDB() {
       ],
       registrations: [],
     };
-    fs.writeFileSync(DB_PATH, JSON.stringify(initial, null, 2));
+    fs.writeFileSync(dbPath, JSON.stringify(initial, null, 2));
     return initial;
   }
   try {
-    const raw = fs.readFileSync(DB_PATH, "utf-8");
+    const raw = fs.readFileSync(dbPath, "utf-8");
     const data = JSON.parse(raw);
     if (!data.users) {
       data.users = [
@@ -61,7 +64,7 @@ function readDB() {
           createdAt: new Date().toISOString(),
         },
       ];
-      fs.writeFileSync(DB_PATH, JSON.stringify(data, null, 2));
+      fs.writeFileSync(dbPath, JSON.stringify(data, null, 2));
     }
     return data;
   } catch {
@@ -71,7 +74,8 @@ function readDB() {
 
 // Helper to write database
 function writeDB(data: any) {
-  fs.writeFileSync(DB_PATH, JSON.stringify(data, null, 2));
+  const dbPath = getDbPath();
+  fs.writeFileSync(dbPath, JSON.stringify(data, null, 2));
 }
 
 // Ensure DB exists on startup

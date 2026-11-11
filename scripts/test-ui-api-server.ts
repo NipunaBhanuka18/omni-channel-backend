@@ -1,5 +1,20 @@
+import fs from "fs";
+import os from "os";
+import path from "path";
+
 process.env.NODE_ENV = "test";
 process.env.ALLOW_MOCK_AUTH = "true";
+
+// Use isolated temporary database file to prevent mutating tracked db.json
+const tempDbPath = path.join(
+  os.tmpdir(),
+  `omni-test-db-${Date.now()}-${Math.random().toString(36).slice(2)}.json`
+);
+const realDbPath = path.join(__dirname, "..", "db.json");
+if (fs.existsSync(realDbPath)) {
+  fs.copyFileSync(realDbPath, tempDbPath);
+}
+process.env.DB_PATH = tempDbPath;
 
 import { app } from "../server";
 
@@ -172,6 +187,13 @@ async function runUiServerTests() {
     console.log("================================================================");
   } finally {
     server.close();
+    if (fs.existsSync(tempDbPath)) {
+      try {
+        fs.unlinkSync(tempDbPath);
+      } catch {
+        // ignore cleanup error
+      }
+    }
   }
 
   if (failed > 0) {
