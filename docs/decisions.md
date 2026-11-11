@@ -669,3 +669,69 @@ Following the implementation of automatic company workspace onboarding in Task 1
 - Live full-stack E2E suite: 23/23 assertions passed live over real HTTP (exit code 0).
 - Immutability check: `git diff db.json` is completely clean.
 
+---
+
+## ADR-020: Supervisor MVP Feature Reconciliation, Native TypeScript AI Runtime Architecture & Amazon Bedrock Converse Integration
+
+- **Status**: Accepted
+- **Date**: 2026-11-11
+- **Scope**: `services/ai-runtime/`, `server.ts`, `package.json`, `scripts/test-ai-runtime.ts`
+
+### Context
+
+Prior to Task 12, the Omni Channel Platform possessed a verified SaaS control plane, automatic workspace onboarding, and robust tenant isolation. However, the AI conversation execution path was only stubbed with static specialist mocks (`agents/specialists/billing`, `usage`, `support`). 
+
+Supervisor Tharusha's authoritative customer-engagement MVP was developed in Python/AWS SAM (`origin/feature/customer-agent-unified:customer-agent-mvp-source/`) featuring:
+1. Amazon Bedrock `Converse` API invocation with configurable foundation models (`anthropic.claude-3-sonnet`, `amazon.nova-lite-v1:0`, etc.).
+2. Bedrock Guardrails propagation (`guardrailIdentifier`, `guardrailVersion`).
+3. Short-term multi-turn conversation memory (last 12 turns) partitioned by `sessionId`.
+4. Tenant-scoped Knowledge Base vector retrieval with shared-KB tenant filtering (`equals: { key: "tenant_id", value: agent.tenantId }`).
+5. Allowlisted tool execution (OpenAPI HTTPS endpoints and MCP JSON-RPC 2.0 with SigV4/secret headers).
+6. Intent routing (`billing`, `technical`, `sales`, `lead`, `general`) and dynamic lead form triggers.
+7. Customer human handoff regex detection (`\b(human|person|representative|live agent)\b`) and session escalation (`HANDOFF_REQUESTED`).
+8. Public agent profile resolution and DynamoDB session management.
+
+Pubudini's branch had checked in the supervisor's Python source under `customer-agent-mvp-source/`, but had not integrated the real Bedrock conversation orchestrator into the TypeScript server runtime.
+
+### Architectural Decision
+
+We evaluated two architectural integration paths:
+1. **Separately deployed Python agent service behind a TypeScript gateway**:
+   - *Drawbacks*: Requires managing dual runtimes (Node.js + Python 3.12), cross-process HTTP serialization latency, duplicated authentication middleware, separate CI/CD environments, and complex Docker multi-container local testing.
+2. **Native TypeScript AWS Bedrock SDK adaptation adapted from Python reference logic** (SELECTED):
+   - *Advantages*:
+     - Single unified runtime aligning with the verified TypeScript control plane and Express server.
+     - 100% logic and formula fidelity to supervisor's `bedrock_service.py`, `orchestrator.py`, `tool_executor.py`, and `repository.py`.
+     - Direct deterministic mock adapter (`DeterministicMockBedrockAdapter`) enabling fast, offline, reliable CI/CD testing without calling live AWS.
+     - Strict production fail-closed boundaries: in `NODE_ENV === "production"`, mock mode is strictly prohibited and fails closed.
+     - Direct integration with `TenantContext`, `LocalSessionTokenService`, and DynamoDB DocumentClient.
+
+### Implementation Details
+
+1. **AI Runtime Domain Modules (`services/ai-runtime/`)**:
+   - `types.ts`: Strictly-typed data models for `AgentConfig`, `PublicMapping`, `ConversationSession`, `ChatMessage`, `ToolDefinition`, `FormDefinition`, and `TurnResult`.
+   - `agent-repository.ts`: Repository managing public URL mappings, agent configs, sessions, and messages with transparent DynamoDB DocumentClient backing and in-memory test fallback.
+   - `bedrock-provider.ts`: `IBedrockRuntime` provider interface with two concrete implementations:
+     - `AwsBedrockRuntimeAdapter`: Uses `@aws-sdk/client-bedrock-runtime` (`ConverseCommand`). Executes 4-turn tool use loop, applies guardrails, configures inference settings, and handles timeouts/errors.
+     - `DeterministicMockBedrockAdapter`: Deterministic offline mock engine for local testing.
+     - `getBedrockRuntime()`: Factory enforcing fail-closed behavior in production.
+   - `knowledge-retriever.ts`: Multi-tier tenant-scoped KB retriever. Enforces shared-KB vector filtering, dedicated KB tenant tag verification, and S3 tenant partition scoping. Guarantees explicit empty KB behavior (no cross-tenant leakage).
+   - `tool-executor.ts`: Strict tool allowlist enforcement (`agent.tools`). Defends against prototype pollution, validates HTTPS-only URLs without embedded credentials, clamps timeouts (2-25s), and executes API / MCP calls safely.
+   - `orchestrator.ts`: Conversation orchestrator porting supervisor's keyword scoring, handoff detection, system prompt compilation with untrusted input boundaries (<180 words, no prompt leakage), dynamic lead form triggers, and multi-turn execution.
+2. **Server Endpoints (`server.ts`)**:
+   - Public Chat API: `GET /v1/public/agents/:key`, `POST /v1/public/sessions`, `POST /v1/public/sessions/:id/messages`, `GET /v1/public/sessions/:id/messages`, `POST /v1/public/sessions/:id/feedback`.
+   - Admin Management: `GET|POST /api/dev/admin/agents`, `GET /api/dev/admin/agents/:id`, `POST /api/dev/admin/agents/:id/publish`, `GET|POST /api/dev/admin/knowledge-bases`, `GET|POST /api/dev/admin/tools`.
+   - Hosted Chat URL Resolver: `GET /api/resolve-chat-url` dynamically resolves published agents from `agentRepository`.
+3. **Automated Verification**:
+   - Authoring `scripts/test-ai-runtime.ts` covering 32 distinct assertions across resolution, loading, cross-tenant denial, Bedrock converse, fail-closed boundaries, KB isolation, multi-turn memory, tools, and handoffs.
+
+### Verification
+
+- AI Runtime test suite (`scripts/test-ai-runtime.ts`): 32/32 assertions passed (exit code 0).
+- Full 13-suite regression test harness (`npm test`): 187/187 assertions passed across all 13 suites, executed twice consecutively with exit code 0.
+- TypeScript typecheck (`npx tsc --noEmit`): 0 errors.
+- Production build (`npm run build`): 0 errors.
+- Terraform configuration (`terraform -chdir=infra validate`): Clean / valid.
+- Real database immutability: Tracked `db.json` unmutated (`git diff db.json` empty).
+
+

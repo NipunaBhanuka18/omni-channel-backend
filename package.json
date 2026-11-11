@@ -8,7 +8,7 @@
   "scripts": {
     "build": "tsc",
     "start": "npx tsx server.ts",
-    "test": "tsx ./scripts/test-all.ts && tsx ./scripts/test-tenant-resolver.ts && tsx ./scripts/test-tenant-onboarding.ts && tsx ./scripts/test-import-safety.ts && tsx ./scripts/test-onboarding.ts && tsx ./scripts/test-router.ts && tsx ./scripts/test-ui-api-server.ts && tsx ./scripts/test-registration-workflows.ts && tsx ./scripts/test-member4-ai-engine.ts && tsx ./scripts/test-auth-security.ts && tsx ./scripts/test-endpoint-hardening.ts && tsx ./scripts/test-automatic-onboarding.ts",
+    "test": "tsx ./scripts/test-all.ts && tsx ./scripts/test-tenant-resolver.ts && tsx ./scripts/test-tenant-onboarding.ts && tsx ./scripts/test-import-safety.ts && tsx ./scripts/test-onboarding.ts && tsx ./scripts/test-router.ts && tsx ./scripts/test-ui-api-server.ts && tsx ./scripts/test-registration-workflows.ts && tsx ./scripts/test-member4-ai-engine.ts && tsx ./scripts/test-auth-security.ts && tsx ./scripts/test-endpoint-hardening.ts && tsx ./scripts/test-automatic-onboarding.ts && tsx ./scripts/test-ai-runtime.ts",
     "test:agents": "tsx ./scripts/test-all.ts",
     "test:tenant-resolver": "tsx ./scripts/test-tenant-resolver.ts",
     "test:tenant-onboarding": "tsx ./scripts/test-tenant-onboarding.ts",
@@ -21,6 +21,7 @@
     "test:security": "tsx ./scripts/test-auth-security.ts",
     "test:hardening": "tsx ./scripts/test-endpoint-hardening.ts",
     "test:automatic-onboarding": "tsx ./scripts/test-automatic-onboarding.ts",
+    "test:ai": "tsx ./scripts/test-ai-runtime.ts",
     "test:e2e": "tsx ./scripts/e2e-live-fullstack.ts"
   },
   "repository": {
@@ -36,6 +37,8 @@
   "homepage": "https://github.com/NipunaBhanuka18/omni-channel-backend#readme",
   "description": "",
   "dependencies": {
+    "@aws-sdk/client-bedrock-agent-runtime": "^3.1166.0",
+    "@aws-sdk/client-bedrock-runtime": "^3.1166.0",
     "@aws-sdk/client-cognito-identity-provider": "^3.1136.0",
     "@aws-sdk/client-dynamodb": "^3.1108.0",
     "@aws-sdk/client-s3": "^3.1113.0",

@@ -17,6 +17,8 @@ import {
   deriveTenantId,
 } from "./shared/utils/tenant-name";
 
+import { agentRepository, orchestrator, AgentConfig, ToolDefinition } from "./services/ai-runtime";
+
 import { LocalSessionTokenService, extractBearerToken } from "./services/auth/local-session-token";
 import {
   createRequireAuth,
@@ -1206,9 +1208,32 @@ app.get("/api/workspace/conversations", ...requireCompanyAdmin, (req, res) => {
 // ==========================================
 
 // GET /api/resolve-chat-url?company={slug}&agent={agent}
-app.get(["/api/resolve-chat-url", "/resolve-chat-url"], (req, res) => {
+app.get(["/api/resolve-chat-url", "/resolve-chat-url"], async (req, res) => {
   const companySlug = (req.query.company as string) || "slt";
   const agentSlug = (req.query.agent as string) || "support";
+  const key = `${companySlug}-${agentSlug}`.toLowerCase();
+
+  let agent = await agentRepository.getAgentByPublicKey(key);
+  if (!agent) {
+    agent = (await agentRepository.getAgentByPublicKey(agentSlug)) || (await agentRepository.getAgentByPublicKey(companySlug));
+  }
+
+  if (agent && agent.status === "PUBLISHED") {
+    return res.json({
+      success: true,
+      tenantId: agent.tenantId,
+      companyName: agent.brandName || agent.displayName,
+      agentId: agent.agentId,
+      agentName: agent.displayName,
+      welcomeMessage: agent.welcomeMessage || `Welcome to ${agent.displayName}! How can we assist you today?`,
+      themeColor: agent.theme?.primaryColor || "#005EB8",
+      agent: {
+        name: agent.displayName,
+        tenantId: agent.tenantId,
+        model: agent.modelId,
+      },
+    });
+  }
 
   const tenant = inMemoryTenants.get(companySlug) || inMemoryTenants.get(`tenant-${companySlug}`) || {
     tenantId: companySlug,
@@ -1224,7 +1249,277 @@ app.get(["/api/resolve-chat-url", "/resolve-chat-url"], (req, res) => {
     agentName: `${tenant.companyName} Assistant`,
     welcomeMessage: `Welcome to ${tenant.companyName}! How can we assist you today?`,
     themeColor: tenant.config?.themeColor || "#005EB8",
+    agent: {
+      name: `${tenant.companyName} Assistant`,
+      tenantId: tenant.tenantId,
+      model: "SLT-Specialist-v3",
+    },
   });
+});
+
+// ==========================================
+// 6A. SUPERVISOR PUBLIC AI CHAT API
+// ==========================================
+
+// 1. Resolve public agent by key
+app.get(["/v1/public/agents/:agentKey", "/api/public/agents/:agentKey"], async (req, res) => {
+  const agentKey = req.params.agentKey;
+  const agent = await agentRepository.getAgentByPublicKey(agentKey);
+  if (!agent || agent.status !== "PUBLISHED") {
+    return res.status(404).json({ success: false, message: "Assistant not found" });
+  }
+
+  return res.json({
+    success: true,
+    agentKey: agent.publicAgentKey,
+    displayName: agent.displayName,
+    brandName: agent.brandName || "Customer Support",
+    welcomeMessage: agent.welcomeMessage || "How can I help you today?",
+    theme: agent.theme || { primaryColor: "#005EB8" },
+    modelId: agent.modelId,
+  });
+});
+
+// 2. Create public conversation session
+app.post(["/v1/public/sessions", "/api/public/sessions"], async (req, res) => {
+  const { agentKey } = req.body || {};
+  if (!agentKey) {
+    return res.status(400).json({ success: false, message: "agentKey is required" });
+  }
+
+  const agent = await agentRepository.getAgentByPublicKey(agentKey);
+  if (!agent || agent.status !== "PUBLISHED") {
+    return res.status(404).json({ success: false, message: "Assistant not found" });
+  }
+
+  const session = await agentRepository.createSession(agent);
+  return res.status(201).json({
+    success: true,
+    sessionId: session.sessionId,
+    agent: {
+      agentKey: agent.publicAgentKey,
+      displayName: agent.displayName,
+      brandName: agent.brandName || "Customer Support",
+      welcomeMessage: agent.welcomeMessage || "How can I help you today?",
+      theme: agent.theme || { primaryColor: "#005EB8" },
+    },
+  });
+});
+
+// 3. Send message / execute AI turn in public session
+app.post(["/v1/public/sessions/:sessionId/messages", "/api/public/sessions/:sessionId/messages"], async (req, res) => {
+  const { sessionId } = req.params;
+  const session = await agentRepository.getSession(sessionId);
+  if (!session) {
+    return res.status(404).json({ success: false, message: "Session not found" });
+  }
+
+  const agent = await agentRepository.getAgent(session.tenantId, session.agentId);
+  if (!agent || agent.status !== "PUBLISHED") {
+    return res.status(404).json({ success: false, message: "Assistant is unavailable" });
+  }
+
+  try {
+    const turnResult = await orchestrator.executeTurn({
+      agent,
+      session,
+      message: req.body?.message,
+      formSubmission: req.body?.formSubmission,
+    });
+
+    return res.json({
+      success: true,
+      ...turnResult,
+    });
+  } catch (err: any) {
+    return res.status(400).json({
+      success: false,
+      message: err.message || "Failed to process chat message",
+    });
+  }
+});
+
+// 4. List messages for session
+app.get(["/v1/public/sessions/:sessionId/messages", "/api/public/sessions/:sessionId/messages"], async (req, res) => {
+  const { sessionId } = req.params;
+  const session = await agentRepository.getSession(sessionId);
+  if (!session) {
+    return res.status(404).json({ success: false, message: "Session not found" });
+  }
+
+  const messages = await agentRepository.listMessages(sessionId);
+  return res.json({
+    success: true,
+    sessionStatus: session.status,
+    messages: messages.map((m) => ({
+      messageId: m.messageId,
+      role: m.role,
+      text: m.text,
+      createdAt: m.createdAt,
+      route: m.route,
+      status: m.status,
+      citations: m.citations,
+    })),
+  });
+});
+
+// 5. Save session feedback
+app.post(["/v1/public/sessions/:sessionId/feedback", "/api/public/sessions/:sessionId/feedback"], async (req, res) => {
+  const { sessionId } = req.params;
+  const session = await agentRepository.getSession(sessionId);
+  if (!session) {
+    return res.status(404).json({ success: false, message: "Session not found" });
+  }
+
+  const { messageId, rating } = req.body || {};
+  if (!messageId || (rating !== "up" && rating !== "down")) {
+    return res.status(400).json({ success: false, message: "Invalid feedback parameters" });
+  }
+
+  await agentRepository.saveFeedback(session, messageId, rating);
+  return res.status(201).json({ success: true, saved: true });
+});
+
+// ==========================================
+// 6B. ADMIN AGENTS, KBS & TOOLS MANAGEMENT
+// ==========================================
+
+// List or create agents for authenticated company
+app.get(["/api/dev/admin/agents", "/v1/admin/agents", "/api/agents"], ...requireCompanyAdmin, async (req, res) => {
+  const tenantId = req.authorizedTenantId!;
+  const agents = await agentRepository.listAgents(tenantId);
+  return res.json({
+    success: true,
+    items: agents,
+  });
+});
+
+app.post(["/api/dev/admin/agents", "/v1/admin/agents", "/api/agents"], ...requireCompanyAdmin, async (req, res) => {
+  const tenantId = req.authorizedTenantId!;
+  const body = req.body || {};
+  const agentId = body.agentId || `agent-${tenantId}-${Date.now().toString(36)}`;
+  const publicAgentKey = (body.publicAgentKey || `${tenantId}-${agentId}`).toLowerCase();
+
+  const agentConfig: AgentConfig = {
+    tenantId,
+    agentId,
+    displayName: body.name || body.displayName || `${tenantId.toUpperCase()} Assistant`,
+    brandName: body.brandName || tenantId.toUpperCase(),
+    welcomeMessage: body.welcomeMessage || "How can I assist you today?",
+    systemPrompt: body.systemPrompt || "You are a professional customer support assistant.",
+    modelId: body.modelId || "anthropic.claude-3-sonnet-20240229-v1:0",
+    status: body.status || "DRAFT",
+    publicAgentKey,
+    tools: body.tools || [],
+    forms: body.forms || [],
+    knowledgeBaseId: body.knowledgeBaseId,
+    sharedKnowledgeBase: body.sharedKnowledgeBase ?? true,
+    guardrailIdentifier: body.guardrailIdentifier,
+    guardrailVersion: body.guardrailVersion,
+    theme: body.theme || { primaryColor: "#005EB8" },
+  };
+
+  await agentRepository.saveAgent(agentConfig);
+  return res.status(201).json({
+    success: true,
+    agent: agentConfig,
+  });
+});
+
+app.get(["/api/dev/admin/agents/:id", "/v1/admin/agents/:id", "/api/agents/:id"], ...requireCompanyAdmin, async (req, res) => {
+  const tenantId = req.authorizedTenantId!;
+  const agentId = req.params.id;
+  const agent = await agentRepository.getAgent(tenantId, agentId);
+  if (!agent) {
+    return res.status(404).json({ success: false, message: "Agent not found" });
+  }
+  return res.json({ success: true, agent });
+});
+
+// Publish agent and generate public chat URL
+app.post(["/api/dev/admin/agents/:id/publish", "/v1/admin/agents/:id/publish", "/api/agents/:id/publish"], ...requireCompanyAdmin, async (req, res) => {
+  const tenantId = req.authorizedTenantId!;
+  const agentId = req.params.id;
+  const publicAgentKey = (req.body?.publicAgentKey || `${tenantId}-support`).toLowerCase();
+
+  try {
+    const mapping = await agentRepository.publishAgent(tenantId, agentId, publicAgentKey);
+    return res.json({
+      success: true,
+      published: true,
+      publicAgentKey: mapping.publicAgentKey,
+      chatUrl: `/chat/${mapping.publicAgentKey}`,
+    });
+  } catch (err: any) {
+    return res.status(400).json({ success: false, message: err.message });
+  }
+});
+
+// Knowledge Bases admin endpoints
+const inMemoryKbs: Map<string, any[]> = new Map();
+app.get(["/api/dev/admin/knowledge-bases", "/v1/admin/knowledge-bases", "/api/knowledge-bases"], ...requireCompanyAdmin, (req, res) => {
+  const tenantId = req.authorizedTenantId!;
+  const items = inMemoryKbs.get(tenantId) || [
+    {
+      kbId: "kb-support",
+      name: "Technical Support Guides",
+      description: "Fiber router and troubleshooting guides",
+      category: "Technical Support",
+      filesCount: 1,
+      status: "READY",
+    },
+  ];
+  return res.json({ success: true, items });
+});
+
+app.post(["/api/dev/admin/knowledge-bases", "/v1/admin/knowledge-bases", "/api/knowledge-bases"], ...requireCompanyAdmin, (req, res) => {
+  const tenantId = req.authorizedTenantId!;
+  const body = req.body || {};
+  const kbItem = {
+    kbId: body.kbId || `kb-${Date.now().toString(36)}`,
+    name: body.name || "Custom Knowledge Base",
+    description: body.description || "",
+    category: body.category || "General",
+    filesCount: body.filesCount || 0,
+    status: "READY",
+  };
+  const list = inMemoryKbs.get(tenantId) || [];
+  list.push(kbItem);
+  inMemoryKbs.set(tenantId, list);
+  return res.status(201).json({ success: true, item: kbItem });
+});
+
+// Tools admin endpoints
+const inMemoryTools: Map<string, any[]> = new Map();
+app.get(["/api/dev/admin/tools", "/v1/admin/tools", "/api/tools"], ...requireCompanyAdmin, (req, res) => {
+  const tenantId = req.authorizedTenantId!;
+  const items = inMemoryTools.get(tenantId) || [
+    {
+      name: "check_balance",
+      type: "api",
+      description: "Query customer account balance",
+      enabled: true,
+      endpoint: "https://mock.internal/api/billing/balance",
+    },
+  ];
+  return res.json({ success: true, items });
+});
+
+app.post(["/api/dev/admin/tools", "/v1/admin/tools", "/api/tools"], ...requireCompanyAdmin, (req, res) => {
+  const tenantId = req.authorizedTenantId!;
+  const body = req.body || {};
+  const toolItem = {
+    name: body.name,
+    type: body.type || "api",
+    description: body.description || "",
+    enabled: body.enabled ?? true,
+    endpoint: body.endpoint,
+    method: body.method || "POST",
+  };
+  const list = inMemoryTools.get(tenantId) || [];
+  list.push(toolItem);
+  inMemoryTools.set(tenantId, list);
+  return res.status(201).json({ success: true, item: toolItem });
 });
 
 // ==========================================

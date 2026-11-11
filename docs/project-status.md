@@ -1,8 +1,8 @@
 # Omni Channel Platform — Current Project Status
 **Date**: November 11, 2026  
-**Status**: Full-Stack Development Baseline (Task 11 Checkpoint)  
-**Branch**: `integration/fullstack-onboarding-validation`  
-**Base Commit**: `df21ff1319de369a7093b0fc8f192d236d2d2604`
+**Status**: Supervisor MVP Feature Reconciliation & AI Runtime Integration (Task 12 Checkpoint)  
+**Branch**: `integration/supervisor-mvp-ai`  
+**Base Commit**: `5182ac49e6acfc9d93122626b9483ad90ec5d845`
 
 ---
 
@@ -53,6 +53,17 @@ The following subsystems are verified and functional in the integrated codebase:
    - All client endpoints configurable via `VITE_API_BASE_URL`.
 9. **[TESTED] Live Full-Stack End-to-End Suite (`scripts/e2e-live-fullstack.ts`)**:
    - Verified 16 live functional scenarios across live backend (port 3001) and React frontend (port 5173). All 23 assertions passed.
+10. **[TESTED] Native TypeScript AI Runtime Subsystem (`services/ai-runtime/`, Task 12)**:
+   - Amazon Bedrock `Converse` API provider adapter with explicit mock/production fail-closed separation.
+   - Public chat endpoints (`GET /v1/public/agents/:key`, `POST /v1/public/sessions`, `POST /v1/public/sessions/:id/messages`, `GET /v1/public/sessions/:id/messages`, `POST /v1/public/sessions/:id/feedback`).
+   - Admin agent, KB, and tool management (`/api/dev/admin/agents`, `/api/dev/admin/knowledge-bases`, `/api/dev/admin/tools`).
+   - Dynamic agent configuration loading and public URL mapping (`/chat/:publicAgentKey`).
+   - Multi-turn conversation memory isolation partitioned by `sessionId`.
+   - Tenant-scoped Knowledge Base vector retrieval with shared-KB tenant filtering (`equals: { key: "tenant_id", value: agent.tenantId }`).
+   - Allowlisted tool execution (API & MCP with SigV4) with prototype pollution defense.
+   - Intent routing (`billing`, `technical`, `sales`, `lead`, `general`) and dynamic lead form triggers.
+   - Human handoff regex escalation (`\b(human|person|representative|live agent)\b`) with session state transition to `HANDOFF_REQUESTED`.
+   - 32/32 assertions verified in automated test suite `scripts/test-ai-runtime.ts`.
 
 ---
 
@@ -60,22 +71,25 @@ The following subsystems are verified and functional in the integrated codebase:
 
 The following capabilities currently rely on simulated logic or fallbacks:
 
-- **[OBSERVED] DynamoDB / S3 Local Fallbacks**: `agents/utils/dynamo-client.ts` and `s3-client.ts` include in-memory mock fallback maps when LocalStack or AWS is unreachable. Automated tests run against these fallbacks rather than a live DynamoDB instance.
+- **[OBSERVED] DynamoDB / S3 Local Fallbacks**: `agents/utils/dynamo-client.ts`, `s3-client.ts`, and `agent-repository.ts` include in-memory mock fallback maps when LocalStack or AWS is unreachable. Automated tests run against these fallbacks rather than a live DynamoDB instance.
+- **[OBSERVED] Bedrock Local Testing**: `DeterministicMockBedrockAdapter` simulates Bedrock Converse multi-turn replies and tool execution in local CI/CD. Production mode (`NODE_ENV=production`) strictly forbids mock mode and fails closed if AWS Bedrock credentials or model access are unavailable.
 - **[OBSERVED] Presence Storage**: `PresenceManager` falls back to an in-memory map when DynamoDB connection fails (`ECONNREFUSED 127.0.0.1:4566`).
 - **[OBSERVED] Development Token Bypass**: In local development (`ALLOW_MOCK_AUTH=true`), preset tokens (`dev-token-*`) bypass cryptographic verification. In production (`NODE_ENV=production`), these tokens are strictly rejected.
 
 ---
 
-## 4. Capabilities Remaining in the Supervisor Python MVP
+## 4. Reconciliation of Supervisor Python MVP
 
-The supervisor (Tharusha) provided a Python/AWS SAM MVP that has **NOT** yet been ported to the TypeScript backend:
+Supervisor Tharusha's Python/AWS SAM MVP (`customer-agent-mvp-source/`) has been reconciled into native TypeScript architecture:
 
-- **[OBSERVED] Python Bedrock Agents**: Python-based LangChain / LangGraph orchestration agents for customer dialogue.
-- **[OBSERVED] ChromaDB Vector Search**: Local vector embeddings and similarity search for customer document indexing.
-- **[OBSERVED] AWS SAM Infrastructure**: Serverless Application Model templates defining Python Lambda handlers.
-- **[PROPOSED] Migration Path**: Evaluate whether to run the Python agent as an independent containerized microservice behind the TypeScript API Gateway, or reimplement the Bedrock agent tools natively in TypeScript.
-
----
+- **[TESTED] Ported to Native TypeScript**:
+  - `bedrock_service.py` -> `services/ai-runtime/bedrock-provider.ts` (Bedrock Converse & Retrieve API integration)
+  - `orchestrator.py` -> `services/ai-runtime/orchestrator.ts` (Routing, prompt compilation, lead form, handoff)
+  - `tool_executor.py` -> `services/ai-runtime/tool-executor.ts` (Tool allowlists, HTTPS checking, MCP, SigV4)
+  - `repository.py` -> `services/ai-runtime/agent-repository.ts` (DynamoDB schema: public mappings, agent configs, conversations)
+  - `handler.py` -> `server.ts` (`/v1/public/agents`, `/v1/public/sessions`, etc.)
+- **[OBSERVED] Architecture Decision**: Native TypeScript AWS SDK adaptation chosen over running a separate Python container to eliminate cross-process latency, duplicate auth middlewares, and multi-runtime maintenance burdens.
+- **[PROPOSED] Remaining Live Cloud Steps**: Live Bedrock foundation model enablement, live OpenSearch Serverless / Bedrock Knowledge Base provisioning, and WebSocket streaming connection integration.
 
 ## 5. Experimental and Unintegrated Branches
 
@@ -104,17 +118,20 @@ The supervisor (Tharusha) provided a Python/AWS SAM MVP that has **NOT** yet bee
 
 ---
 
-## 7. Authentication Architecture and Limitations
+## 7. Authentication Architecture and Hardened Security
 
 - **Production Mode**: Validates RS256 JWKS tokens from AWS Cognito (`COGNITO_USER_POOL_ID`).
 - **Local Mode**: Uses HMAC-SHA256 `v1.` session tokens.
-- **[OBSERVED] Critical Endpoint Exposure**: As audited in Task 08 Stage 2, `/api/auth/register-admin`, `/api/agent/presence/online`, `/api/agent/presence/offline`, and `/api/chat/handoff/resolve` currently lack authentication middleware and must be protected before any deployment.
+- **[TESTED] Hardened Endpoints**: `/api/auth/register-admin` (bootstrap-guarded), `/api/agent/presence/*` (restricted to authenticated live agents), and `/api/chat/handoff/resolve` (restricted to assigned agents).
+- **[TESTED] Rate Limiting**: Bounded rate limiter defends public registration endpoints against brute-force abuse.
+- **[TESTED] Idempotency Protection**: SHA-256 fingerprint binding rejects adversarial collisions and strips tokens on unauthenticated replay.
+- **[TESTED] Non-Destructive Workspace Suspension**: `DELETE /api/registrations/:id` deactivates workspaces and prevents login without destroying cloud partitions or audit records.
 
 ---
 
 ## 8. Infrastructure State
 
-- **Terraform Config**: Located in `infra/`. Modules include `api-gateway`, `dynamodb`, `cognito`, `s3`, and `lambda`.
+- **Terraform Config**: Located in `infra/`. Modules include `api-gateway`, `cognito`, `lambda`, `secrets`, `step-functions`, and `waf`.
 - **[TESTED] Validation**: `terraform -chdir=infra validate` reports `Success! The configuration is valid.`
 - **[OBSERVED] Deployment State**: Lambda source code must be compiled (`npm run build`) to produce `./dist` before running `terraform apply`.
 
@@ -122,16 +139,16 @@ The supervisor (Tharusha) provided a Python/AWS SAM MVP that has **NOT** yet bee
 
 ## 9. Open Architectural Decisions
 
-1. **Python MVP Integration**: Will Bedrock AI agents be maintained as a Python microservice or ported to TypeScript `@aws-sdk/client-bedrock-agent-runtime`?
-2. **WebSocket Architecture**: Will live chat and human handoff use API Gateway WebSocket APIs or an Express WebSocket server?
-3. **Identity Provider Scope**: Will enterprise customers federate via SAML/OIDC into Cognito, or will each tenant have a dedicated User Pool?
+1. **Live Bedrock Foundation Model Quota & Region**: Supervisor approval for production foundation model ARN (`anthropic.claude-3-sonnet-20240229-v1:0` vs `amazon.nova-lite-v1:0`) and AWS deployment region.
+2. **WebSocket Architecture for Live Streaming & Real-Time Handoff**: Decision between AWS API Gateway WebSocket API with DynamoDB connection state or an ECS/Fargate Socket.io cluster.
+3. **Dedicated vs Shared Bedrock Knowledge Bases**: Tenant pricing tier determining whether standard companies share a multi-tenant vector index with metadata filtering or provision dedicated OpenSearch Serverless collections.
 
 ---
 
 ## 10. Evidence Classification Summary
 
 - **`[OBSERVED]`**: Code structure, file diffs, endpoint definitions, and unintegrated branches.
-- **`[TESTED]`**: Compiler typecheck, build outputs, Terraform syntax validation, and 101 automated test assertions across 10 test suites.
+- **`[TESTED]`**: Compiler typecheck, build outputs, Terraform syntax validation, and 187 automated test assertions across 13 test suites.
 - **`[REPORTED]`**: Previous meeting notes and Git commit history messages.
-- **`[UNKNOWN]`**: Behavior of live AWS Cognito endpoints behind production VPC boundaries and frontend-backend live contract integration.
-- **`[PROPOSED]`**: Recommended architectural patterns for Python microservices and endpoint hardening.
+- **`[UNKNOWN]`**: Behavior of live AWS Bedrock foundation model quotas and live OpenSearch Serverless vector indexing.
+- **`[PROPOSED]`**: Recommended architectural patterns for production AWS Bedrock streaming and real-time handoff WebSocket scaling.
